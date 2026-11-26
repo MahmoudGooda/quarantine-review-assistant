@@ -10,6 +10,8 @@ Add-Type -AssemblyName System.Drawing
 
 # Shared UI kit: DPI helpers, design tokens, fonts, painted controls (with plain fallbacks) and background work.
 . (Join-Path $PSScriptRoot 'QraUi.ps1')
+# Optional release-request intake (Exchange Online). Dot-sourced WITHOUT arguments: its parameters are aliased so this script's $Incoming and $Screenshot stay untouched.
+. (Join-Path $PSScriptRoot 'ReleaseRequests.ps1')
 # -ScreenshotDpi: emulate another display scale. Must run before any window exists.
 if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -20,7 +22,7 @@ trap {
 }
 
 # ---------------------------------------------------------------- configuration
-$AppVersion   = '2.2.0'
+$AppVersion   = '2.3.0'
 $Root         = Split-Path -Parent $PSScriptRoot
 $AppDir       = $PSScriptRoot
 $Incoming     = Join-Path $Root 'Incoming'
@@ -631,13 +633,15 @@ $st3 = New-StepPanel 3 'Download the message' 'The Sandbox reads the ZIP from th
     (New-SubStep 'In the portal, select the message.'),
     (New-SubStep 'Choose ... More > Download message.' '... More > Download message'),
     (New-SubStep 'Type a password you will remember for the next few minutes.'),
-    (New-SubStep 'Save the ZIP to the folder below. Do not open or extract it.')
+    (New-SubStep 'Save the ZIP to the folder below. Do not open or extract it.'),
+    (New-SubStep 'Optional: Fetch release requests saves the messages you tick straight into this folder.' 'Fetch release requests')
 )
 $incomingLbl = New-Object System.Windows.Forms.TextBox
 $incomingLbl.ReadOnly = $true; $incomingLbl.Text = $Incoming; $incomingLbl.BorderStyle = 'FixedSingle'
 $incomingLbl.BackColor = $C.Surface; $incomingLbl.Font = $Fonts.Body
 $bOpenIncoming = New-QraButton 'Open folder' 'Secondary' $QraGlyph.Folder
 $bCopyIncoming = New-QraButton 'Copy path' 'Secondary' $QraGlyph.Copy
+$bFetch = New-QraButton 'Fetch release requests' 'Secondary' $QraGlyph.Mail
 $incomingList = New-Object System.Windows.Forms.ListView
 $incomingList.View = 'Details'; $incomingList.FullRowSelect = $true; $incomingList.HeaderStyle = 'Nonclickable'
 [void]$incomingList.Columns.Add('Waiting for review', (S 290))
@@ -646,7 +650,7 @@ $incomingList.View = 'Details'; $incomingList.FullRowSelect = $true; $incomingLi
 $incomingSpin = New-QraSpinner 20
 $incomingSpin.BackColor = $C.Card; Set-Shown $incomingSpin $false
 $incomingHint = New-TextLabel '' $Fonts.Body $C.TextMuted
-$st3.Panel.Controls.AddRange(@($incomingLbl, $bOpenIncoming, $bCopyIncoming, $incomingList, $incomingSpin, $incomingHint))
+$st3.Panel.Controls.AddRange(@($incomingLbl, $bOpenIncoming, $bCopyIncoming, $bFetch, $incomingList, $incomingSpin, $incomingHint))
 
 # Step 4: Analyze in the Sandbox
 $st4 = New-StepPanel 4 'Analyze in the Sandbox' 'Networking is off. Report export makes the Reports folder writable. Compatibility mode uses the Windows default for clipboard sharing.' @(
@@ -705,6 +709,7 @@ Set-Access $bPortal 'Open Defender quarantine in the browser'
 Set-Access $bChecked "I've checked it in Defender, go to the next step"
 Set-Access $incomingLbl 'Incoming folder path'
 Set-Access $bOpenIncoming 'Open the Incoming folder'; Set-Access $bCopyIncoming 'Copy the Incoming folder path'
+Set-Access $bFetch 'Fetch release requests from Exchange Online and save the ones you tick into Incoming'
 Set-Access $incomingList 'Files waiting for review'
 Set-Access $optReports 'Let the Sandbox save reports to this PC'; Set-Access $optProtected 'Protected Client mode'; Set-Access $optCompat 'Compatibility mode, weaker isolation'
 Set-Access $bLaunch 'Launch Sandbox review'
@@ -715,7 +720,7 @@ $rail.TabIndex = 0; $pane.TabIndex = 1
 $ti = 0; foreach ($row in $script:RailRows) { $row.TabIndex = $ti++ }
 $checksPanel.TabIndex = 0; $recheck.TabIndex = 1
 $bPortal.TabIndex = 0; $bChecked.TabIndex = 1
-$ti = 0; foreach ($tabCtl in @($incomingLbl, $bOpenIncoming, $bCopyIncoming, $incomingList)) { $tabCtl.TabIndex = $ti++ }
+$ti = 0; foreach ($tabCtl in @($incomingLbl, $bOpenIncoming, $bCopyIncoming, $bFetch, $incomingList)) { $tabCtl.TabIndex = $ti++ }
 $ti = 0; foreach ($tabCtl in @($optReports, $optProtected, $optCompat, $bLaunch, $bAck)) { $tabCtl.TabIndex = $ti++ }
 $ti = 0; foreach ($tabCtl in @($bNext, $bCopyBlock, $bLog, $bReports, $bClean)) { $tabCtl.TabIndex = $ti++ }
 $form.ResumeLayout($false)
@@ -852,9 +857,19 @@ function Update-StepContent([int]$n) {
             $wCopy = Get-ButtonWidth $bCopyIncoming; $wOpen = Get-ButtonWidth $bOpenIncoming
             $bCopyIncoming.SetBounds(($pad + $rw - $wCopy), $y, $wCopy, $bh)
             $bOpenIncoming.SetBounds(($bCopyIncoming.Left - (S 8) - $wOpen), $y, $wOpen, $bh)
-            $incomingLbl.Width = [Math]::Max((S 120), $bOpenIncoming.Left - (S 8) - $pad)
+            # Fetch sits left of Open folder when the path box keeps a usable width, else it gets its own row below.
+            $wFetch = Get-ButtonWidth $bFetch
+            $inline = (($bOpenIncoming.Left - (S 8) - $wFetch - (S 8) - $pad) -ge (S 220))
+            if ($inline) {
+                $bFetch.SetBounds(($bOpenIncoming.Left - (S 8) - $wFetch), $y, $wFetch, $bh)
+                $boxRight = $bFetch.Left
+            } else {
+                $boxRight = $bOpenIncoming.Left
+            }
+            $incomingLbl.Width = [Math]::Max((S 120), $boxRight - (S 8) - $pad)
             $incomingLbl.Location = New-Object System.Drawing.Point($pad, ($y + [int](($bh - $incomingLbl.Height) / 2)))
             $y += $bh + (S 16)
+            if (-not $inline) { $bFetch.SetBounds($pad, ($y - (S 8)), $wFetch, $bh); $y = $bFetch.Bottom + (S 16) }
             $hintH = (Measure-Wrapped $incomingHint.Text $incomingHint.Font ($rw - (S 28))) + (S 8)   # keep the hint under the list inside the card
             $listH = [Math]::Min((S 240), [Math]::Max((S 72), $h - $y - $hintH - (S 36)))
             $incomingList.SetBounds($pad, $y, $rw, $listH)
@@ -1603,6 +1618,13 @@ $optReports.Add_CheckedChanged({ if (-not $Screenshot) { Update-Stepper } })
 $bPortal.Add_Click({ Start-Process $QuarantineUrl })
 $bOpenIncoming.Add_Click({ Start-Process explorer.exe -ArgumentList ('"' + $Incoming + '"') })
 $bCopyIncoming.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($Incoming); Show-QraCopied $bCopyIncoming })
+# Modal, but the dialog works in its own runspace and polls with a timer, so this window's timers keep running while it is open.
+$bFetch.Add_Click({
+    try { Show-ReleaseRequestDialog -Incoming $Incoming -Owner $form }
+    catch { [System.Windows.Forms.MessageBox]::Show("The release-request window hit an unexpected error:`r`n`r`n$($_.Exception.Message)", 'Quarantine Review Assistant', 'OK', 'Error') | Out-Null }
+    Refresh-Incoming
+    Update-Stepper
+})
 $bCopyBlock.Add_Click({
     if (-not $optReports.Checked -or -not $script:DecisionCurrent) { return }
     $text = Get-VerifiedBlockList $Incoming $Reports $script:LastDecision
@@ -1679,6 +1701,8 @@ if (-not $Screenshot) { $form.Add_Shown({
 }) }
 $form.Add_FormClosing({
     $incomingTimer.Stop(); $timer.Stop(); $waitTimer.Stop()
+    # The release-request dialog is modal, so this should never find one. If it does, closing it signs out of Exchange Online (its FormClosing calls Close-RrSession).
+    foreach ($owned in @($form.OwnedForms)) { try { $owned.Close() } catch { $null = $_ } } # best effort on the way out
     if ($script:IncomingWatcher) { $script:IncomingWatcher.Dispose() }
     foreach ($running in @($script:HashWork, $script:ReadinessWork, $(if ($script:Busy) { $script:Busy.Work }))) { if ($running) { Stop-QraWork $running } }
 })
@@ -1762,6 +1786,24 @@ if ($Screenshot) {
         $bmp.Dispose()
     }
     $form.Dispose()
+    # The release-request dialog, built from synthetic rows (no connection, no real data, no file access beyond this PNG).
+    $rrDlg = New-RrDialog -Incoming 'D:\SecurityReview\Incoming' -NoAutoStart
+    try {
+        $rrDlg.Form.ShowInTaskbar = $false; $rrDlg.Form.Opacity = 0; $rrDlg.Form.StartPosition = 'Manual'
+        $rrDlg.Form.Location = New-Object System.Drawing.Point(-32000, -32000)
+        $rrDlg.Form.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+        Set-RrScreenshotState $rrDlg 'results'
+        $rrDlg.Form.ActiveControl = $null
+        [System.Windows.Forms.Application]::DoEvents()
+        $bmp = New-Object System.Drawing.Bitmap($rrDlg.Form.Width, $rrDlg.Form.Height)
+        $rrDlg.Form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $rrDlg.Form.Width, $rrDlg.Form.Height)))
+        $bmp.Save((Join-Path $Screenshot 'launcher-release-requests.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    } finally {
+        Stop-RrDialog $rrDlg
+        $rrDlg.Form.Dispose()
+    }
     exit 0
 }
 

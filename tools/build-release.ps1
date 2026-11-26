@@ -16,7 +16,7 @@ $src = Join-Path $repo 'src\SecurityReview'
 # The release allow-list: nothing else is ever packed (no reports, profiles, tools, samples or caches).
 $runtimeFiles = @(
     'Start-Here.cmd', 'Start-Review.cmd', 'README.md',
-    'app\Launcher.ps1', 'app\QuarantineReview.ps1', 'app\Enable-Sandbox.ps1', 'app\QraUi.ps1', 'app\inspect_eml.py',
+    'app\Launcher.ps1', 'app\QuarantineReview.ps1', 'app\Enable-Sandbox.ps1', 'app\QraUi.ps1', 'app\ReleaseRequests.ps1', 'app\inspect_eml.py',
     'Incoming\PLACE_ZIP_HERE.txt'
 )
 $releaseFiles = [ordered]@{}

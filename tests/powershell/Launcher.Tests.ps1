@@ -459,11 +459,76 @@ Describe 'Launcher: step texts' {
         $t.Contains('Type a password you will remember for the next few minutes.') | Should -BeTrue -Because 'Type a password you will remember for the next few minutes.'
         $t.Contains('Save the ZIP to the folder below. Do not open or extract it.') | Should -BeTrue -Because 'Save the ZIP to the folder below. Do not open or extract it.'
     }
+    It 'step 3 offers the optional Fetch release requests button and sub-step' {
+        $t = [IO.File]::ReadAllText($script:LauncherPath)
+        $t.Contains("New-QraButton 'Fetch release requests' 'Secondary'") | Should -BeTrue
+        $t.Contains("(New-SubStep 'Optional: Fetch release requests saves the messages you tick straight into this folder.' 'Fetch release requests')") | Should -BeTrue
+        $t.Contains("Show-ReleaseRequestDialog -Incoming `$Incoming -Owner `$form") | Should -BeTrue
+        $t.Contains(". (Join-Path `$PSScriptRoot 'ReleaseRequests.ps1')") | Should -BeTrue -Because 'dot-sourced without arguments'
+    }
+}
+
+Describe 'Launcher: sandbox profile settings' {
+    BeforeAll {
+        Import-LauncherFunction 'Write-SandboxProfile'
+        $global:ProfilesDir = Join-Path $TestDrive 'Profiles'
+        $global:Reports = Join-Path $TestDrive 'Reports'
+        $global:Root = Join-Path $TestDrive 'tool root & more'
+        New-Item -ItemType Directory -Force -Path $global:Root | Out-Null
+        function Get-Wsb([bool]$exportOn, [bool]$protectedClient, [bool]$compat) {   # not named $reports: the launcher function reads $Reports (PowerShell names are case-insensitive)
+            $path = Write-SandboxProfile $exportOn $protectedClient $compat
+            [xml][IO.File]::ReadAllText($path)
+        }
+        function Get-Mapping($xml, [string]$sandboxFolder) {
+            @($xml.Configuration.MappedFolders.MappedFolder | Where-Object { $_.SandboxFolder -eq $sandboxFolder })
+        }
+    }
+    AfterAll { foreach ($n in 'ProfilesDir', 'Reports') { Remove-Variable -Name $n -Scope Global -ErrorAction SilentlyContinue }; $global:Root = $TestDrive }
+
+    It 'default mode: no network, every redirection and vGPU disabled, no Protected Client' {
+        $x = Get-Wsb $true $false $false
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput') { $x.Configuration.$opt | Should -Be 'Disable' -Because $opt }
+        $x.Configuration.ProtectedClient | Should -BeNullOrEmpty
+    }
+    It 'Protected mode adds ProtectedClient and keeps everything else disabled' {
+        $x = Get-Wsb $true $true $false
+        $x.Configuration.ProtectedClient | Should -Be 'Enable'
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput') { $x.Configuration.$opt | Should -Be 'Disable' -Because $opt }
+    }
+    It 'Compatibility mode leaves the redirections at the Windows default (no elements) but keeps networking disabled' {
+        $x = Get-Wsb $true $true $true       # Protected is ignored in compatibility mode
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput', 'ProtectedClient') { $x.Configuration.$opt | Should -BeNullOrEmpty -Because $opt }
+    }
+    It 'maps the tool folder read-only in every mode' {
+        foreach ($combo in @(@($true, $false, $false), @($false, $true, $false), @($true, $false, $true))) {
+            $x = Get-Wsb $combo[0] $combo[1] $combo[2]
+            $m = @(Get-Mapping $x 'C:\Review')
+            $m.Count | Should -Be 1
+            $m[0].ReadOnly | Should -Be 'true'
+            $m[0].HostFolder | Should -Be $global:Root
+        }
+    }
+    It 'maps Reports writable only when report export is on' {
+        $on = @(Get-Mapping (Get-Wsb $true $false $false) 'C:\Reports')
+        $on.Count | Should -Be 1
+        $on[0].ReadOnly | Should -Be 'false'
+        $on[0].HostFolder | Should -Be $global:Reports
+        (Get-Mapping (Get-Wsb $false $false $false) 'C:\Reports').Count | Should -Be 0
+        (Get-Mapping (Get-Wsb $false $true $true) 'C:\Reports').Count | Should -Be 0
+        @((Get-Wsb $false $false $false).Configuration.MappedFolders.MappedFolder).Count | Should -Be 1
+    }
+    It 'starts the review window in the Sandbox and nothing else' {
+        $x = Get-Wsb $true $false $false
+        $x.Configuration.LogonCommand.Command | Should -Be 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Review\app\QuarantineReview.ps1'
+    }
 }
 
 Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
     BeforeAll {
-        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'all-done'
+        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'all-done', 'release-requests'
         function Invoke-LauncherShots([string]$dir, [string]$extra = '') {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:LauncherPath, '-Screenshot', $dir)
