@@ -305,7 +305,7 @@ Describe 'ReleaseRequests: one row per message' {
         $g[2].Subject | Should -Be 'Subject of '
         $g[2].QuarantineTypes | Should -Be 'Phish'
         $g[2].Expires | Should -Be ([datetime]'2026-12-25')
-        @($g | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique) | Should -Be @('Key', 'ExportIdentity', 'Received', 'Sender', 'Subject', 'QuarantineTypes', 'Expires', 'Counts', 'CopiesText', 'Status', 'HasReleasedCopy', 'RecipientCount')
+        @($g | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique) | Should -Be @('Key', 'ExportIdentity', 'Received', 'Sender', 'Recipients', 'Subject', 'QuarantineTypes', 'Expires', 'Counts', 'CopiesText', 'Status', 'HasReleasedCopy', 'RecipientCount')
     }
     It 'prefers a pending copy for the export, even when the first row is not pending' {
         $rows = @((New-Copy 'g9\x1' 'RELEASED' '<m9@x.example>' '08:00' $true))
@@ -1014,8 +1014,8 @@ $d.Ctl.BSignIn.PerformClick()
 Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
 $sess = $d.Session
 $listed = @{ State = $d.ListState; Items = $d.Ctl.List.Items.Count; Ticked = $d.Ctl.List.CheckedItems.Count; Note = $d.ListMsg; SaveEnabledEarly = $d.Ctl.BSave.Enabled; Connect = $d.ConnectState
-    Columns = (@($d.Ctl.List.Columns | ForEach-Object { $_.Text }) -join '|'); Cells = (@($d.Ctl.List.Items[1].SubItems | ForEach-Object { $_.Text }) -join '|'); HScroll = ($d.Ctl.List.Columns | Measure-Object Width -Sum).Sum -gt $d.Ctl.List.ClientSize.Width }
-$d.Ctl.List.Items[1].Checked = $true
+    Columns = (@($d.Ctl.List.Columns | ForEach-Object { $_.Text }) -join '|').Replace([string][char]0x25BC, '[desc]'); Cells = (@($d.Ctl.List.Items[0].SubItems | ForEach-Object { $_.Text }) -join '|'); HScroll = ($d.Ctl.List.Columns | Measure-Object Width -Sum).Sum -gt $d.Ctl.List.ClientSize.Width }
+$d.Ctl.List.Items[0].Checked = $true
 $enabledNoPw = $d.Ctl.BSave.Enabled
 $d.Ctl.Pw.Text = 'Sentinel-Pw-7f3a'
 $enabledWithPw = $d.Ctl.BSave.Enabled
@@ -1037,8 +1037,8 @@ $out | ConvertTo-Json -Compress -Depth 4
         $r.Listed.Items | Should -Be 2
         $r.Listed.Ticked | Should -Be 0
         $r.Listed.Note | Should -Be '2 messages with pending requests (2 recipient copies). Nothing is selected yet.'
-        $r.Listed.Columns | Should -Be 'Received|Sender|Subject|Quarantine type|Copies|Expires'
-        $r.Listed.Cells | Should -Be '2026-11-25 08:12|billing2@invoice-pay.example|Invoice 2|Phish|1 pending|2026-12-25'
+        $r.Listed.Columns | Should -Be 'Received [desc]|Sender|Recipients|Subject|Quarantine type|Copies|Expires'
+        $r.Listed.Cells | Should -Be '2026-11-25 08:12|billing2@invoice-pay.example|a@corp.example|Invoice 2|Phish|1 pending|2026-12-25'
         $r.Listed.HScroll | Should -BeFalse
         $r.Listed.SaveEnabledEarly | Should -BeFalse
         $r.EnabledNoPw | Should -BeFalse
@@ -1144,10 +1144,9 @@ Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
 $sess = $d.Session
 $first = @{ Checked = $d.Ctl.ChkHandled.Checked; Visible = $d.Ctl.ChkHandled.Visible; Text = $d.Ctl.ChkHandled.Text; Note = $d.Ctl.LblHandled.Text; NoteVisible = $d.Ctl.LblHandled.Visible
     Hint = $d.Ctl.LblListHint.Text; HintVisible = $d.Ctl.LblListHint.Visible; Items = $d.Ctl.List.Items.Count; Calls = (@($sess.State.Calls) -join ' | '); ListNote = $d.ListMsg
-    Copies = $d.Ctl.List.Items[0].SubItems[4].Text; Tip = $d.Ctl.List.Items[0].ToolTipText; ShowTips = $d.Ctl.List.ShowItemToolTips; Flag = ($d.Ctl.List.Items[0].SubItems[4].ForeColor -eq $C.Warning) }
+    Copies = $d.Ctl.List.Items[0].SubItems[5].Text; Tip = $d.Ctl.List.Items[0].ToolTipText; ShowTips = $d.Ctl.List.ShowItemToolTips; Flag = ($d.Ctl.List.Items[0].SubItems[5].ForeColor -eq $C.Warning) }
 $sess.State.Calls = @()
-$d.Ctl.ChkHandled.Checked = $true
-$d.Ctl.BRefresh.PerformClick()
+$d.Ctl.ChkHandled.Checked = $true   # refreshes by itself, no Refresh click
 Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
 $second = @{ Items = $d.Ctl.List.Items.Count; Calls = (@($sess.State.Calls) -join ' | '); ListNote = $d.ListMsg
     MutedSecond = ($d.Ctl.List.Items[1].SubItems[2].ForeColor -eq $C.TextMuted); Status = @($d.Rows | ForEach-Object { $_.Status }) -join ',' }
@@ -1167,7 +1166,7 @@ Out-AsciiJson ([pscustomobject]@{ First = $first; Second = $second })
         $r.First.Calls | Should -Be 'status=Requested;mid= | status=;mid=<m1@invoice-pay.example>'
         $r.First.ListNote | Should -Be '1 message with a pending request (1 recipient copy). Nothing is selected yet.'
         $r.First.Copies | Should -Be "! 1 pending $dot 1 released $dot 1 not requested"
-        $r.First.Tip | Should -Be 'Released to 1 recipient(s) already. Decide for all copies in Defender.'
+        $r.First.Tip | Should -BeLike 'Released to 1 recipient(s) already. Decide for all copies in Defender.*Recipients:*a@corp.example (pending)*'
         $r.First.ShowTips | Should -BeTrue
         $r.First.Flag | Should -BeTrue
         $r.Second.Items | Should -Be 2
@@ -1184,7 +1183,7 @@ Set-RrScreenshotState $d 'results'
 $items = $d.Ctl.List.Items
 [pscustomobject]@{
     Count = $items.Count; Rows = @($items | ForEach-Object { ($_.SubItems | ForEach-Object { $_.Text }) -join '|' }); Checked = $d.Ctl.List.CheckedItems.Count
-    Saved = $d.SaveSummary; Note = $d.ListMsg; Flags = @($d.Rows | ForEach-Object { $_.HasReleasedCopy })
+    Saved = $d.SaveSummary; Note = $d.ListMsg; Header = $d.Ctl.List.Columns[0].Text; Flags = @($d.Rows | ForEach-Object { $_.HasReleasedCopy })
     Json = ($d.Rows | ConvertTo-Json -Depth 5 -Compress)
 } | ForEach-Object { Out-AsciiJson $_ }
 $d.Form.Close()
@@ -1194,12 +1193,249 @@ $d.Form.Close()
         $r.Count | Should -Be 3
         $r.Checked | Should -Be 2
         $r.Saved | Should -Be 'Saved 2 of 2 to Incoming'
-        $r.Rows[0] | Should -BeLike "2026-11-25 08:12|billing@invoice-pay.example|*|HighConfPhish|! 2 pending $dot 2 released $dot 3 not requested|2026-12-25"
-        $r.Rows[1] | Should -BeLike "2026-11-25 09:03|*|Phish|1 pending $dot 3 not requested|2026-12-25"
-        $r.Rows[2] | Should -BeLike "2026-11-25 09:47|*|Spam|1 pending|2026-12-25"
-        @($r.Flags) | Should -Be @($true, $false, $false)
+        # newest first by default
+        $r.Rows[0] | Should -BeLike "2026-11-25 09:47|shipping@parcel-track.example|p.nguyen@corp.example|*|Spam|1 pending|2026-12-25"
+        $r.Rows[1] | Should -BeLike "2026-11-25 09:03|*|a.rivera@corp.example (+3)|*|Phish|1 pending $dot 3 not requested|2026-12-25"
+        $r.Rows[2] | Should -BeLike "2026-11-25 08:12|billing@invoice-pay.example|7 recipients|*|HighConfPhish|! 2 pending $dot 2 released $dot 3 not requested|2026-12-25"
+        @($r.Flags) | Should -Be @($false, $false, $true)
+        $r.Header | Should -Be ("Received " + [char]0x25BC)
         $r.Json | Should -Not -Match '(?i)@(?!\w[\w.-]*\.example)'
         $r.Json | Should -Match '00000000-0000-4000-8000'
+    }
+}
+
+Describe 'ReleaseRequests: Recipients column' {
+    BeforeAll {
+        function New-RcCopy([string]$Identity, [string]$Status, [string]$Who, [string]$MessageId = '<r1@invoice-pay.example>') {
+            $cp = New-Copy $Identity $Status $MessageId '08:10' ($Status -eq 'RELEASED')
+            $cp.Recipient = $Who
+            $cp
+        }
+        $script:RcMid = '<r1@invoice-pay.example>'
+        $script:RcAll = @(
+            (New-RcCopy 'r1\c1' 'NOTRELEASED' 'z.last@corp.example'), (New-RcCopy 'r1\c2' 'REQUESTED' 'a.rivera@corp.example'),
+            (New-RcCopy 'r1\c3' 'RELEASED' 'm.haddad@corp.example'), (New-RcCopy 'r1\c4' 'REQUESTED' 'k.novak@corp.example')
+        )
+    }
+    It 'lists the pending copies first, then the rest, and shows the first address with (+N) when two do not fit' {
+        $g = @(Group-RrMessages @($script:RcAll[1], $script:RcAll[3]) @{ $script:RcMid = $script:RcAll })
+        @($g[0].Recipients | ForEach-Object { $_.Address }) | Should -Be @('a.rivera@corp.example', 'k.novak@corp.example', 'z.last@corp.example', 'm.haddad@corp.example')
+        @($g[0].Recipients | ForEach-Object { $_.Kind }) | Should -Be @('Pending', 'Pending', 'NotRequested', 'Released')
+        Get-RrRecipientsCell $g[0] 40 | Should -Be 'a.rivera@corp.example (+3)'
+        Get-RrRecipientsCell $g[0] 80 | Should -Be 'a.rivera@corp.example, k.novak@corp.example (+2)'
+    }
+    It 'shows one address with no suffix for a single recipient and two addresses without (+N) when that is all there is' {
+        $one = @(Group-RrMessages @((New-RcCopy 'r2\c1' 'REQUESTED' 'p.nguyen@corp.example' '<r2@x.example>')) @{})
+        Get-RrRecipientsCell $one[0] 40 | Should -Be 'p.nguyen@corp.example'
+        $two = @(Group-RrMessages @((New-RcCopy 'r3\c1' 'REQUESTED' 'a@corp.example' '<r3@x.example>'), (New-RcCopy 'r3\c2' 'REQUESTED' 'b@corp.example' '<r3@x.example>')) @{})
+        Get-RrRecipientsCell $two[0] 40 | Should -Be 'a@corp.example, b@corp.example'
+    }
+    It 'falls back to the recipient count when no address is known' {
+        $copies = @(1..7 | ForEach-Object { New-RcCopy "r4\c$_" $(if ($_ -eq 1) { 'REQUESTED' } else { 'NOTRELEASED' }) '' '<r4@x.example>' })
+        $g = @(Group-RrMessages @($copies[0]) @{ '<r4@x.example>' = $copies })
+        @($g[0].Recipients).Count | Should -Be 0
+        Get-RrRecipientsCell $g[0] | Should -Be '7 recipients'
+        Get-RrRecipientsTip $g[0] | Should -Be ''
+        $solo = @(Group-RrMessages @((New-RcCopy 'r5\c1' 'REQUESTED' '' '<r5@x.example>')) @{})
+        Get-RrRecipientsCell $solo[0] | Should -Be '1 recipient'
+    }
+    It 'uses the addresses of the -MessageId lookup when the list rows left them empty' {
+        $rows = @((New-RcCopy 'r1\c2' 'REQUESTED' '' $script:RcMid))
+        $g = @(Group-RrMessages $rows @{ $script:RcMid = $script:RcAll })
+        @($g[0].Recipients).Count | Should -Be 4
+        $g[0].Recipients[0].Address | Should -Be 'a.rivera@corp.example'
+    }
+    It 'reads the address array of an aggregated row and drops duplicates without regard to case' {
+        $raw = [pscustomobject]@{
+            Identity = 'ag\1'; MessageId = '<ag@x.example>'; ReleaseStatus = 'REQUESTED'; Released = $false; RecipientCount = 3
+            ReceivedTime = [datetime]'2026-11-25 08:10'; SenderAddress = 's@x.example'; RecipientAddress = @('x@corp.example', 'Y@corp.example', 'x@CORP.example'); Subject = 'agg'; QuarantineTypes = 'Spam'; Expires = [datetime]'2026-12-25'
+        }
+        $g = @(Group-RrMessages @(ConvertTo-RrRow $raw) @{})
+        @($g[0].Recipients | ForEach-Object { $_.Address }) | Should -Be @('x@corp.example', 'Y@corp.example')
+        $g[0].Counts.Total | Should -Be 3
+        Get-RrRecipientsCell $g[0] 80 | Should -Be 'x@corp.example, Y@corp.example (+1)'
+        Get-RrRecipientsCell $g[0] 20 | Should -Be 'x@corp.example (+2)'
+    }
+    It 'lists every known recipient with its status in the tooltip, and says when Exchange named only some' {
+        $g = @(Group-RrMessages @($script:RcAll[1]) @{ $script:RcMid = $script:RcAll })
+        Get-RrRecipientsTip $g[0] | Should -Be "Recipients:`r`na.rivera@corp.example (pending)`r`nk.novak@corp.example (pending)`r`nz.last@corp.example (not requested)`r`nm.haddad@corp.example (released)"
+        $part = @(Group-RrMessages @((New-RcCopy 'r6\c1' 'REQUESTED' 'a@corp.example' '<r6@x.example>'), (New-RcCopy 'r6\c2' 'REQUESTED' '' '<r6@x.example>'), (New-RcCopy 'r6\c3' 'REQUESTED' '' '<r6@x.example>')) @{})
+        Get-RrRecipientsTip $part[0] | Should -Be "Recipients:`r`na@corp.example (pending)`r`n+ 2 more not listed by Exchange"
+        Get-RrRecipientsCell $part[0] 40 | Should -Be 'a@corp.example (+2)'
+    }
+}
+
+Describe 'ReleaseRequests: Sort-RrMessages' {
+    BeforeAll {
+        function New-SortMsg([string]$Key, $Received, [string]$Sender, [string]$Subject, [string]$Type, [int]$Pending, [int]$Total, $Expires, [string]$Who = '') {
+            $rc = @(); if ($Who) { $rc = @([pscustomobject]@{ Address = $Who; Kind = 'Pending' }) }
+            [pscustomobject]@{
+                Key = $Key; Received = $Received; Sender = $Sender; Subject = $Subject; QuarantineTypes = $Type; Expires = $Expires; Recipients = $rc
+                Counts = [pscustomobject]@{ Pending = $Pending; Total = $Total }
+            }
+        }
+        $script:SortSet = @(
+            (New-SortMsg 'A' ([datetime]'2026-11-25 09:00') 'bob@x.example' 'beta' 'Spam' 1 3 ([datetime]'2026-12-20') 'm@corp.example'),
+            (New-SortMsg 'B' ([datetime]'2026-11-24 10:00') 'Alice@x.example' 'Alpha' 'Phish' 2 2 ([datetime]'2026-12-30') 'a@corp.example'),
+            (New-SortMsg 'C' ([datetime]'2026-11-26 08:00') 'carol@x.example' 'gamma' 'HighConfPhish' 1 7 ([datetime]'2026-12-05') ''),
+            (New-SortMsg 'D' $null 'dave@x.example' 'Delta' 'Bulk' 1 1 $null 'z@corp.example')
+        )
+        function Get-SortKeys($col, [bool]$desc) { (@(Sort-RrMessages $script:SortSet $col $desc) | ForEach-Object { $_.Key }) -join '' }
+    }
+    It 'sorts Received as dates (a missing date first when ascending)' {
+        Get-SortKeys 'Received' $false | Should -Be 'DBAC'
+        Get-SortKeys 'Received' $true | Should -Be 'CABD'
+    }
+    It 'sorts Expires as dates' {
+        Get-SortKeys 'Expires' $false | Should -Be 'DCAB'
+        Get-SortKeys 'Expires' $true | Should -Be 'BACD'
+    }
+    It 'sorts Copies by pending count, then total' {
+        Get-SortKeys 'Copies' $false | Should -Be 'DACB'
+        Get-SortKeys 'Copies' $true | Should -Be 'BCAD'
+    }
+    It 'sorts Sender, Subject and Quarantine type as case-insensitive text' {
+        Get-SortKeys 'Sender' $false | Should -Be 'BACD'
+        Get-SortKeys 'Sender' $true | Should -Be 'DCAB'
+        Get-SortKeys 'Subject' $false | Should -Be 'BADC'
+        Get-SortKeys 'Subject' $true | Should -Be 'CDAB'
+        Get-SortKeys 'Quarantine type' $false | Should -Be 'DCBA'
+        Get-SortKeys 'Quarantine type' $true | Should -Be 'ABCD'
+    }
+    It 'sorts Recipients by the first known address, messages with none first when ascending' {
+        Get-SortKeys 'Recipients' $false | Should -Be 'CBAD'
+        Get-SortKeys 'Recipients' $true | Should -Be 'DABC'
+    }
+    It 'keeps equal rows in their original order and copes with empty input' {
+        $same = @((New-SortMsg 'X' ([datetime]'2026-11-25') 's' 'same' 'Spam' 1 1 $null), (New-SortMsg 'Y' ([datetime]'2026-11-25') 's' 'same' 'Spam' 1 1 $null), (New-SortMsg 'Z' ([datetime]'2026-11-25') 's' 'same' 'Spam' 1 1 $null))
+        (@(Sort-RrMessages $same 'Subject' $false) | ForEach-Object { $_.Key }) -join '' | Should -Be 'XYZ'
+        (@(Sort-RrMessages $same 'Subject' $true) | ForEach-Object { $_.Key }) -join '' | Should -Be 'XYZ'
+        @(Sort-RrMessages @() 'Received' $true).Count | Should -Be 0
+        @(Sort-RrMessages $null 'Received' $true).Count | Should -Be 0
+    }
+}
+
+Describe 'ReleaseRequests: dialog sorting, selection and auto-refresh (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $script:ChildHead3 = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+[System.Windows.Forms.Application]::EnableVisualStyles()
+. '$($script:RrPath)'
+function Show-Offscreen(`$form) {
+    `$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.StartPosition = 'Manual'
+    `$form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+}
+function Wait-Until([scriptblock]`$cond, [int]`$seconds = 40) {
+    `$end = [DateTime]::UtcNow.AddSeconds(`$seconds)
+    while (-not (& `$cond) -and [DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+}
+function Out-AsciiJson(`$obj) {
+    `$j = `$obj | ConvertTo-Json -Compress -Depth 5
+    [regex]::Replace(`$j, '[^\x00-\x7F]', { param(`$m) ('\u{0:x4}' -f [int][char]`$m.Value) })
+}
+"@
+    }
+    It 'sorts by header click, reverses on a second click, keeps the checked messages, and refreshes without losing them' {
+        $b64 = [Convert]::ToBase64String((New-TestZip -Flags 1 -Aes))
+        $inc = Join-Path $TestDrive 'dialog-incoming-sort'
+        $head = $script:ChildHead3 + "`r`n`$b64 = '$b64'`r`n`$inc = '$inc'`r`n"
+        $body = $head + @'
+function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
+function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
+function Get-QuarantineMessage {
+    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId)
+    $State.Calls = @($State.Calls | Where-Object { $_ }) + "status=$ReleaseStatus"
+    function Row($n, $at, $who, $subject, $status) { [pscustomobject]@{ Identity = "g$n\a$n"; ReleaseStatus = $status; Released = $false; ReceivedTime = [datetime]("2026-11-25 $at")
+        SenderAddress = "$who@invoice-pay.example"; RecipientAddress = @("r$n@corp.example"); Subject = $subject; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' } }
+    if ($ReleaseStatus -eq 'Requested') { Row 1 '08:10' 'ccc' 'one' 'REQUESTED'; Row 2 '09:00' 'aaa' 'two' 'REQUESTED'; Row 3 '10:00' 'bbb' 'three' 'REQUESTED' }
+    if ($ReleaseStatus -eq 'Denied') { Row 4 '07:00' 'ddd' 'four' 'DENIED' }
+}
+Invoke-Expression ('function Export-QuarantineMessage { [CmdletBinding()] param($Identity, [switch]$CompressOutput, $Password, $ReasonForExport) Start-Sleep -Milliseconds 1500; [pscustomobject]@{ Eml = ''' + $b64 + ''' } }')
+$d = New-RrDialog -Incoming $inc -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage', 'Export-QuarantineMessage') -NoAutoStart
+Show-Offscreen $d.Form
+$d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
+Update-RrView $d
+$d.Ctl.BSignIn.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
+$sess = $d.Session
+function Keys { (@($d.Ctl.List.Items | ForEach-Object { $_.Tag.Key }) -join ',') }
+function Ticked { (@($d.Ctl.List.CheckedItems | ForEach-Object { $_.Tag.Key } | Sort-Object) -join ',') }
+function Heads { (@($d.Ctl.List.Columns | ForEach-Object { $_.Text }) -join '|') }
+function Requested { @($sess.State.Calls | Where-Object { $_ -eq 'status=Requested' }).Count }
+$out = @{ HeaderStyle = [string]$d.Ctl.List.HeaderStyle; Default = (Keys); DefaultHeads = (Heads); Recipients = (@($d.Ctl.List.Items | ForEach-Object { $_.SubItems[2].Text }) -join ',') }
+foreach ($it in $d.Ctl.List.Items) { if ($it.Tag.Key -eq 'g1' -or $it.Tag.Key -eq 'g2') { $it.Checked = $true } }
+$out.TickedStart = (Ticked)
+Invoke-RrSort $d 1
+$out.BySender = (Keys); $out.BySenderTicked = (Ticked); $out.BySenderHeads = (Heads)
+Invoke-RrSort $d 1
+$out.BySenderRev = (Keys); $out.BySenderRevTicked = (Ticked); $out.BySenderRevHeads = (Heads)
+Invoke-RrSort $d 0
+$out.ByReceived = (Keys); $out.ByReceivedHeads = (Heads)
+Invoke-RrSort $d 0
+$out.ByReceivedRev = (Keys)
+$sess.State.Calls = @()
+$d.Ctl.BRefresh.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' }
+$out.AfterRefreshKeys = (Keys); $out.AfterRefreshTicked = (Ticked); $out.RefreshCalls = (Requested); $out.AfterRefreshHeads = (Heads)
+# the checkbox refreshes at once, exactly one list step, and keeps the ticks
+$sess.State.Calls = @()
+$d.Ctl.ChkHandled.Checked = $true
+$out.ToggleLoading = ($d.ListState -eq 'loading')
+Wait-Until { $d.ListState -eq 'loaded' }
+$out.ToggleKeys = (Keys); $out.ToggleTicked = (Ticked); $out.ToggleRequested = (Requested); $out.ToggleCalls = (@($sess.State.Calls) -join ',')
+# a change while an export runs is remembered and runs when the export ends
+$sess.State.Calls = @()
+foreach ($it in $d.Ctl.List.Items) { $it.Checked = ($it.Tag.Key -eq 'g1' -or $it.Tag.Key -eq 'g2') }
+$d.Ctl.Pw.Text = 'Sentinel-Pw-7f3a'
+$d.Ctl.BSave.PerformClick()
+foreach ($it in $d.Ctl.List.Items) { if ($it.Tag.Key -eq 'g3') { $it.Checked = $true } }
+$out.BusyKind = $d.WorkKind
+$d.Ctl.ChkHandled.Checked = $false
+$out.PendingFlag = [bool]$d.PendingRefresh
+$out.RequestedWhileBusy = (Requested)
+Wait-Until { $d.SaveState -eq 'done' -and $d.ListState -eq 'loaded' -and -not $d.PendingRefresh } 60
+$out.AfterBusyRequested = (Requested); $out.AfterBusyKeys = (Keys); $out.AfterBusyTicked = (Ticked); $out.PendingAfter = [bool]$d.PendingRefresh
+$out.Saved = $d.SaveSummary
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]$out)
+'@
+        $r = Get-ChildJson (Invoke-ChildPs $body)
+        $up = [string][char]0x25B2; $down = [string][char]0x25BC
+        $r.HeaderStyle | Should -Be 'Clickable'
+        $r.Default | Should -Be 'g3,g2,g1'
+        $r.DefaultHeads | Should -Be "Received $down|Sender|Recipients|Subject|Quarantine type|Copies|Expires"
+        $r.Recipients | Should -Be 'r3@corp.example,r2@corp.example,r1@corp.example'
+        $r.TickedStart | Should -Be 'g1,g2'
+        $r.BySender | Should -Be 'g2,g3,g1'
+        $r.BySenderTicked | Should -Be 'g1,g2'
+        $r.BySenderHeads | Should -Be "Received|Sender $up|Recipients|Subject|Quarantine type|Copies|Expires"
+        $r.BySenderRev | Should -Be 'g1,g3,g2'
+        $r.BySenderRevTicked | Should -Be 'g1,g2'
+        $r.BySenderRevHeads | Should -Be "Received|Sender $down|Recipients|Subject|Quarantine type|Copies|Expires"
+        $r.ByReceived | Should -Be 'g1,g2,g3'
+        $r.ByReceivedHeads | Should -Be "Received $up|Sender|Recipients|Subject|Quarantine type|Copies|Expires"
+        $r.ByReceivedRev | Should -Be 'g3,g2,g1'
+        $r.AfterRefreshKeys | Should -Be 'g3,g2,g1'
+        $r.AfterRefreshTicked | Should -Be 'g1,g2'
+        $r.RefreshCalls | Should -Be 1
+        $r.AfterRefreshHeads | Should -Be "Received $down|Sender|Recipients|Subject|Quarantine type|Copies|Expires"
+        $r.ToggleLoading | Should -BeTrue
+        $r.ToggleRequested | Should -Be 1
+        $r.ToggleCalls | Should -Be 'status=Requested,status=Released,status=Denied'
+        $r.ToggleKeys | Should -Be 'g3,g2,g1,g4'
+        $r.ToggleTicked | Should -Be 'g1,g2'
+        $r.BusyKind | Should -Be 'export'
+        $r.PendingFlag | Should -BeTrue
+        $r.RequestedWhileBusy | Should -Be 0
+        $r.AfterBusyRequested | Should -Be 1
+        $r.PendingAfter | Should -BeFalse
+        $r.AfterBusyKeys | Should -Be 'g3,g2,g1'
+        $r.Saved | Should -Be 'Saved 2 of 2 to Incoming'
+        $r.AfterBusyTicked | Should -Be 'g3'
     }
 }
 
@@ -1267,6 +1503,14 @@ Describe 'Release requests: wording and window chrome' {
         $t = [IO.File]::ReadAllText($script:RrPath)
         $t.Contains("'Nothing is selected by default. Select the messages to save.'") | Should -BeTrue
         $t.Contains("'Saves each selected message as a password-protected ZIP.'") | Should -BeTrue
+    }
+    It 'wires the header click, the checkbox refresh and Enter in the recipient box, and not the keystroke or the days control' {
+        $t = [IO.File]::ReadAllText($script:RrPath)
+        $t.Contains('$k.List.Add_ColumnClick(') | Should -BeTrue
+        $t.Contains('$k.ChkHandled.Add_CheckedChanged(') | Should -BeTrue
+        $t.Contains('$k.Recip.Add_KeyDown(') | Should -BeTrue
+        $t.Contains('$k.Recip.Add_TextChanged(') | Should -BeFalse
+        $t.Contains('$k.Days.Add_ValueChanged(') | Should -BeFalse
     }
     It 'gives the dialog the app icon and the taskbar identity (not for the screenshot build)' {
         $t = [IO.File]::ReadAllText($script:RrPath)
