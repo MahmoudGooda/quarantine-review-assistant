@@ -34,10 +34,10 @@ function Get-RrWindowDays([int]$days) {
     [Math]::Min(30, [Math]::Max(1, $days))
 }
 
-function Get-RrQuarantineParams([int]$Days, [string]$Recipient, [datetime]$Now = (Get-Date)) {
+function Get-RrQuarantineParams([int]$Days, [string]$Recipient, [datetime]$Now = (Get-Date), [string]$Status = 'Requested') {
     $span = Get-RrWindowDays $Days
     $p = @{
-        ReleaseStatus     = 'Requested'
+        ReleaseStatus     = $Status
         PageSize          = 1000
         StartReceivedDate = $Now.AddDays(-$span)
         EndReceivedDate   = $Now
@@ -47,10 +47,15 @@ function Get-RrQuarantineParams([int]$Days, [string]$Recipient, [datetime]$Now =
 }
 
 function ConvertTo-RrRow($message) {
+    # One quarantine row = one recipient copy of a message.
     $rcpt = @($message.RecipientAddress | Where-Object { $_ }) -join '; '
     $types = @($message.QuarantineTypes | Where-Object { $_ }) -join ', '
     [pscustomobject]@{
         Identity        = [string]$message.Identity
+        MessageId       = [string]$message.MessageId
+        ReleaseStatus   = [string]$message.ReleaseStatus
+        Released        = $message.Released
+        RecipientCount  = [Math]::Max([Math]::Max(1, [int]$message.RecipientCount), @($message.RecipientAddress | Where-Object { $_ }).Count)
         Received        = $message.ReceivedTime
         Sender          = [string]$message.SenderAddress
         Recipient       = $rcpt
@@ -60,14 +65,200 @@ function ConvertTo-RrRow($message) {
     }
 }
 
-function Get-RrRequests([int]$Days = 0, [string]$Recipient = '', [datetime]$Now = (Get-Date)) {
-    $p = Get-RrQuarantineParams -Days $Days -Recipient $Recipient -Now $Now
+function Get-RrRequests([int]$Days = 0, [string]$Recipient = '', [datetime]$Now = (Get-Date), [string]$Status = 'Requested') {
+    # Raw rows (one per recipient copy) that have the given release status.
+    $p = Get-RrQuarantineParams -Days $Days -Recipient $Recipient -Now $Now -Status $Status
     foreach ($msg in @(Get-QuarantineMessage @p -ErrorAction Stop)) { ConvertTo-RrRow $msg }
 }
 
 function Get-RrCapMessage([int]$count) {
     if ($count -ge 1000) { return 'Showing the first 1000. Narrow the date range or filter by recipient.' }
     ''
+}
+
+function Get-RrMessageKey($row) {
+    # The message id when there is one, otherwise the part of the identity before the first backslash.
+    $mid = ''
+    $prop = $row.PSObject.Properties['MessageId']
+    if ($prop -and $null -ne $prop.Value) { $mid = ([string]$prop.Value).Trim() }
+    if ($mid) { return $mid }
+    $id = ''
+    $idProp = $row.PSObject.Properties['Identity']
+    if ($idProp -and $null -ne $idProp.Value) { $id = [string]$idProp.Value }
+    $cut = $id.IndexOf('\')
+    if ($cut -ge 0) { return $id.Substring(0, $cut) }
+    $id
+}
+
+function Get-RrCopyKind($copy) {
+    # Pending, Released, Denied or NotRequested. Status text is compared without regard to case (Exchange returns REQUESTED, RELEASED, NOTRELEASED ...).
+    $status = ''
+    $prop = $copy.PSObject.Properties['ReleaseStatus']
+    if ($prop -and $null -ne $prop.Value) { $status = ([string]$prop.Value).Trim().ToUpperInvariant() }
+    $rel = $null
+    $relProp = $copy.PSObject.Properties['Released']
+    if ($relProp) { $rel = $relProp.Value }
+    if ($rel -eq $true -or $status -eq 'RELEASED' -or $status -eq 'APPROVED') { return 'Released' }
+    if ($status -eq 'REQUESTED') { return 'Pending' }
+    if ($status -eq 'DENIED') { return 'Denied' }
+    'NotRequested'
+}
+
+function Get-RrCopyWeight($copy) {
+    # A per-recipient row is one copy. An aggregated row (one entry with several recipients) counts as all of them, with its own status.
+    $w = 1
+    $prop = $copy.PSObject.Properties['RecipientCount']
+    if ($prop -and $null -ne $prop.Value) { try { $w = [Math]::Max($w, [int]$prop.Value) } catch { $null = $_ } }
+    $addr = $copy.PSObject.Properties['RecipientAddress']
+    if ($addr -and $null -ne $addr.Value) { $w = [Math]::Max($w, @($addr.Value | Where-Object { $_ }).Count) }
+    $w
+}
+
+function Get-RrCopyCounts($copies) {
+    $n = @{ Pending = 0; Released = 0; Denied = 0; NotRequested = 0 }
+    foreach ($c in @($copies)) {
+        if ($null -eq $c) { continue }
+        $n[(Get-RrCopyKind $c)] += (Get-RrCopyWeight $c)
+    }
+    [pscustomobject]@{
+        Pending = [int]$n.Pending; Released = [int]$n.Released; Denied = [int]$n.Denied; NotRequested = [int]$n.NotRequested
+        Total   = [int]($n.Pending + $n.Released + $n.Denied + $n.NotRequested); Unknown = $false
+    }
+}
+
+function Format-RrCopies($counts) {
+    # For example: 2 pending . 2 released . 3 not requested (a middle dot between the parts, zero parts left out).
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($counts.Pending -gt 0) { $parts.Add("$($counts.Pending) pending") }
+    if ($counts.Released -gt 0) { $parts.Add("$($counts.Released) released") }
+    if ($counts.Denied -gt 0) { $parts.Add("$($counts.Denied) denied") }
+    if ($counts.NotRequested -gt 0) { $parts.Add("$($counts.NotRequested) not requested") }
+    if ($counts.Unknown) { $parts.Add('other copies unknown') }
+    $parts -join (' {0} ' -f [char]0x00B7)
+}
+
+function Group-RrRowsByKey($Rows) {
+    $map = [ordered]@{}
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        $key = Get-RrMessageKey $r
+        if (-not $map.Contains($key)) { $map[$key] = [System.Collections.Generic.List[object]]::new() }
+        $map[$key].Add($r)
+    }
+    $map
+}
+
+function Group-RrMessages($Rows, $CopiesByKey = @{}) {
+    # One object per message. CopiesByKey maps a message key to the rows of a MessageId lookup (every recipient copy).
+    # A key that is present with a null value means the lookup failed: the copies stay as they are and are marked unknown.
+    $byKey = Group-RrRowsByKey $Rows
+    foreach ($key in @($byKey.Keys)) {
+        $own = @($byKey[$key])
+        $unknown = $false
+        $found = @()
+        if ($CopiesByKey -and $CopiesByKey.Contains($key)) {
+            if ($null -eq $CopiesByKey[$key]) { $unknown = $true } else { $found = @($CopiesByKey[$key] | Where-Object { $_ }) }
+        }
+        # the queried rows first (the lookup version of a copy wins), then the copies only the lookup knew
+        $byId = @{}
+        foreach ($c in $found) { $byId[[string]$c.Identity] = $c }
+        $all = [System.Collections.Generic.List[object]]::new()
+        $used = @{}
+        foreach ($c in $own) {
+            $id = [string]$c.Identity
+            if ($used.Contains($id)) { continue }
+            $used[$id] = $true
+            if ($byId.Contains($id)) { $all.Add($byId[$id]) } else { $all.Add($c) }
+        }
+        foreach ($c in $found) {
+            $id = [string]$c.Identity
+            if ($used.Contains($id)) { continue }
+            $used[$id] = $true
+            $all.Add($c)
+        }
+        $counts = Get-RrCopyCounts $all
+        $counts.Unknown = $unknown
+        $pendingCopy = $all | Where-Object { (Get-RrCopyKind $_) -eq 'Pending' } | Select-Object -First 1
+        $exportCopy = $(if ($pendingCopy) { $pendingCopy } else { $all[0] })
+        $received = @($all | Where-Object { $_.Received } | ForEach-Object { [datetime]$_.Received } | Sort-Object | Select-Object -First 1)
+        $expires = @($all | Where-Object { $_.Expires } | ForEach-Object { [datetime]$_.Expires } | Sort-Object | Select-Object -First 1)
+        $types = @($all | ForEach-Object { @([string]$_.QuarantineTypes -split ',\s*') } | Where-Object { $_ } | Select-Object -Unique) -join ', '
+        $status = 'Released'
+        if ($counts.Pending -gt 0) { $status = 'Pending' }
+        elseif ($counts.Denied -gt $counts.Released) { $status = 'Denied' }
+        [pscustomobject]@{
+            Key             = $key
+            ExportIdentity  = [string]$exportCopy.Identity
+            Received        = $(if ($received.Count) { $received[0] } else { $null })
+            Sender          = [string]$own[0].Sender
+            Subject         = [string]$own[0].Subject
+            QuarantineTypes = $types
+            Expires         = $(if ($expires.Count) { $expires[0] } else { $null })
+            Counts          = $counts
+            CopiesText      = (Format-RrCopies $counts)
+            Status          = $status
+            HasReleasedCopy = ($counts.Released -gt 0)
+            RecipientCount  = $counts.Total
+        }
+    }
+}
+
+function Get-RrCopiesCell($message) {
+    $mark = $(if ($message.HasReleasedCopy) { '! ' } else { '' })
+    $mark + [string]$message.CopiesText
+}
+
+function Get-RrRowTip($message) {
+    if (-not $message.HasReleasedCopy) { return '' }
+    "Released to $($message.Counts.Released) recipient(s) already. Decide for all copies in Defender."
+}
+
+function Set-RrProgress([string]$Text) {
+    # Progress text for the dialog: the session variable State is shared with the window (it is absent outside the dialog session).
+    $shared = Get-Variable -Name State -ValueOnly -ErrorAction SilentlyContinue
+    if ($shared -is [hashtable]) { $shared['Progress'] = $Text }
+}
+
+function Get-RrMessages {
+    # The listing step (runs in the session, never on the UI thread): pending copies, optionally released and denied ones, then one
+    # read-only lookup per message to count every recipient copy. Returns Messages (one per message) and the raw pending row count.
+    param([int]$Days = 0, [string]$Recipient = '', [switch]$IncludeHandled, [datetime]$Now = (Get-Date))
+    $raw = @(Get-RrRequests -Days $Days -Recipient $Recipient -Now $Now -Status 'Requested')
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($r in $raw) {
+        if ((Get-RrCopyKind $r) -ne 'Pending') { continue }
+        if ($seen.Contains([string]$r.Identity)) { continue }
+        $seen[[string]$r.Identity] = $true
+        $rows.Add($r)
+    }
+    if ($IncludeHandled) {
+        Set-RrProgress 'Loading released and denied messages...'
+        foreach ($status in 'Released', 'Denied') {
+            foreach ($r in @(Get-RrRequests -Days $Days -Recipient $Recipient -Now $Now -Status $status)) {
+                if ($seen.Contains([string]$r.Identity)) { continue }
+                $seen[[string]$r.Identity] = $true
+                $rows.Add($r)
+            }
+        }
+    }
+    $byKey = Group-RrRowsByKey $rows
+    $copiesByKey = @{}
+    $total = $byKey.Count
+    $at = 0
+    foreach ($key in @($byKey.Keys)) {
+        $at++
+        Set-RrProgress ('Checking other copies ({0} of {1})...' -f $at, $total)
+        $mid = ''
+        foreach ($r in $byKey[$key]) { if (-not $mid -and $r.MessageId) { $mid = [string]$r.MessageId } }
+        if (-not $mid) { continue }
+        try {
+            $copiesByKey[$key] = @(Get-QuarantineMessage -MessageId $mid -ErrorAction Stop | ForEach-Object { ConvertTo-RrRow $_ })
+        } catch {
+            $copiesByKey[$key] = $null
+        }
+    }
+    [pscustomobject]@{ Messages = @(Group-RrMessages $rows $copiesByKey); RawPending = $raw.Count; Handled = [bool]$IncludeHandled }
 }
 
 function Get-RrFileName([datetime]$Received, [string]$Identity) {
@@ -344,8 +535,9 @@ function Get-RrConnectScript {
 }
 
 function Get-RrSessionFunctionNames {
-    @('Get-RrWindowDays', 'Get-RrQuarantineParams', 'ConvertTo-RrRow', 'Get-RrRequests', 'Get-RrFileName', 'Get-RrZipSummary', 'Test-RrZipBytes',
-        'Get-RrErrorText', 'New-RrResult', 'Save-RrExport')
+    @('Get-RrWindowDays', 'Get-RrQuarantineParams', 'ConvertTo-RrRow', 'Get-RrRequests', 'Get-RrCapMessage', 'Get-RrMessageKey', 'Get-RrCopyKind',
+        'Get-RrCopyWeight', 'Get-RrCopyCounts', 'Format-RrCopies', 'Group-RrRowsByKey', 'Group-RrMessages', 'Set-RrProgress', 'Get-RrMessages', 'Get-RrFileName',
+        'Get-RrZipSummary', 'Test-RrZipBytes', 'Get-RrErrorText', 'New-RrResult', 'Save-RrExport')
 }
 
 # ================================================================= dialog
@@ -421,7 +613,7 @@ function Update-RrSaveButton($d) {
     $k = $d.Ctl
     $k.BSave.Enabled = ($d.ConnectState -eq 'done') -and (-not $d.Work) -and ($d.ListState -ne 'loading') -and ($k.List.CheckedItems.Count -ge 1) -and ($k.Pw.Text.Length -ge 1)
     if ($d.ListState -eq 'loaded') {   # keep the selected count under the list current
-        $d.ListMsg = Get-RrListNote @($d.Rows).Count $k.List.CheckedItems.Count
+        $d.ListMsg = Get-RrListNote $d.Rows $k.List.CheckedItems.Count $d.IncludeHandled $d.RawPending
         $k.LblList.Text = $d.ListMsg
     }
     $st = Get-RrStepStates $d
@@ -455,7 +647,7 @@ function Update-RrView($d) {
 
         # ---- hide every optional control, then show what the state needs
         Hide-RrControls @($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
-                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.List, $k.SpList, $k.LblList,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.LblListHint,
                 $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet))
         Set-QraSpinner $k.SpInstall ($d.InstallState -eq 'waiting') 'Waiting for the install window to close'
         Set-QraSpinner $k.SpConnect ($d.ConnectState -eq 'working') 'Waiting for you to sign in'
@@ -530,7 +722,14 @@ function Update-RrView($d) {
                 Set-RrBounds $k.BRefresh ($k.Recip.Right + (S 16)) ($yy - (S 2)) $bw (S 34)
                 $k.BRefresh.Enabled = ($d.ListState -ne 'loading') -and (-not $d.Work)
                 $yy += $rowH + (S 6)
-                Set-RrBounds $k.List $textX $yy $w (S 150)
+                $k.ChkHandled.Text = 'Also show released and denied messages'
+                $cw = (Get-RrTextWidth $k.ChkHandled.Text $k.ChkHandled.Font) + (S 34)
+                Set-RrBounds $k.ChkHandled $textX $yy $cw (S 24)
+                $k.ChkHandled.Enabled = ($d.ListState -ne 'loading') -and (-not $d.Work)
+                $yy = $k.ChkHandled.Bottom + (S 1)
+                $yy = (Set-RrWrapped $k.LblHandled ($textX + (S 22)) $yy ($w - (S 22))) + (S 8)
+                Set-RrBounds $k.List $textX $yy $w (S 160)
+                Set-RrListColumns $k.List
                 $yy = $k.List.Bottom + (S 6)
                 $note = $d.ListMsg
                 $lx = $textX
@@ -539,7 +738,8 @@ function Update-RrView($d) {
                 $k.LblList.ForeColor = $(if ($d.ListState -eq 'failed') { $C.Danger } else { $C.TextMuted })
                 $yb = Set-RrWrapped $k.LblList $lx $yy ($w - ($lx - $textX))
                 if ($d.ListState -eq 'loading') { $k.SpList.Top = $k.LblList.Top + [int](($k.LblList.Height - $k.SpList.Height) / 2); $yb = [Math]::Max($yb, $k.SpList.Bottom) }
-                $yy = [Math]::Max($yb, $yy + (S 20)) + (S 6)
+                $yy = [Math]::Max($yb, $yy + (S 20)) + (S 2)
+                $yy = (Set-RrWrapped $k.LblListHint $textX $yy $w) + (S 6)
             }
             if ($i -eq 3 -and $connected) {
                 $rowH = S 30
@@ -592,7 +792,24 @@ function Get-RrTextWidth([string]$text, $font) {
     [System.Windows.Forms.TextRenderer]::MeasureText($text, $font, (New-Object System.Drawing.Size([int]::MaxValue, 0)), $fl).Width
 }
 
+function Set-RrListColumns($lv) {
+    # Columns: Received, Sender, Subject, Quarantine type, Copies, Expires. Sender and Subject share what the others leave, so no horizontal scrollbar.
+    $avail = $lv.ClientSize.Width - (S 2)
+    if ($avail -le 0 -or $lv.Columns.Count -ne 6) { return }
+    $received = S 128; $type = S 108; $copies = S 275; $expires = S 84
+    $rest = $avail - ($received + $type + $copies + $expires)
+    if ($rest -lt (S 200)) {
+        $copies = [Math]::Max((S 170), $copies - ((S 200) - $rest))
+        $rest = $avail - ($received + $type + $copies + $expires)
+    }
+    $sender = [Math]::Max((S 80), [int]($rest * 0.4))
+    $subject = [Math]::Max((S 80), $rest - $sender)
+    $widths = @($received, $sender, $subject, $type, $copies, $expires)
+    for ($i = 0; $i -lt 6; $i++) { $lv.Columns[$i].Width = $widths[$i] }
+}
+
 function Set-RrRows($d, $rows) {
+    # One list row per message.
     $lv = $d.Ctl.List
     $d.Rows = @($rows)
     $lv.BeginUpdate()
@@ -600,20 +817,42 @@ function Set-RrRows($d, $rows) {
         $lv.Items.Clear()
         foreach ($r in $d.Rows) {
             $it = New-Object System.Windows.Forms.ListViewItem -ArgumentList ([string](Format-RrDate $r.Received 'yyyy-MM-dd HH:mm'))
-            foreach ($cell in @($r.Sender, $r.Recipient, $r.Subject, $r.QuarantineTypes, (Format-RrDate $r.Expires 'yyyy-MM-dd'))) { [void]$it.SubItems.Add([string]$cell) }
+            $cells = @($r.Sender, $r.Subject, $r.QuarantineTypes, (Get-RrCopiesCell $r), (Format-RrDate $r.Expires 'yyyy-MM-dd'))
+            foreach ($cell in $cells) { [void]$it.SubItems.Add([string]$cell) }
+            $it.UseItemStyleForSubItems = $false
+            $rowColor = $(if ($r.Status -ne 'Pending') { $C.TextMuted } else { $C.Text })
+            foreach ($sub in $it.SubItems) { $sub.ForeColor = $rowColor }
+            if ($r.HasReleasedCopy -and $r.Status -eq 'Pending') { $it.SubItems[4].ForeColor = $C.Warning }
+            $it.ToolTipText = Get-RrRowTip $r
             $it.Tag = $r
             [void]$lv.Items.Add($it)
         }
     } finally { $lv.EndUpdate() }
 }
 
-function Get-RrListNote([int]$count, [int]$picked = 0) {
-    if ($count -eq 0) { return 'No pending release requests in this period.' }
-    $word = $(if ($count -eq 1) { 'request' } else { 'requests' })
-    $pickText = $(if ($picked -eq 0) { 'Nothing is selected yet.' } else { "$picked selected." })
-    $cap = Get-RrCapMessage $count
-    if ($cap) { return "$cap $pickText" }
-    "$count pending release $word. $pickText"
+function Get-RrListNote($Messages, [int]$Picked = 0, [bool]$Handled = $false, [int]$RawPending = 0) {
+    $list = @($Messages | Where-Object { $_ })
+    if ($list.Count -eq 0) {
+        if ($Handled) { return 'No messages in this period.' }
+        return 'No pending release requests in this period.'
+    }
+    $pendingMessages = @($list | Where-Object { $_.Status -eq 'Pending' }).Count
+    $pendingCopies = 0
+    foreach ($m in $list) { $pendingCopies += [int]$m.Counts.Pending }
+    $head = ''
+    if ($Handled) {
+        $word = $(if ($list.Count -eq 1) { 'message' } else { 'messages' })
+        $with = $(if ($pendingMessages -eq 1) { '1 with a pending request' } else { "$pendingMessages with pending requests" })
+        $head = "$($list.Count) $word ($with)."
+    } else {
+        $word = $(if ($list.Count -eq 1) { '1 message with a pending request' } else { "$($list.Count) messages with pending requests" })
+        $copyWord = $(if ($pendingCopies -eq 1) { '1 recipient copy' } else { "$pendingCopies recipient copies" })
+        $head = "$word ($copyWord)."
+    }
+    $pickText = $(if ($Picked -eq 0) { 'Nothing is selected yet.' } else { "$Picked selected." })
+    $cap = Get-RrCapMessage $RawPending
+    if ($cap) { return "$cap $head $pickText" }
+    "$head $pickText"
 }
 
 function Get-RrDialogSession($d) {
@@ -677,7 +916,9 @@ function Start-RrList($d) {
     $k = $d.Ctl
     $d.ListState = 'loading'
     $d.ListMsg = 'Loading release requests...'
-    $d.Work = Invoke-RrStep (Get-RrDialogSession $d) { Get-RrRequests -Days $RrDays -Recipient $RrRecipient } @{ RrDays = [int]$k.Days.Value; RrRecipient = $k.Recip.Text.Trim() }
+    $session = Get-RrDialogSession $d
+    $session.State['Progress'] = ''
+    $d.Work = Invoke-RrStep $session { Get-RrMessages -Days $RrDays -Recipient $RrRecipient -IncludeHandled:$RrHandled } @{ RrDays = [int]$k.Days.Value; RrRecipient = $k.Recip.Text.Trim(); RrHandled = [bool]$k.ChkHandled.Checked }
     $d.WorkKind = 'list'
     $d.Poll.Start()
     Update-RrView $d
@@ -703,7 +944,7 @@ function Start-RrNextExport($d) {
     if ($b.Index -ge $b.Items.Count) { Complete-RrBatch $d; return }
     $row = $b.Items[$b.Index].Tag
     $d.SaveProgress = 'Saving {0} of {1}...' -f ($b.Index + 1), $b.Items.Count
-    $vars = @{ RrIdentity = [string]$row.Identity; RrReceived = [datetime]$row.Received; RrPassword = $b.Password; RrIncoming = [string]$d.Incoming }
+    $vars = @{ RrIdentity = [string]$row.ExportIdentity; RrReceived = [datetime]$row.Received; RrPassword = $b.Password; RrIncoming = [string]$d.Incoming }
     $d.Work = Invoke-RrStep (Get-RrDialogSession $d) { Save-RrExport -Identity $RrIdentity -Received $RrReceived -Password $RrPassword -Incoming $RrIncoming } $vars
     $d.WorkKind = 'export'
     $d.Poll.Start()
@@ -752,7 +993,13 @@ function Complete-RrExport($d, $res) {
 function Invoke-RrPoll($d) {
     $work = $d.Work
     if (-not $work) { $d.Poll.Stop(); return }
-    if (-not $work.Handle.IsCompleted) { return }
+    if (-not $work.Handle.IsCompleted) {
+        if ($d.WorkKind -eq 'list' -and $d.Session) {
+            $progress = [string]$d.Session.State['Progress']
+            if ($progress -and $progress -ne $d.ListMsg) { $d.ListMsg = $progress; $d.Ctl.LblList.Text = $progress }
+        }
+        return
+    }
     $d.Poll.Stop()
     $d.Work = $null
     $res = Complete-RrStep $work
@@ -771,14 +1018,16 @@ function Invoke-RrPoll($d) {
             }
         }
         'list' {
-            if ($res.Error -and @($res.Output).Count -eq 0) {
+            $payload = @($res.Output | Where-Object { $_ -and $_.PSObject.Properties['Messages'] }) | Select-Object -Last 1
+            if (-not $payload) {
                 $d.ListState = 'failed'
-                $d.ListMsg = 'Could not list release requests: ' + $res.Error
+                $d.ListMsg = 'Could not list release requests: ' + $(if ($res.Error) { $res.Error } else { 'no data came back.' })
             } else {
-                $rows = @($res.Output | Where-Object { $_ })
-                Set-RrRows $d $rows
+                Set-RrRows $d @($payload.Messages)
+                $d.IncludeHandled = [bool]$payload.Handled
+                $d.RawPending = [int]$payload.RawPending
                 $d.ListState = 'loaded'
-                $d.ListMsg = Get-RrListNote $rows.Count
+                $d.ListMsg = Get-RrListNote $d.Rows 0 $d.IncludeHandled $d.RawPending
             }
             Update-RrView $d
         }
@@ -814,7 +1063,7 @@ function New-RrDialog {
     $form.SuspendLayout()
     Initialize-QraForm $form
     $form.Text = 'Fetch release requests - Quarantine Review Assistant'
-    $form.Size = New-Object System.Drawing.Size(1000, 880)
+    $form.Size = New-Object System.Drawing.Size(1120, 880)
     $form.MinimumSize = New-Object System.Drawing.Size(760, 640)
     $form.StartPosition = 'CenterScreen'
     $form.BackColor = $C.Surface
@@ -861,7 +1110,7 @@ function New-RrDialog {
         Form = $form; Incoming = $Incoming; Fonts = $fonts; Ctl = $k; SessionFunctions = $SessionFunctions
         Session = $null; Work = $null; WorkKind = ''; Module = $null; InstallProc = $null; Batch = $null
         InstallState = 'idle'; InstallMsg = ''; ConnectState = 'idle'; ConnectMsg = ''; ListState = 'idle'; ListMsg = ''
-        SaveState = 'idle'; SaveProgress = ''; SaveSummary = ''; SaveProblems = ''; SaveAllOk = $false; RejectedText = ''; Rows = @()
+        SaveState = 'idle'; SaveProgress = ''; SaveSummary = ''; SaveProblems = ''; SaveAllOk = $false; RejectedText = ''; Rows = @(); IncludeHandled = $false; RawPending = 0
         Steps = @(); Ready = $false; InLayout = $false
     }
     $form.Tag = $d
@@ -905,16 +1154,21 @@ function New-RrDialog {
     $k.Recip = New-Object System.Windows.Forms.TextBox
     $k.Recip.Font = $fonts.Body; $k.Recip.Visible = $false
     $k.BRefresh = New-RrButton 'Refresh list' 'Secondary' $QraGlyph.Refresh $fonts.Body
+    $k.ChkHandled = New-Object System.Windows.Forms.CheckBox
+    $k.ChkHandled.Text = 'Also show released and denied messages'; $k.ChkHandled.Font = $fonts.Body; $k.ChkHandled.ForeColor = $C.Text; $k.ChkHandled.BackColor = $C.Card
+    $k.ChkHandled.AutoSize = $false; $k.ChkHandled.UseMnemonic = $false; $k.ChkHandled.Visible = $false
+    $k.LblHandled = New-RrLabel 'Includes messages released by an admin without a request.' $fonts.Body $C.TextMuted
     $lv = New-Object System.Windows.Forms.ListView
     $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.MultiSelect = $false
     $lv.HeaderStyle = 'Nonclickable'; $lv.BorderStyle = 'FixedSingle'; $lv.Font = $fonts.Body
-    $lv.BackColor = $C.Card; $lv.ForeColor = $C.Text; $lv.Visible = $false
-    foreach ($col in @(@('Received', 135), @('Sender', 165), @('Recipient', 150), @('Subject', 185), @('Quarantine type', 115), @('Expires', 85))) {
+    $lv.BackColor = $C.Card; $lv.ForeColor = $C.Text; $lv.Visible = $false; $lv.ShowItemToolTips = $true
+    foreach ($col in @(@('Received', 128), @('Sender', 110), @('Subject', 160), @('Quarantine type', 108), @('Copies', 275), @('Expires', 84))) {
         [void]$lv.Columns.Add([string]$col[0], (S $col[1]))
     }
     $k.List = $lv
     $k.SpList = New-QraSpinner (S 24); $k.SpList.Visible = $false
     $k.LblList = New-RrLabel '' $fonts.Body $C.TextMuted
+    $k.LblListHint = New-RrLabel 'One row per message. Saving exports one copy; decide for all copies in Defender.' $fonts.Body $C.TextMuted
 
     # step 4: save
     $k.LblPw = New-RrLabel 'Download password' $fonts.BodyBold $C.Text
@@ -933,7 +1187,7 @@ function New-RrDialog {
     $k.BCopyDet = New-RrButton 'Copy details' 'Secondary' $QraGlyph.Copy $fonts.Body
 
     $scroll.Controls.AddRange(@($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
-                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.List, $k.SpList, $k.LblList,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.LblListHint,
                 $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet)))
 
     # footer: a read-only reminder on the left, Close on the right
@@ -990,14 +1244,15 @@ function New-RrDialog {
     Set-Access $k.Days 'Days to look back'
     Set-Access $k.Recip 'Recipient address filter, optional'
     Set-Access $k.BRefresh 'Refresh the list of release requests'
-    Set-Access $k.List 'Release requests, select the messages to save'
+    Set-Access $k.ChkHandled 'Also show released and denied messages'
+    Set-Access $k.List 'Messages with release requests, select the messages to save'
     Set-Access $k.Pw 'Download password'
     Set-Access $k.BSave 'Save the selected messages to Incoming'
     Set-Access $k.Rej 'Details of the rejected export'
     Set-Access $k.BCopyDet 'Copy the details of the rejected export'
     Set-Access $k.BClose 'Close this window'
     $ti = 0
-    foreach ($ctl in @($k.BInstall, $k.BCopyCmd, $k.BSignIn, $k.Days, $k.Recip, $k.BRefresh, $k.List, $k.Pw, $k.BSave, $k.Rej, $k.BCopyDet)) { $ctl.TabIndex = $ti++ }
+    foreach ($ctl in @($k.BInstall, $k.BCopyCmd, $k.BSignIn, $k.Days, $k.Recip, $k.ChkHandled, $k.BRefresh, $k.List, $k.Pw, $k.BSave, $k.Rej, $k.BCopyDet)) { $ctl.TabIndex = $ti++ }
     $k.BClose.TabIndex = 0
 
     $d.Ready = $true
@@ -1033,27 +1288,36 @@ function Set-RrScreenshotState($d, [string]$State = 'results') {
         Update-RrView $d
         return
     }
+    # three messages (synthetic): the copies of each are what the MessageId lookup would return
     $expires = ConvertTo-RrShotDate '2026-12-25 00:00'
-    $fake = @(
-        @('08:12', 'billing@invoice-pay.example', 'a.rivera@corp.example', 'Invoice 4471 - action required', 'HighConfPhish'),
-        @('09:03', 'it-helpdesk@contoso-mail.example', 'j.chen@corp.example', 'Password expires today - verify now', 'Phish'),
-        @('09:47', 'shipping@parcel-track.example', 'm.okafor@corp.example', 'Parcel on hold: confirm your delivery', 'Spam'),
-        @('10:15', 'hr-benefits@payroll-update.example', 's.novak@corp.example', 'Updated benefits statement', 'Malware'),
-        @('10:31', 'accounts@invoice-pay.example', 'd.silva@corp.example', 'Overdue payment notice', 'HighConfPhish')
+    $plan = @(
+        @{ At = '08:12'; Sender = 'billing@invoice-pay.example'; Subject = 'Invoice 4471 - action required'; Type = 'HighConfPhish'; Copies = @('REQUESTED', 'REQUESTED', 'RELEASED', 'RELEASED', 'NOTRELEASED', 'NOTRELEASED', 'NOTRELEASED') },
+        @{ At = '09:03'; Sender = 'it-helpdesk@contoso-mail.example'; Subject = 'Password expires today - verify now'; Type = 'Phish'; Copies = @('REQUESTED', 'NOTRELEASED', 'NOTRELEASED', 'NOTRELEASED') },
+        @{ At = '09:47'; Sender = 'shipping@parcel-track.example'; Subject = 'Parcel on hold: confirm your delivery'; Type = 'Spam'; Copies = @('REQUESTED') }
     )
-    $rows = @()
-    for ($i = 0; $i -lt $fake.Count; $i++) {
-        $f = $fake[$i]
-        $rows += [pscustomobject]@{
-            Identity        = ('00000000-0000-4000-8000-00000000000{0}\00000000-0000-4000-8000-0000000000a{0}' -f ($i + 1))
-            Received        = (ConvertTo-RrShotDate ('2026-11-25 ' + $f[0]))
-            Sender          = $f[1]; Recipient = $f[2]; Subject = $f[3]; QuarantineTypes = $f[4]; Expires = $expires
+    $pendingRows = @()
+    $lookups = @{}
+    for ($m = 0; $m -lt $plan.Count; $m++) {
+        $p = $plan[$m]
+        $mid = '<shot-{0}@{1}>' -f ($m + 1), ($p.Sender -split '@')[1]
+        $copies = @()
+        for ($n = 0; $n -lt $p.Copies.Count; $n++) {
+            $copies += [pscustomobject]@{
+                Identity = ('00000000-0000-4000-8000-{0:x12}\00000000-0000-4000-8000-{1:x12}' -f ($m + 1), (($m + 1) * 100 + $n + 1))
+                MessageId = $mid; ReleaseStatus = $p.Copies[$n]; Released = ($p.Copies[$n] -eq 'RELEASED')
+                Received = (ConvertTo-RrShotDate ('2026-11-25 ' + $p.At)); Sender = $p.Sender; Recipient = ''; Subject = $p.Subject; QuarantineTypes = $p.Type; Expires = $expires
+            }
         }
+        $pendingRows += @($copies | Where-Object { $_.ReleaseStatus -eq 'REQUESTED' })
+        $lookups[$mid] = $copies
     }
+    $rows = @(Group-RrMessages $pendingRows $lookups)
     Set-RrRows $d $rows
     $d.ConnectState = 'done'
     $d.ListState = 'loaded'
-    $d.ListMsg = Get-RrListNote $rows.Count
+    $d.IncludeHandled = $false
+    $d.RawPending = $pendingRows.Count
+    $d.ListMsg = Get-RrListNote $rows 0 $false $d.RawPending
     $k.List.Items[0].Checked = $true
     $k.List.Items[2].Checked = $true
     $k.Pw.Text = '        '   # eight blanks: the box shows mask dots only, there is no secret in a screenshot

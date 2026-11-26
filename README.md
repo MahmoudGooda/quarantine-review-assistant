@@ -103,10 +103,16 @@ Instead of downloading each message by hand in the Defender portal, the launcher
 **pending release request** and save the ones you choose into `Incoming`. Click **Fetch release requests** in step 3 of the
 launcher. Manual download from the portal still works and stays the default.
 
-- **You choose, per message.** The list shows only Received, Sender, Recipient, Subject, Quarantine type and Expires, and every
-  checkbox starts unselected. Nothing is downloaded automatically and there is no select-all by default.
-- **Each selected message is saved as one password-protected ZIP** in `Incoming`. The whole message goes into one ZIP and its
-  attachments stay inside the encrypted ZIP. The launcher checks the ZIP signature and that every entry is encrypted before it writes
+- **One row per message, and you choose.** Exchange keeps one quarantine row per recipient copy, so a message sent to seven people is
+  seven rows. The list groups them and shows one row per message with Received, Sender, Subject, Quarantine type, Copies and Expires.
+  **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`, and a message that was
+  already released to some recipients is flagged. Every checkbox starts unselected. Nothing is downloaded automatically and there is
+  no select-all by default.
+  Microsoft lists quarantined messages either once per message or once per recipient (per-recipient since early 2026); the dialog groups both into one row per message.
+- **Optional view.** Select **Also show released and denied messages** to include messages that were released or denied (for example
+  released by an admin without a request). It is off by default.
+- **Each selected message is saved as one password-protected ZIP** in `Incoming`, one copy per message. The whole message goes into
+  one ZIP and its attachments stay inside the encrypted ZIP. Decide for all copies in Defender. The launcher checks the ZIP signature and that every entry is encrypted before it writes
   the file, and it never writes an `.eml` or any other file type.
 - **Use the same download password in the Sandbox.** You type it once per batch in the dialog (it is not stored or shown again), then
   type it again in the Sandbox review window.

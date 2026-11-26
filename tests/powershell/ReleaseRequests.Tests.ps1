@@ -11,11 +11,12 @@ BeforeAll {
     $script:PwSentinel = 'Sentinel-Pw-7f3a'
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.IO.Compression
     . $script:KitPath
 
     # The EXO cmdlets do not exist on CI: global stubs first, so Mock has something to replace.
     function global:Initialize-RrStubs {
-        function global:Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress) }
+        function global:Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId) }
         function global:Export-QuarantineMessage { [CmdletBinding()] param($Identity, [switch]$CompressOutput, [securestring]$Password, $ReasonForExport) }
         function global:Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
         function global:Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
@@ -89,10 +90,18 @@ BeforeAll {
     }
     function New-FakeMessage([int]$n) {
         [pscustomobject]@{
-            Identity = "00000000-0000-4000-8000-00000000000$n\00000000-0000-4000-8000-0000000000a$n"
+            Identity = "00000000-0000-4000-8000-00000000000$n\00000000-0000-4000-8000-0000000000a$n"; MessageId = "<m$n@invoice-pay.example>"
+            ReleaseStatus = 'REQUESTED'; Released = $false
             ReceivedTime = ([datetime]'2026-11-25 08:10').AddMinutes($n); SenderAddress = "billing$n@invoice-pay.example"
             RecipientAddress = @('a@corp.example', 'b@corp.example'); Subject = "Invoice $n"; QuarantineTypes = 'HighConfPhish'
             Expires = [datetime]'2026-12-25'
+        }
+    }
+    function New-Copy([string]$Identity, [string]$Status = 'REQUESTED', [string]$MessageId = '', [string]$At = '08:10', $Released = $false) {
+        [pscustomobject]@{
+            Identity = $Identity; MessageId = $MessageId; ReleaseStatus = $Status; Released = $Released
+            Received = ([datetime]('2026-11-25 ' + $At)); Sender = 'billing@invoice-pay.example'; Recipient = ''; Subject = "Subject of $MessageId"
+            QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25'
         }
     }
     function Start-RrWatch([string[]]$Paths) {
@@ -167,19 +176,346 @@ Describe 'ReleaseRequests: listing' {
         $rows[0].Subject | Should -Be 'Invoice 1'
         $rows[0].QuarantineTypes | Should -Be 'HighConfPhish'
         $rows[0].Expires | Should -Be ([datetime]'2026-12-25')
+        $rows[0].MessageId | Should -Be '<m1@invoice-pay.example>'
+        $rows[0].ReleaseStatus | Should -Be 'REQUESTED'
+        $rows[0].Released | Should -BeFalse
     }
-    It 'writes the list note: empty, nothing selected, some selected, capped' {
-        Get-RrListNote 0 0 | Should -Be 'No pending release requests in this period.'
-        Get-RrListNote 5 0 | Should -Be '5 pending release requests. Nothing is selected yet.'
-        Get-RrListNote 5 2 | Should -Be '5 pending release requests. 2 selected.'
-        Get-RrListNote 1 0 | Should -Be '1 pending release request. Nothing is selected yet.'
-        Get-RrListNote 1000 0 | Should -BeLike 'Showing the first 1000. Narrow the date range or filter by recipient.*'
-        Get-RrListNote 1000 3 | Should -Be 'Showing the first 1000. Narrow the date range or filter by recipient. 3 selected.'
+    It 'writes the list note: empty, nothing selected, some selected, capped, with and without the handled view' {
+        function New-NoteMsg([string]$Status, [int]$Pending, [int]$Released = 0) {
+            [pscustomobject]@{ Status = $Status; Counts = [pscustomobject]@{ Pending = $Pending; Released = $Released } }
+        }
+        $three = @((New-NoteMsg 'Pending' 2 2), (New-NoteMsg 'Pending' 1), (New-NoteMsg 'Pending' 2))
+        Get-RrListNote @() 0 | Should -Be 'No pending release requests in this period.'
+        Get-RrListNote @() 0 $true | Should -Be 'No messages in this period.'
+        Get-RrListNote $three 0 | Should -Be '3 messages with pending requests (5 recipient copies). Nothing is selected yet.'
+        Get-RrListNote $three 2 | Should -Be '3 messages with pending requests (5 recipient copies). 2 selected.'
+        Get-RrListNote @((New-NoteMsg 'Pending' 1)) 0 | Should -Be '1 message with a pending request (1 recipient copy). Nothing is selected yet.'
+        $mixed = @((New-NoteMsg 'Pending' 1), (New-NoteMsg 'Released' 0 3), (New-NoteMsg 'Denied' 0), (New-NoteMsg 'Released' 0 1))
+        Get-RrListNote $mixed 0 $true | Should -Be '4 messages (1 with a pending request). Nothing is selected yet.'
+        Get-RrListNote $mixed 1 $true | Should -Be '4 messages (1 with a pending request). 1 selected.'
+        Get-RrListNote @($mixed[0], $mixed[1], $three[2]) 0 $true | Should -Be '3 messages (2 with pending requests). Nothing is selected yet.'
+        Get-RrListNote @((New-NoteMsg 'Released' 0 2)) 0 $true | Should -Be '1 message (0 with pending requests). Nothing is selected yet.'
+        $cap = 'Showing the first 1000. Narrow the date range or filter by recipient.'
+        Get-RrListNote $three 0 $false 1000 | Should -Be "$cap 3 messages with pending requests (5 recipient copies). Nothing is selected yet."
+        Get-RrListNote $three 3 $false 1000 | Should -Be "$cap 3 messages with pending requests (5 recipient copies). 3 selected."
+        Get-RrListNote $three 0 $false 999 | Should -Not -BeLike 'Showing*'
     }
     It 'shows the cap message only at 1000 rows or more' {
         Get-RrCapMessage 999 | Should -Be ''
         Get-RrCapMessage 1000 | Should -Be 'Showing the first 1000. Narrow the date range or filter by recipient.'
         Get-RrCapMessage 1500 | Should -Be 'Showing the first 1000. Narrow the date range or filter by recipient.'
+    }
+}
+
+Describe 'ReleaseRequests: message key and copy counts' {
+    It 'uses the MessageId when it is there, otherwise the Identity before the first backslash' {
+        Get-RrMessageKey ([pscustomobject]@{ MessageId = '<abc@mail.example>'; Identity = 'g1\a1' }) | Should -Be '<abc@mail.example>'
+        Get-RrMessageKey ([pscustomobject]@{ MessageId = '  <abc@mail.example> '; Identity = 'g1\a1' }) | Should -Be '<abc@mail.example>'
+        Get-RrMessageKey ([pscustomobject]@{ MessageId = ''; Identity = '11111111-aaaa\22222222-bbbb\33' }) | Should -Be '11111111-aaaa'
+        Get-RrMessageKey ([pscustomobject]@{ Identity = 'g1\a1' }) | Should -Be 'g1'
+        Get-RrMessageKey ([pscustomobject]@{ MessageId = $null; Identity = 'g1\a1' }) | Should -Be 'g1'
+        Get-RrMessageKey ([pscustomobject]@{ Identity = 'no-backslash' }) | Should -Be 'no-backslash'
+        # two copies of one message share a key, whichever way it is found
+        (Get-RrMessageKey (New-Copy 'g1\a1')) | Should -Be (Get-RrMessageKey (New-Copy 'g1\a2'))
+    }
+    It 'classifies a copy without regard to the case of the status text' {
+        Get-RrCopyKind (New-Copy 'g\1' 'REQUESTED') | Should -Be 'Pending'
+        Get-RrCopyKind (New-Copy 'g\1' 'requested') | Should -Be 'Pending'
+        Get-RrCopyKind (New-Copy 'g\1' 'Requested') | Should -Be 'Pending'
+        Get-RrCopyKind (New-Copy 'g\1' 'RELEASED') | Should -Be 'Released'
+        Get-RrCopyKind (New-Copy 'g\1' 'released') | Should -Be 'Released'
+        Get-RrCopyKind (New-Copy 'g\1' 'APPROVED') | Should -Be 'Released'
+        Get-RrCopyKind (New-Copy 'g\1' 'DENIED') | Should -Be 'Denied'
+        Get-RrCopyKind (New-Copy 'g\1' 'denied') | Should -Be 'Denied'
+        Get-RrCopyKind (New-Copy 'g\1' 'NOTRELEASED') | Should -Be 'NotRequested'
+        Get-RrCopyKind (New-Copy 'g\1' 'notreleased') | Should -Be 'NotRequested'
+        Get-RrCopyKind (New-Copy 'g\1' 'PREPARINGTORELEASE') | Should -Be 'NotRequested'
+        Get-RrCopyKind (New-Copy 'g\1' 'ERROR') | Should -Be 'NotRequested'
+        Get-RrCopyKind (New-Copy 'g\1' '') | Should -Be 'NotRequested'
+        # Released = $true wins over a REQUESTED status: that copy is not pending any more
+        Get-RrCopyKind (New-Copy 'g\1' 'REQUESTED' '' '08:10' $true) | Should -Be 'Released'
+        Get-RrCopyKind (New-Copy 'g\1' 'REQUESTED' '' '08:10' $false) | Should -Be 'Pending'
+    }
+    It 'counts pending, released, denied and not requested copies' {
+        $copies = @(
+            (New-Copy 'g\1' 'REQUESTED'), (New-Copy 'g\2' 'requested'), (New-Copy 'g\3' 'RELEASED'), (New-Copy 'g\4' 'REQUESTED' '' '08:10' $true),
+            (New-Copy 'g\5' 'DENIED'), (New-Copy 'g\6' 'NOTRELEASED'), (New-Copy 'g\7' 'notreleased'), (New-Copy 'g\8' 'ERROR')
+        )
+        $n = Get-RrCopyCounts $copies
+        $n.Pending | Should -Be 2
+        $n.Released | Should -Be 2
+        $n.Denied | Should -Be 1
+        $n.NotRequested | Should -Be 3
+        $n.Total | Should -Be 8
+        $n.Unknown | Should -BeFalse
+        (Get-RrCopyCounts @()).Total | Should -Be 0
+        (Get-RrCopyCounts $null).Total | Should -Be 0
+    }
+    It 'formats the copies with a middle dot and leaves zero parts out' {
+        $dot = [string][char]0x00B7
+        function New-Counts($p, $r, $dn, $nr, $u = $false) { [pscustomobject]@{ Pending = $p; Released = $r; Denied = $dn; NotRequested = $nr; Unknown = $u } }
+        Format-RrCopies (New-Counts 2 2 0 3) | Should -Be "2 pending $dot 2 released $dot 3 not requested"
+        Format-RrCopies (New-Counts 1 0 0 3) | Should -Be "1 pending $dot 3 not requested"
+        Format-RrCopies (New-Counts 1 0 0 0) | Should -Be '1 pending'
+        Format-RrCopies (New-Counts 0 0 2 0) | Should -Be '2 denied'
+        Format-RrCopies (New-Counts 0 4 1 0) | Should -Be "4 released $dot 1 denied"
+        Format-RrCopies (New-Counts 1 0 0 0 $true) | Should -Be "1 pending $dot other copies unknown"
+        Format-RrCopies (New-Counts 0 0 0 0 $true) | Should -Be 'other copies unknown'
+        Format-RrCopies (New-Counts 0 0 0 0) | Should -Be ''
+    }
+}
+
+Describe 'ReleaseRequests: one row per message' {
+    BeforeAll {
+        $script:M1 = '<m1@invoice-pay.example>'; $script:M2 = '<m2@parcel-track.example>'
+        $script:Dot = [string][char]0x00B7
+        $script:PendingRows = @(
+            (New-Copy 'g1\a1' 'REQUESTED' $script:M1 '08:12'), (New-Copy 'g1\a2' 'REQUESTED' $script:M1 '08:10'),
+            (New-Copy 'g2\b1' 'REQUESTED' $script:M2 '09:00'),
+            (New-Copy 'g3\c1' 'REQUESTED' '' '10:00'), (New-Copy 'g3\c2' 'REQUESTED' '' '10:05')
+        )
+        $script:Lookup1 = @(
+            (New-Copy 'g1\a1' 'REQUESTED' $script:M1 '08:12'), (New-Copy 'g1\a2' 'REQUESTED' $script:M1 '08:10'),
+            (New-Copy 'g1\a3' 'RELEASED' $script:M1 '08:11' $true), (New-Copy 'g1\a4' 'RELEASED' $script:M1 '08:11' $true),
+            (New-Copy 'g1\a5' 'NOTRELEASED' $script:M1 '08:11'), (New-Copy 'g1\a6' 'NOTRELEASED' $script:M1 '08:11'), (New-Copy 'g1\a7' 'NOTRELEASED' $script:M1 '08:11')
+        )
+        $script:Lookup2 = @((New-Copy 'g2\b1' 'REQUESTED' $script:M2 '09:00'), (New-Copy 'g2\b2' 'NOTRELEASED' $script:M2 '09:00'), (New-Copy 'g2\b3' 'NOTRELEASED' $script:M2 '09:00'), (New-Copy 'g2\b4' 'NOTRELEASED' $script:M2 '09:00'))
+    }
+    It 'groups 5 rows into 3 messages with the earliest Received and a pending ExportIdentity' {
+        $g = @(Group-RrMessages $script:PendingRows @{ $script:M1 = $script:Lookup1; $script:M2 = $script:Lookup2 })
+        $g.Count | Should -Be 3
+        $g[0].Key | Should -Be $script:M1
+        $g[0].Received | Should -Be ([datetime]'2026-11-25 08:10')
+        $g[0].ExportIdentity | Should -Be 'g1\a1'
+        $g[0].CopiesText | Should -Be "2 pending $($script:Dot) 2 released $($script:Dot) 3 not requested"
+        $g[0].HasReleasedCopy | Should -BeTrue
+        $g[0].RecipientCount | Should -Be 7
+        $g[0].Status | Should -Be 'Pending'
+        $g[0].Counts.Pending | Should -Be 2
+        $g[1].Key | Should -Be $script:M2
+        $g[1].CopiesText | Should -Be "1 pending $($script:Dot) 3 not requested"
+        $g[1].HasReleasedCopy | Should -BeFalse
+        $g[1].RecipientCount | Should -Be 4
+        # no MessageId: the key is the identity before the backslash, and only the rows already returned are used
+        $g[2].Key | Should -Be 'g3'
+        $g[2].Received | Should -Be ([datetime]'2026-11-25 10:00')
+        $g[2].CopiesText | Should -Be '2 pending'
+        $g[2].RecipientCount | Should -Be 2
+        $g[2].Sender | Should -Be 'billing@invoice-pay.example'
+        $g[2].Subject | Should -Be 'Subject of '
+        $g[2].QuarantineTypes | Should -Be 'Phish'
+        $g[2].Expires | Should -Be ([datetime]'2026-12-25')
+        @($g | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique) | Should -Be @('Key', 'ExportIdentity', 'Received', 'Sender', 'Subject', 'QuarantineTypes', 'Expires', 'Counts', 'CopiesText', 'Status', 'HasReleasedCopy', 'RecipientCount')
+    }
+    It 'prefers a pending copy for the export, even when the first row is not pending' {
+        $rows = @((New-Copy 'g9\x1' 'RELEASED' '<m9@x.example>' '08:00' $true))
+        $look = @((New-Copy 'g9\x1' 'RELEASED' '<m9@x.example>' '08:00' $true), (New-Copy 'g9\x2' 'REQUESTED' '<m9@x.example>' '08:05'))
+        $g = @(Group-RrMessages $rows @{ '<m9@x.example>' = $look })
+        $g[0].ExportIdentity | Should -Be 'g9\x2'
+        $g[0].Status | Should -Be 'Pending'
+        $g[0].Received | Should -Be ([datetime]'2026-11-25 08:00')
+    }
+    It 'gives Released or Denied for a message with no pending copy, by the larger count, and the first copy to export' {
+        $rel = @(Group-RrMessages @((New-Copy 'g5\1' 'RELEASED' '<m5@x.example>' '08:00'), (New-Copy 'g5\2' 'RELEASED' '<m5@x.example>' '08:01')) @{})
+        $rel[0].Status | Should -Be 'Released'
+        $rel[0].ExportIdentity | Should -Be 'g5\1'
+        $rel[0].HasReleasedCopy | Should -BeTrue
+        $den = @(Group-RrMessages @((New-Copy 'g6\1' 'DENIED' '<m6@x.example>'), (New-Copy 'g6\2' 'DENIED' '<m6@x.example>')) @{})
+        $den[0].Status | Should -Be 'Denied'
+        $den[0].HasReleasedCopy | Should -BeFalse
+        $mix = @(Group-RrMessages @((New-Copy 'g7\1' 'DENIED' '<m7@x.example>'), (New-Copy 'g7\2' 'RELEASED' '<m7@x.example>'), (New-Copy 'g7\3' 'RELEASED' '<m7@x.example>')) @{})
+        $mix[0].Status | Should -Be 'Released'
+    }
+    It 'marks the copies unknown when the lookup failed, and keeps the group' {
+        $g = @(Group-RrMessages $script:PendingRows @{ $script:M1 = $script:Lookup1; $script:M2 = $null })
+        $g.Count | Should -Be 3
+        $g[1].Counts.Unknown | Should -BeTrue
+        $g[1].CopiesText | Should -Be "1 pending $($script:Dot) other copies unknown"
+        $g[1].ExportIdentity | Should -Be 'g2\b1'
+        $g[0].Counts.Unknown | Should -BeFalse
+    }
+    It 'builds the Copies cell with a leading mark only when a copy was released, and the tooltip text' {
+        $g = @(Group-RrMessages $script:PendingRows @{ $script:M1 = $script:Lookup1; $script:M2 = $script:Lookup2 })
+        Get-RrCopiesCell $g[0] | Should -Be "! 2 pending $($script:Dot) 2 released $($script:Dot) 3 not requested"
+        Get-RrCopiesCell $g[1] | Should -Be "1 pending $($script:Dot) 3 not requested"
+        Get-RrRowTip $g[0] | Should -Be 'Released to 2 recipient(s) already. Decide for all copies in Defender.'
+        Get-RrRowTip $g[1] | Should -Be ''
+    }
+}
+
+Describe 'ReleaseRequests: Get-RrMessages (the listing step)' {
+    BeforeAll {
+        $script:Now = [datetime]'2026-11-26 12:00'
+        function New-Msg($c) {
+            [pscustomobject]@{
+                Identity = $c.Identity; MessageId = $c.MessageId; ReleaseStatus = $c.ReleaseStatus; Released = $c.Released; ReceivedTime = $c.Received
+                SenderAddress = $c.Sender; RecipientAddress = @('r@corp.example'); Subject = $c.Subject; QuarantineTypes = $c.QuarantineTypes; Expires = $c.Expires
+            }
+        }
+        $script:Q1 = '<q1@invoice-pay.example>'; $script:Q2 = '<q2@parcel-track.example>'
+        $script:PendingCopies = @((New-Copy 'q1\a1' 'REQUESTED' $script:Q1 '08:12'), (New-Copy 'q1\a2' 'REQUESTED' $script:Q1 '08:10'), (New-Copy 'q2\b1' 'REQUESTED' $script:Q2 '09:00'))
+        $script:AllQ1 = @($script:PendingCopies[0], $script:PendingCopies[1], (New-Copy 'q1\a3' 'RELEASED' $script:Q1 '08:11' $true), (New-Copy 'q1\a4' 'NOTRELEASED' $script:Q1 '08:11'))
+        $script:AllQ2 = @($script:PendingCopies[2], (New-Copy 'q2\b2' 'NOTRELEASED' $script:Q2 '09:00'))
+    }
+    It 'toggle off: one -ReleaseStatus Requested query plus one -MessageId lookup per message, nothing else' {
+        Mock Get-QuarantineMessage { @($script:PendingCopies | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { @($script:AllQ1 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q1 }
+        Mock Get-QuarantineMessage { @($script:AllQ2 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q2 }
+        $res = Get-RrMessages -Days 5 -Now $script:Now
+        Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $ReleaseStatus }
+        Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter {
+            $ReleaseStatus -eq 'Requested' -and $PageSize -eq 1000 -and $StartReceivedDate -eq $script:Now.AddDays(-5) -and $EndReceivedDate -eq $script:Now -and -not $RecipientAddress
+        }
+        Should -Invoke Get-QuarantineMessage -Times 0 -ParameterFilter { $ReleaseStatus -eq 'Released' -or $ReleaseStatus -eq 'Denied' }
+        Should -Invoke Get-QuarantineMessage -Times 2 -Exactly -ParameterFilter { $MessageId }
+        Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $MessageId -eq $script:Q1 }
+        Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $MessageId -eq $script:Q2 }
+        Should -Invoke Get-QuarantineMessage -Times 0 -ParameterFilter { $ReleaseStatus -and $MessageId }
+        $res.RawPending | Should -Be 3
+        $res.Handled | Should -BeFalse
+        @($res.Messages).Count | Should -Be 2
+        $res.Messages[0].CopiesText | Should -Be "2 pending $([char]0x00B7) 1 released $([char]0x00B7) 1 not requested"
+        $res.Messages[0].HasReleasedCopy | Should -BeTrue
+        $res.Messages[1].CopiesText | Should -Be "1 pending $([char]0x00B7) 1 not requested"
+    }
+    It 'toggle on: also queries Released and Denied with the same window and recipient' {
+        $released = @((New-Copy 'q3\r1' 'RELEASED' '<q3@x.example>' '07:00' $true))
+        $denied = @((New-Copy 'q4\d1' 'DENIED' '<q4@x.example>' '07:30'))
+        Mock Get-QuarantineMessage { @($script:PendingCopies | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { @($released | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Released' }
+        Mock Get-QuarantineMessage { @($denied | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Denied' }
+        Mock Get-QuarantineMessage { @($script:AllQ1 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q1 }
+        Mock Get-QuarantineMessage { @($script:AllQ2 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q2 }
+        Mock Get-QuarantineMessage { @($released | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq '<q3@x.example>' }
+        Mock Get-QuarantineMessage { @($denied | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq '<q4@x.example>' }
+        $res = Get-RrMessages -Days 5 -Recipient ' r@corp.example ' -IncludeHandled -Now $script:Now
+        foreach ($st in 'Requested', 'Released', 'Denied') {
+            Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter {
+                $ReleaseStatus -eq $st -and $PageSize -eq 1000 -and $StartReceivedDate -eq $script:Now.AddDays(-5) -and $EndReceivedDate -eq $script:Now -and $RecipientAddress -eq 'r@corp.example'
+            }
+        }
+        Should -Invoke Get-QuarantineMessage -Times 4 -Exactly -ParameterFilter { $MessageId }
+        $res.Handled | Should -BeTrue
+        @($res.Messages).Count | Should -Be 4
+        @($res.Messages | ForEach-Object { $_.Status }) | Should -Be @('Pending', 'Pending', 'Released', 'Denied')
+        $res.Messages[2].ExportIdentity | Should -Be 'q3\r1'
+    }
+    It 'a copy with REQUESTED but Released = true is not pending, and the cap counts the raw query rows' {
+        Mock Get-QuarantineMessage { @((New-Copy 'q8\a1' 'REQUESTED' '<q8@x.example>' '08:00' $true), (New-Copy 'q9\a1' 'REQUESTED' '<q9@x.example>' '08:00') | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { } -ParameterFilter { $MessageId }
+        $res = Get-RrMessages -Days 5 -Now $script:Now
+        @($res.Messages).Count | Should -Be 1
+        $res.Messages[0].Key | Should -Be '<q9@x.example>'
+        $res.RawPending | Should -Be 2
+        Mock Get-QuarantineMessage { 1..1000 | ForEach-Object { New-Msg (New-Copy "qc$_\a" 'REQUESTED' '') } } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        (Get-RrMessages -Days 5 -Now $script:Now).RawPending | Should -Be 1000
+    }
+    It 'skips the lookup when there is no MessageId and uses the rows already returned' {
+        Mock Get-QuarantineMessage { @((New-Copy 'n1\a1' 'REQUESTED' ''), (New-Copy 'n1\a2' 'REQUESTED' '')) | ForEach-Object { New-Msg $_ } } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { throw 'must not be called' } -ParameterFilter { $MessageId }
+        $res = Get-RrMessages -Days 5 -Now $script:Now
+        Should -Invoke Get-QuarantineMessage -Times 0 -ParameterFilter { $MessageId }
+        @($res.Messages).Count | Should -Be 1
+        $res.Messages[0].CopiesText | Should -Be '2 pending'
+        $res.Messages[0].Counts.Unknown | Should -BeFalse
+    }
+    It 'a failed -MessageId lookup keeps the message and marks other copies unknown' {
+        Mock Get-QuarantineMessage { @($script:PendingCopies | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { @($script:AllQ1 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q1 }
+        Mock Get-QuarantineMessage { throw 'throttled: simulated' } -ParameterFilter { $MessageId -eq $script:Q2 }
+        $res = Get-RrMessages -Days 5 -Now $script:Now
+        @($res.Messages).Count | Should -Be 2
+        $res.Messages[1].CopiesText | Should -Be "1 pending $([char]0x00B7) other copies unknown"
+        $res.Messages[1].Counts.Unknown | Should -BeTrue
+        $res.Messages[1].ExportIdentity | Should -Be 'q2\b1'
+        $res.Messages[0].Counts.Unknown | Should -BeFalse
+    }
+    It 'a failing main query throws, so the dialog shows the error' {
+        Mock Get-QuarantineMessage { throw 'no access: simulated' } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        { Get-RrMessages -Days 5 -Now $script:Now } | Should -Throw '*no access: simulated*'
+    }
+    It 'reports the lookup progress through $State' {
+        $State = [hashtable]::Synchronized(@{})
+        Mock Get-QuarantineMessage { @($script:PendingCopies | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { @($script:AllQ1 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q1 }
+        Mock Get-QuarantineMessage { @($script:AllQ2 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q2 }
+        $null = Get-RrMessages -Days 5 -Now $script:Now
+        $State.Progress | Should -Be 'Checking other copies (2 of 2)...'
+    }
+    It 'exports one copy per selected message: the pending ExportIdentity, one ZIP each' {
+        $inc = Join-Path $TestDrive 'per-message-incoming'
+        Mock Get-QuarantineMessage { @($script:PendingCopies | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { @($script:AllQ1 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q1 }
+        Mock Get-QuarantineMessage { @($script:AllQ2 | ForEach-Object { New-Msg $_ }) } -ParameterFilter { $MessageId -eq $script:Q2 }
+        $b64 = [Convert]::ToBase64String((New-TestZip -Flags 1 -Aes))
+        Mock Export-QuarantineMessage { [pscustomobject]@{ Eml = $b64 } }
+        $msgs = @((Get-RrMessages -Days 5 -Now $script:Now).Messages)
+        $msgs.Count | Should -Be 2
+        foreach ($m in $msgs) {
+            (Save-RrExport -Identity $m.ExportIdentity -Received $m.Received -Password (New-SecurePw 'x') -Incoming $inc).Status | Should -Be 'Saved'
+        }
+        Should -Invoke Export-QuarantineMessage -Times 2 -Exactly
+        Should -Invoke Export-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $Identity -eq 'q1\a1' }
+        Should -Invoke Export-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $Identity -eq 'q2\b1' }
+        Should -Invoke Export-QuarantineMessage -Times 0 -ParameterFilter { $Identity -eq 'q1\a2' -or $Identity -eq 'q1\a3' }
+        $files = @(Get-ChildItem -LiteralPath $inc -File | ForEach-Object { $_.Name } | Sort-Object)
+        $files.Count | Should -Be 2
+        $files | Should -Be @((Get-RrFileName $msgs[0].Received 'q1\a1'), (Get-RrFileName $msgs[1].Received 'q2\b1') | Sort-Object)
+        $files[0] | Should -Match '^20261125-08\d\d-[0-9a-f]{10}\.zip$'
+    }
+}
+
+Describe 'ReleaseRequests: aggregated and per-recipient shapes' {
+    It 'weights an aggregated row by RecipientCount or the address list, and a per-recipient row as one' {
+        $agg = New-Copy 'a1\1' 'REQUESTED' '<agg@x.example>'
+        $agg | Add-Member RecipientCount 5
+        Get-RrCopyWeight $agg | Should -Be 5
+        $addr = New-Copy 'a1\2' 'REQUESTED' '<agg2@x.example>'
+        $addr | Add-Member RecipientAddress @('a@corp.example', 'b@corp.example', 'c@corp.example')
+        Get-RrCopyWeight $addr | Should -Be 3
+        Get-RrCopyWeight (New-Copy 'p\1') | Should -Be 1
+        $zero = New-Copy 'p\2'; $zero | Add-Member RecipientCount 0; $zero | Add-Member RecipientAddress @()
+        Get-RrCopyWeight $zero | Should -Be 1
+        (ConvertTo-RrRow ([pscustomobject]@{ Identity = 'a\b'; RecipientCount = 5; RecipientAddress = @('x@corp.example') })).RecipientCount | Should -Be 5
+        (ConvertTo-RrRow ([pscustomobject]@{ Identity = 'a\b'; RecipientAddress = @() })).RecipientCount | Should -Be 1
+    }
+    It '(a) aggregated: one row with RecipientCount 5 and REQUESTED is one message with 5 pending' {
+        $agg = New-Copy 'ag\1' 'REQUESTED' '<agg@x.example>'
+        $agg | Add-Member RecipientCount 5
+        $g = @(Group-RrMessages @($agg) @{})
+        $g.Count | Should -Be 1
+        $g[0].Counts.Pending | Should -Be 5
+        $g[0].RecipientCount | Should -Be 5
+        $g[0].CopiesText | Should -Be '5 pending'
+        $g[0].ExportIdentity | Should -Be 'ag\1'
+    }
+    It '(b) per-recipient: 3 rows with one MessageId, one with an empty RecipientAddress, are one message' {
+        $rows = @(
+            (New-Copy 'pr\a' 'REQUESTED' '<pr@x.example>'), (New-Copy 'pr\b' 'REQUESTED' '<pr@x.example>'), (New-Copy 'pr\c' 'REQUESTED' '<pr@x.example>')
+        )
+        $rows[0] | Add-Member RecipientAddress @('a@corp.example'); $rows[1] | Add-Member RecipientAddress @('b@corp.example'); $rows[2] | Add-Member RecipientAddress @()
+        $g = @(Group-RrMessages $rows @{})
+        $g.Count | Should -Be 1
+        $g[0].CopiesText | Should -Be '3 pending'
+        $g[0].RecipientCount | Should -Be 3
+    }
+    It '(c) mixed: an aggregated released entry and per-recipient pending ones add up' {
+        $rel = New-Copy 'mx\r' 'RELEASED' '<mx@x.example>' '08:00' $true
+        $rel | Add-Member RecipientCount 4
+        $look = @($rel, (New-Copy 'mx\p1' 'REQUESTED' '<mx@x.example>' '08:05'), (New-Copy 'mx\p2' 'REQUESTED' '<mx@x.example>' '08:06'))
+        $g = @(Group-RrMessages @($look[1], $look[2]) @{ '<mx@x.example>' = $look })
+        $g.Count | Should -Be 1
+        $g[0].CopiesText | Should -Be "2 pending $([char]0x00B7) 4 released"
+        $g[0].HasReleasedCopy | Should -BeTrue
+        $g[0].ExportIdentity | Should -Be 'mx\p1'
+    }
+    BeforeAll { function New-Msg($c) { [pscustomobject]@{ Identity = $c.Identity; MessageId = $c.MessageId; ReleaseStatus = $c.ReleaseStatus; Released = $c.Released; ReceivedTime = $c.Received; SenderAddress = $c.Sender; RecipientAddress = @(); Subject = $c.Subject; QuarantineTypes = $c.QuarantineTypes; Expires = $c.Expires } } }
+    It 'passes the MessageId, angle brackets included, to -MessageId unchanged' {
+        $mid = '<CAF=weird+id.1@mail.example.com>'
+        Mock Get-QuarantineMessage { New-Msg (New-Copy 'br\1' 'REQUESTED' $mid) } -ParameterFilter { $ReleaseStatus -eq 'Requested' }
+        Mock Get-QuarantineMessage { New-Msg (New-Copy 'br\1' 'REQUESTED' $mid) } -ParameterFilter { $MessageId }
+        $null = Get-RrMessages -Days 5
+        Should -Invoke Get-QuarantineMessage -Times 1 -Exactly -ParameterFilter { $MessageId -ceq $mid }
     }
 }
 
@@ -529,7 +865,7 @@ Describe 'ReleaseRequests: session' {
     }
     It 'a failing connect gives an error and no listing is requested' {
         function global:Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) throw 'sign-in cancelled: simulated' }
-        function global:Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress) $State.Listed = $true }
+        function global:Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId) $State.Listed = $true }
         $s = New-RrSession -Functions (@('Connect-ExchangeOnline', 'Get-QuarantineMessage') + (Get-RrSessionFunctionNames))
         try {
             $work = Invoke-RrStep $s (Get-RrConnectScript) @{}
@@ -541,17 +877,20 @@ Describe 'ReleaseRequests: session' {
     }
     It 'lists and exports through the session functions' {
         $b64 = [Convert]::ToBase64String((New-TestZip -Flags 1))
-        Invoke-Expression ("function global:Get-QuarantineMessage { [CmdletBinding()] param(`$ReleaseStatus, `$PageSize, `$StartReceivedDate, `$EndReceivedDate, `$RecipientAddress) [pscustomobject]@{ Identity = 'a\b'; ReceivedTime = [datetime]'2026-11-25 08:11'; SenderAddress = 's@x.example'; RecipientAddress = @('r@corp.example'); Subject = 'S'; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' } }")
+        Invoke-Expression ("function global:Get-QuarantineMessage { [CmdletBinding()] param(`$ReleaseStatus, `$PageSize, `$StartReceivedDate, `$EndReceivedDate, `$RecipientAddress, `$MessageId) [pscustomobject]@{ Identity = 'a\b'; MessageId = ''; ReleaseStatus = 'REQUESTED'; Released = `$false; ReceivedTime = [datetime]'2026-11-25 08:11'; SenderAddress = 's@x.example'; RecipientAddress = @('r@corp.example'); Subject = 'S'; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' } }")
         Invoke-Expression ("function global:Export-QuarantineMessage { [CmdletBinding()] param(`$Identity, [switch]`$CompressOutput, `$Password, `$ReasonForExport) [pscustomobject]@{ Eml = '$b64' } }")
         $s = New-RrSession -Functions (@('Get-QuarantineMessage', 'Export-QuarantineMessage') + (Get-RrSessionFunctionNames))
         $inc = Join-Path $TestDrive 'session-incoming'
         try {
-            $w = Invoke-RrStep $s { Get-RrRequests -Days $RrDays -Recipient $RrRecipient } @{ RrDays = 7; RrRecipient = '' }
+            $w = Invoke-RrStep $s { Get-RrMessages -Days $RrDays -Recipient $RrRecipient -IncludeHandled:$RrHandled } @{ RrDays = 7; RrRecipient = ''; RrHandled = $false }
             while (-not $w.Handle.IsCompleted) { Start-Sleep -Milliseconds 20 }
-            $rows = @((Complete-RrStep $w).Output)
+            $payload = @((Complete-RrStep $w).Output | Where-Object { $_.PSObject.Properties['Messages'] })[-1]
+            $rows = @($payload.Messages)
             $rows.Count | Should -Be 1
             $rows[0].Sender | Should -Be 's@x.example'
-            $vars = @{ RrIdentity = [string]$rows[0].Identity; RrReceived = [datetime]$rows[0].Received; RrPassword = (New-SecurePw $script:PwSentinel); RrIncoming = $inc }
+            $rows[0].CopiesText | Should -Be '1 pending'
+            $s.State.Progress | Should -Be 'Checking other copies (1 of 1)...'
+            $vars = @{ RrIdentity = [string]$rows[0].ExportIdentity; RrReceived = [datetime]$rows[0].Received; RrPassword = (New-SecurePw $script:PwSentinel); RrIncoming = $inc }
             $w2 = Invoke-RrStep $s { Save-RrExport -Identity $RrIdentity -Received $RrReceived -Password $RrPassword -Incoming $RrIncoming } $vars
             while (-not $w2.Handle.IsCompleted) { Start-Sleep -Milliseconds 20 }
             $r2 = Complete-RrStep $w2
@@ -625,7 +964,7 @@ $d.Form.Close()
         $body = $script:ChildHead + @'
 function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) throw 'sign-in cancelled: simulated' }
 function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) $State.Disconnected = $true }
-function Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress) $State.Listed = $true }
+function Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId) $State.Listed = $true }
 $d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-none') -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage') -NoAutoStart
 Show-Offscreen $d.Form
 $d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
@@ -659,13 +998,13 @@ $out | ConvertTo-Json -Compress
 function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
 function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) $State.Disconnected = $true }
 function Get-QuarantineMessage {
-    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress)
+    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId)
     foreach ($n in 1, 2) {
-        [pscustomobject]@{ Identity = "00000000-0000-4000-8000-00000000000$n\00000000-0000-4000-8000-0000000000a$n"; ReceivedTime = ([datetime]'2026-11-25 08:10').AddMinutes($n)
+        [pscustomobject]@{ Identity = "00000000-0000-4000-8000-00000000000$n\00000000-0000-4000-8000-0000000000a$n"; ReleaseStatus = 'REQUESTED'; Released = $false; ReceivedTime = ([datetime]'2026-11-25 08:10').AddMinutes($n)
             SenderAddress = "billing$n@invoice-pay.example"; RecipientAddress = @('a@corp.example'); Subject = "Invoice $n"; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' }
     }
 }
-$exportCode = 'function Export-QuarantineMessage { [CmdletBinding()] param($Identity, [switch]$CompressOutput, $Password, $ReasonForExport) [pscustomobject]@{ Eml = ''' + $b64 + ''' } }'
+$exportCode = 'function Export-QuarantineMessage { [CmdletBinding()] param($Identity, [switch]$CompressOutput, $Password, $ReasonForExport) $State.ExportIds = @($State.ExportIds | Where-Object { $_ }) + $Identity; [pscustomobject]@{ Eml = ''' + $b64 + ''' } }'
 Invoke-Expression $exportCode
 $d = New-RrDialog -Incoming $inc -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage', 'Export-QuarantineMessage') -NoAutoStart
 Show-Offscreen $d.Form
@@ -674,7 +1013,8 @@ Update-RrView $d
 $d.Ctl.BSignIn.PerformClick()
 Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
 $sess = $d.Session
-$listed = @{ State = $d.ListState; Items = $d.Ctl.List.Items.Count; Ticked = $d.Ctl.List.CheckedItems.Count; Note = $d.ListMsg; SaveEnabledEarly = $d.Ctl.BSave.Enabled; Connect = $d.ConnectState }
+$listed = @{ State = $d.ListState; Items = $d.Ctl.List.Items.Count; Ticked = $d.Ctl.List.CheckedItems.Count; Note = $d.ListMsg; SaveEnabledEarly = $d.Ctl.BSave.Enabled; Connect = $d.ConnectState
+    Columns = (@($d.Ctl.List.Columns | ForEach-Object { $_.Text }) -join '|'); Cells = (@($d.Ctl.List.Items[1].SubItems | ForEach-Object { $_.Text }) -join '|'); HScroll = ($d.Ctl.List.Columns | Measure-Object Width -Sum).Sum -gt $d.Ctl.List.ClientSize.Width }
 $d.Ctl.List.Items[1].Checked = $true
 $enabledNoPw = $d.Ctl.BSave.Enabled
 $d.Ctl.Pw.Text = 'Sentinel-Pw-7f3a'
@@ -686,7 +1026,7 @@ $files = @(Get-ChildItem -LiteralPath $inc -File -ErrorAction SilentlyContinue |
 $out = [pscustomobject]@{
     Listed = $listed; EnabledNoPw = $enabledNoPw; EnabledWithPw = $enabledWithPw; PwAfterClick = $pwAfterClick
     Summary = $d.SaveSummary; Problems = $d.SaveProblems; Files = $files; TickedAfter = $d.Ctl.List.CheckedItems.Count; SaveEnabledAfter = $d.Ctl.BSave.Enabled
-    PwBox = $d.Ctl.Pw.Text
+    PwBox = $d.Ctl.Pw.Text; ExportIds = @($sess.State.ExportIds)
 }
 $d.Form.Close()
 $out | Add-Member Disconnected ([bool]$sess.State.Disconnected)
@@ -696,6 +1036,10 @@ $out | ConvertTo-Json -Compress -Depth 4
         $r.Listed.State | Should -Be 'loaded'
         $r.Listed.Items | Should -Be 2
         $r.Listed.Ticked | Should -Be 0
+        $r.Listed.Note | Should -Be '2 messages with pending requests (2 recipient copies). Nothing is selected yet.'
+        $r.Listed.Columns | Should -Be 'Received|Sender|Subject|Quarantine type|Copies|Expires'
+        $r.Listed.Cells | Should -Be '2026-11-25 08:12|billing2@invoice-pay.example|Invoice 2|Phish|1 pending|2026-12-25'
+        $r.Listed.HScroll | Should -BeFalse
         $r.Listed.SaveEnabledEarly | Should -BeFalse
         $r.EnabledNoPw | Should -BeFalse
         $r.EnabledWithPw | Should -BeTrue
@@ -704,6 +1048,7 @@ $out | ConvertTo-Json -Compress -Depth 4
         $r.Summary | Should -Be 'Saved 1 of 1 to Incoming'
         @($r.Files).Count | Should -Be 1
         @($r.Files)[0] | Should -Match '^20261125-0812-[0-9a-f]{10}\.zip$'
+        @($r.ExportIds) | Should -Be @('00000000-0000-4000-8000-000000000002\00000000-0000-4000-8000-0000000000a2')
         $r.TickedAfter | Should -Be 0
         $r.SaveEnabledAfter | Should -BeFalse
         $r.Disconnected | Should -BeTrue
@@ -716,8 +1061,8 @@ $out | ConvertTo-Json -Compress -Depth 4
 function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
 function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
 function Get-QuarantineMessage {
-    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress)
-    [pscustomobject]@{ Identity = '00000000-0000-4000-8000-000000000001\00000000-0000-4000-8000-0000000000a1'; ReceivedTime = [datetime]'2026-11-25 08:11'
+    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId)
+    [pscustomobject]@{ Identity = '00000000-0000-4000-8000-000000000001\00000000-0000-4000-8000-0000000000a1'; ReleaseStatus = 'REQUESTED'; Released = $false; ReceivedTime = [datetime]'2026-11-25 08:11'
         SenderAddress = 'billing@invoice-pay.example'; RecipientAddress = @('a@corp.example'); Subject = 'Invoice'; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' }
 }
 Invoke-Expression ('function Export-QuarantineMessage { [CmdletBinding()] param($Identity, [switch]$CompressOutput, $Password, $ReasonForExport) [pscustomobject]@{ Eml = ''' + $b64 + ''' } }')
@@ -747,6 +1092,114 @@ $out | ConvertTo-Json -Compress
         $r.CopyVisible | Should -BeTrue
         $r.Files | Should -Be 0
         $r.TickedAfter | Should -Be 1
+    }
+}
+
+Describe 'ReleaseRequests: dialog, handled view and screenshot data (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $script:ChildHead2 = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+[System.Windows.Forms.Application]::EnableVisualStyles()
+. '$($script:RrPath)'
+function Show-Offscreen(`$form) {
+    `$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.StartPosition = 'Manual'
+    `$form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+}
+function Wait-Until([scriptblock]`$cond, [int]`$seconds = 40) {
+    `$end = [DateTime]::UtcNow.AddSeconds(`$seconds)
+    while (-not (& `$cond) -and [DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+}
+function Out-AsciiJson(`$obj) {
+    `$j = `$obj | ConvertTo-Json -Compress -Depth 5
+    [regex]::Replace(`$j, '[^\x00-\x7F]', { param(`$m) ('\u{0:x4}' -f [int][char]`$m.Value) })
+}
+"@
+    }
+    It 'the checkbox is off by default, its note is shown, and turning it on adds the released and denied queries' {
+        $body = $script:ChildHead2 + @'
+function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
+function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
+function Get-QuarantineMessage {
+    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId)
+    $State.Calls = @($State.Calls | Where-Object { $_ }) + ("status=$ReleaseStatus;mid=$MessageId")
+    function Row($id, $status, $rel) { [pscustomobject]@{ Identity = $id; MessageId = '<m1@invoice-pay.example>'; ReleaseStatus = $status; Released = $rel; ReceivedTime = [datetime]'2026-11-25 08:11'
+        SenderAddress = 'billing@invoice-pay.example'; RecipientAddress = @('a@corp.example'); Subject = 'Invoice'; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' } }
+    function Denied { [pscustomobject]@{ Identity = 'g2\d1'; MessageId = '<m2@invoice-pay.example>'; ReleaseStatus = 'DENIED'; Released = $false; ReceivedTime = [datetime]'2026-11-25 07:00'
+        SenderAddress = 'old@invoice-pay.example'; RecipientAddress = @('a@corp.example'); Subject = 'Old'; QuarantineTypes = 'Spam'; Expires = [datetime]'2026-12-25' } }
+    if ($MessageId -eq '<m1@invoice-pay.example>') { Row 'g1\a1' 'REQUESTED' $false; Row 'g1\a2' 'RELEASED' $true; Row 'g1\a3' 'NOTRELEASED' $false; return }
+    if ($MessageId -eq '<m2@invoice-pay.example>') { Denied; return }
+    if ($ReleaseStatus -eq 'Requested') { Row 'g1\a1' 'REQUESTED' $false }
+    if ($ReleaseStatus -eq 'Denied') { Denied }
+}
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-none') -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage') -NoAutoStart
+Show-Offscreen $d.Form
+$d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
+Update-RrView $d
+$d.Ctl.BSignIn.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
+$sess = $d.Session
+$first = @{ Checked = $d.Ctl.ChkHandled.Checked; Visible = $d.Ctl.ChkHandled.Visible; Text = $d.Ctl.ChkHandled.Text; Note = $d.Ctl.LblHandled.Text; NoteVisible = $d.Ctl.LblHandled.Visible
+    Hint = $d.Ctl.LblListHint.Text; HintVisible = $d.Ctl.LblListHint.Visible; Items = $d.Ctl.List.Items.Count; Calls = (@($sess.State.Calls) -join ' | '); ListNote = $d.ListMsg
+    Copies = $d.Ctl.List.Items[0].SubItems[4].Text; Tip = $d.Ctl.List.Items[0].ToolTipText; ShowTips = $d.Ctl.List.ShowItemToolTips; Flag = ($d.Ctl.List.Items[0].SubItems[4].ForeColor -eq $C.Warning) }
+$sess.State.Calls = @()
+$d.Ctl.ChkHandled.Checked = $true
+$d.Ctl.BRefresh.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
+$second = @{ Items = $d.Ctl.List.Items.Count; Calls = (@($sess.State.Calls) -join ' | '); ListNote = $d.ListMsg
+    MutedSecond = ($d.Ctl.List.Items[1].SubItems[2].ForeColor -eq $C.TextMuted); Status = @($d.Rows | ForEach-Object { $_.Status }) -join ',' }
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]@{ First = $first; Second = $second })
+'@
+        $r = Get-ChildJson (Invoke-ChildPs $body)
+        $dot = [string][char]0x00B7
+        $r.First.Checked | Should -BeFalse
+        $r.First.Visible | Should -BeTrue
+        $r.First.Text | Should -Be 'Also show released and denied messages'
+        $r.First.Note | Should -Be 'Includes messages released by an admin without a request.'
+        $r.First.NoteVisible | Should -BeTrue
+        $r.First.Hint | Should -Be 'One row per message. Saving exports one copy; decide for all copies in Defender.'
+        $r.First.HintVisible | Should -BeTrue
+        $r.First.Items | Should -Be 1
+        $r.First.Calls | Should -Be 'status=Requested;mid= | status=;mid=<m1@invoice-pay.example>'
+        $r.First.ListNote | Should -Be '1 message with a pending request (1 recipient copy). Nothing is selected yet.'
+        $r.First.Copies | Should -Be "! 1 pending $dot 1 released $dot 1 not requested"
+        $r.First.Tip | Should -Be 'Released to 1 recipient(s) already. Decide for all copies in Defender.'
+        $r.First.ShowTips | Should -BeTrue
+        $r.First.Flag | Should -BeTrue
+        $r.Second.Items | Should -Be 2
+        $r.Second.Calls | Should -Be 'status=Requested;mid= | status=Released;mid= | status=Denied;mid= | status=;mid=<m1@invoice-pay.example> | status=;mid=<m2@invoice-pay.example>'
+        $r.Second.ListNote | Should -Be '2 messages (1 with a pending request). Nothing is selected yet.'
+        $r.Second.Status | Should -Be 'Pending,Denied'
+        $r.Second.MutedSecond | Should -BeTrue
+    }
+    It 'the screenshot data is three synthetic messages, two selected, saved 2 of 2' {
+        $body = $script:ChildHead2 + @'
+$d = New-RrDialog -Incoming 'D:\SecurityReview\Incoming' -NoAutoStart
+Show-Offscreen $d.Form
+Set-RrScreenshotState $d 'results'
+$items = $d.Ctl.List.Items
+[pscustomobject]@{
+    Count = $items.Count; Rows = @($items | ForEach-Object { ($_.SubItems | ForEach-Object { $_.Text }) -join '|' }); Checked = $d.Ctl.List.CheckedItems.Count
+    Saved = $d.SaveSummary; Note = $d.ListMsg; Flags = @($d.Rows | ForEach-Object { $_.HasReleasedCopy })
+    Json = ($d.Rows | ConvertTo-Json -Depth 5 -Compress)
+} | ForEach-Object { Out-AsciiJson $_ }
+$d.Form.Close()
+'@
+        $r = Get-ChildJson (Invoke-ChildPs $body)
+        $dot = [string][char]0x00B7
+        $r.Count | Should -Be 3
+        $r.Checked | Should -Be 2
+        $r.Saved | Should -Be 'Saved 2 of 2 to Incoming'
+        $r.Rows[0] | Should -BeLike "2026-11-25 08:12|billing@invoice-pay.example|*|HighConfPhish|! 2 pending $dot 2 released $dot 3 not requested|2026-12-25"
+        $r.Rows[1] | Should -BeLike "2026-11-25 09:03|*|Phish|1 pending $dot 3 not requested|2026-12-25"
+        $r.Rows[2] | Should -BeLike "2026-11-25 09:47|*|Spam|1 pending|2026-12-25"
+        @($r.Flags) | Should -Be @($true, $false, $false)
+        $r.Json | Should -Not -Match '(?i)@(?!\w[\w.-]*\.example)'
+        $r.Json | Should -Match '00000000-0000-4000-8000'
     }
 }
 

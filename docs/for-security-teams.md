@@ -75,8 +75,8 @@ These are links the reviewer's browser opens. The tool itself makes no request t
 
 ## What the host shows during intake
 
-The intake list has six columns: **Received, Sender, Recipient, Subject, Quarantine type, Expires**. That is all. No message body and
-no attachment is opened or shown on the host. The reviewer selects the messages to export; none is selected by default.
+The intake list shows one row per message (Exchange keeps one quarantine row per recipient copy, and the tool groups them). It has six columns: **Received, Sender, Subject, Quarantine type, Copies, Expires**. **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`. No message body and
+no attachment is opened or shown on the host. The reviewer selects the messages to export; none is selected by default. Saving exports one copy per selected message. The release decision for all copies stays in Defender. Microsoft lists quarantined messages either once per message or once per recipient (per-recipient since early 2026); the dialog groups both into one row per message. An optional view, **Also show released and denied messages** (off by default), adds messages that were already released or denied. To count the copies, the tool runs one more read-only `Get-QuarantineMessage -MessageId` lookup per listed message.
 
 ## Permissions
 
