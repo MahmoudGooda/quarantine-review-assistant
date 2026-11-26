@@ -7,20 +7,331 @@ param([switch]$NoGui, [string]$Screenshot, [int]$ScreenshotDpi = 0, [switch]$Scr
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+$AppVersion   = '2.3.0'   # read by the start-up splash, so it is set before anything else
+
+# ---------------------------------------------------------------- start-up: single instance, then a splash while the window is built
+# Only for a real GUI run (not -Screenshot, -NoGui or inside the Sandbox). Plain WinForms and .NET only: nothing here needs Add-Type or the UI kit,
+# so the splash is on screen before the slow part (loading the kit and building the form) starts.
+$script:LauncherMutex = $null
+$script:Splash = $null          # the plain fallback splash (a form on this thread)
+$script:SplashState = $null     # shared with the animated splash thread: Close, Ready, Failed, Status, Frame, Progress
+$script:SplashPs = $null; $script:SplashRs = $null; $script:SplashAsync = $null
+$startGui = (-not $Screenshot) -and (-not $NoGui) -and ($env:USERNAME -ne 'WDAGUtilityAccount')
+
+# The animated splash. It runs on its OWN STA thread (a runspace with its own message loop), because the launcher thread is busy for a couple of seconds
+# (compile, build the form) and pumps no messages: an animation on that thread would freeze. Plain WinForms and GDI+ only, no Add-Type.
+# With $state.Shot set it renders one frame (progress frozen) to that PNG on the calling thread and returns: that is the review screenshot.
+$script:LauncherSplashBlock = {
+    param($state)
+    $ErrorActionPreference = 'Stop'
+    $shot = [string]$state.Shot
+    $ui = @{ Frame = 0; Fading = 0; Closing = $false; CloseAt = 0; LastStatus = '' }
+    $win = $null; $timer = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $dr = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+        $ui.W = 640; $ui.H = 357
+        $navy = [System.Drawing.Color]::FromArgb(17, 38, 66)
+        $win = New-Object System.Windows.Forms.Form
+        $win.AutoScaleMode = 'None'; $win.FormBorderStyle = 'None'; $win.ShowInTaskbar = $false; $win.TopMost = $true; $win.StartPosition = 'Manual'
+        $win.BackColor = $navy; $win.ClientSize = New-Object System.Drawing.Size($ui.W, $ui.H)
+        $win.Text = 'Quarantine Review Assistant'
+        $win.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic').SetValue($win, $true, $null)
+        $area = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea   # the screen with the mouse
+        $win.Location = New-Object System.Drawing.Point(($area.Left + [int](($area.Width - $win.Width) / 2)), ($area.Top + [int](($area.Height - $win.Height) / 2)))
+        if (-not $shot) { $win.Opacity = 0 }
+        # The window exists from the next line on (hidden, opacity 0): the launcher may go on and declare DPI awareness while the picture is prepared.
+        $win.Add_HandleCreated({ $state.Ready = $true }.GetNewClosure())
+        if (-not $shot) { [void]$win.Handle }
+
+        # A family that is not installed throws: that is the cheap way to ask (listing all families is slow).
+        $hasFont = { param($n) try { (New-Object System.Drawing.FontFamily($n)).Dispose(); $true } catch { $false } }
+        $titleName = 'Segoe UI'; $titleStyle = [System.Drawing.FontStyle]::Bold
+        if (& $hasFont 'Segoe UI Variable Display Semib') { $titleName = 'Segoe UI Variable Display Semib'; $titleStyle = [System.Drawing.FontStyle]::Regular }
+        elseif (& $hasFont 'Segoe UI Semibold') { $titleName = 'Segoe UI Semibold'; $titleStyle = [System.Drawing.FontStyle]::Regular }
+        $bodyName = if (& $hasFont 'Segoe UI Variable Text') { 'Segoe UI Variable Text' } else { 'Segoe UI' }
+        $fTitle = New-Object System.Drawing.Font($titleName, [single]20, $titleStyle, [System.Drawing.GraphicsUnit]::Point)
+        $fBody = New-Object System.Drawing.Font($bodyName, [single]10, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+        $ui.FBody = $fBody
+
+        # The picture is shipped at twice the window size and scaled down once, with the best filter, into a cache that every repaint copies from.
+        $cache = New-Object System.Drawing.Bitmap($ui.W, $ui.H, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $gc = [System.Drawing.Graphics]::FromImage($cache)
+        $hasImage = $false
+        try {
+            $gc.Clear($navy)
+            $gc.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $gc.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $gc.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $gc.CompositingQuality = $dr
+            $imgPath = [string]$state.Image
+            if ($imgPath -and (Test-Path -LiteralPath $imgPath)) {
+                $ms = New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($imgPath))
+                try {
+                    $src = [System.Drawing.Image]::FromStream($ms)
+                    try {
+                        $attr = New-Object System.Drawing.Imaging.ImageAttributes
+                        $attr.SetWrapMode([System.Drawing.Drawing2D.WrapMode]::TileFlipXY)
+                        $gc.DrawImage($src, (New-Object System.Drawing.Rectangle(0, 0, $ui.W, $ui.H)), 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel, $attr)
+                        $attr.Dispose()
+                        $hasImage = $true
+                    } finally { $src.Dispose() }
+                } finally { $ms.Dispose() }
+            }
+        } catch { $hasImage = $false; $gc.Clear($navy) }   # missing or unreadable picture: plain navy, same text, same animation
+
+        # Layout: the picture keeps its shield on the left, so the text sits in the empty right part (or the whole width without a picture).
+        $ui.TextX = if ($hasImage) { 372 } else { 40 }
+        $ui.TextW = $ui.W - $ui.TextX - 40
+        $white = [System.Drawing.Brushes]::White
+        $muted = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(170, 196, 224))
+        $sf = New-Object System.Drawing.StringFormat([System.Drawing.StringFormat]::GenericDefault)
+        $sf.Trimming = [System.Drawing.StringTrimming]::None
+        $gc.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+        $title = 'Quarantine Review Assistant'
+        $titleH = [Math]::Ceiling($gc.MeasureString($title, $fTitle, $ui.TextW, $sf).Height)
+        $verH = [Math]::Ceiling($fBody.GetHeight($gc))
+        $blockH = $titleH + 10 + $verH
+        $top = [Math]::Round(158 - $blockH / 2)
+        $gc.DrawString($title, $fTitle, $white, (New-Object System.Drawing.RectangleF($ui.TextX, $top, $ui.TextW, ($titleH + 4))), $sf)
+        $gc.DrawString(('Version ' + [string]$state.Version), $fBody, $muted, (New-Object System.Drawing.RectangleF($ui.TextX, ($top + $titleH + 10), $ui.TextW, ($verH + 4))), $sf)
+        # 1 px border
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(42, 74, 117), 1)
+        $gc.DrawRectangle($pen, 0, 0, ($ui.W - 1), ($ui.H - 1))
+        $pen.Dispose(); $muted.Dispose(); $sf.Dispose(); $gc.Dispose(); $fTitle.Dispose()
+        $ui.Cache = $cache
+        $ui.StatusRect = New-Object System.Drawing.Rectangle(($ui.TextX - 2), 284, ($ui.TextW + 4), 26)
+        $ui.BarRect = New-Object System.Drawing.Rectangle($ui.TextX, 320, $ui.TextW, 3)
+        $ui.BarInvalid = New-Object System.Drawing.Rectangle(($ui.TextX - 2), 318, ($ui.TextW + 4), 7)
+        $ui.Segment = [int]($ui.TextW * 0.34)
+        $ui.Clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $ui.Frozen = -1.0
+        if ($shot) { $ui.Frozen = 0.46 }
+
+
+        $win.Add_Paint({
+                param($s, $e)
+                $g = $e.Graphics; $r = $e.ClipRectangle
+                $g.DrawImage($ui.Cache, $r, $r.X, $r.Y, $r.Width, $r.Height, [System.Drawing.GraphicsUnit]::Pixel)
+                if ($r.IntersectsWith($ui.StatusRect)) {
+                    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+                    $g.DrawString([string]$state.Status, $ui.FBody, [System.Drawing.Brushes]::White, [single]$ui.TextX, [single]($ui.StatusRect.Y + 2))
+                }
+                if ($r.IntersectsWith($ui.BarInvalid)) {
+                    $bar = $ui.BarRect
+                    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+                    $d = [single]$bar.Height
+                    $path.AddArc([single]$bar.X, [single]$bar.Y, $d, $d, 90, 180)
+                    $path.AddArc([single]($bar.Right - $d), [single]$bar.Y, $d, $d, 270, 180)
+                    $path.CloseFigure()
+                    $track = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(38, 255, 255, 255))   # white at 15 %
+                    $g.FillPath($track, $path); $track.Dispose()
+                    # Eased sweep: gentle start, faster middle, gentle end, a very short rest before the loop. The head and the soft tail are one gradient segment.
+                    $p = $ui.Progress
+                    $t = [Math]::Min(1.0, $p / 0.94)
+                    $ease = 0.55 * (0.5 - 0.5 * [Math]::Cos([Math]::PI * $t)) + 0.45 * $t   # mostly eased, never quite stopping
+                    $x0 = -$ui.Segment + $ease * ($bar.Width + $ui.Segment)
+                    $g.SetClip($path)
+                    $segRect = New-Object System.Drawing.RectangleF(([single]($bar.X + $x0)), [single]$bar.Y, [single]$ui.Segment, [single]$bar.Height)
+                    $lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($segRect, [System.Drawing.Color]::FromArgb(0, 76, 194, 255), [System.Drawing.Color]::FromArgb(255, 76, 194, 255), [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
+                    $blend = New-Object System.Drawing.Drawing2D.ColorBlend(3)
+                    $blend.Colors = @([System.Drawing.Color]::FromArgb(0, 76, 194, 255), [System.Drawing.Color]::FromArgb(255, 76, 194, 255), [System.Drawing.Color]::FromArgb(255, 76, 194, 255))
+                    $blend.Positions = @([single]0, [single]0.7, [single]1)
+                    $lg.InterpolationColors = $blend
+                    $g.FillRectangle($lg, $segRect)
+                    $lg.Dispose(); $g.ResetClip(); $path.Dispose()
+                }
+            }.GetNewClosure())
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 15
+        $timer.Add_Tick({
+                $ms = $ui.Clock.ElapsedMilliseconds
+                $ui.Frame++
+                $state.Frame = $ui.Frame
+                if ($ui.Frozen -ge 0) { $ui.Progress = $ui.Frozen } else { $ui.Progress = ($ms % 1700) / 1700.0 }
+                $state.Progress = $ui.Progress
+                # fade in over about 150 ms, fade out over about 120 ms once the launcher asks for it (or after a 60 s safety limit)
+                if (-not $ui.Closing -and ($state.Close -or $ms -gt 60000)) { $ui.Closing = $true; $ui.CloseAt = $ms }
+                if ($ui.Closing) {
+                    $o = 1.0 - (($ms - $ui.CloseAt) / 120.0)
+                    if ($o -le 0) { $win.Close(); return }
+                    $win.Opacity = $o
+                } elseif ($win.Opacity -lt 1) {
+                    $win.Opacity = [Math]::Min(1.0, $win.Opacity + 0.12)
+                }
+                $status = [string]$state.Status
+                if ($status -ne $ui.LastStatus) { $ui.LastStatus = $status; $win.Invalidate($ui.StatusRect) }
+                $win.Invalidate($ui.BarInvalid)
+            }.GetNewClosure())
+
+        if ($shot) {
+            # Review screenshot: render this form once, with the bar frozen, and leave.
+            $ui.Progress = $ui.Frozen
+            $win.Opacity = 0; $win.Location = New-Object System.Drawing.Point(-32000, -32000)
+            $win.Show()
+            [System.Windows.Forms.Application]::DoEvents()
+            $bmp = New-Object System.Drawing.Bitmap($win.Width, $win.Height)
+            $win.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $win.Width, $win.Height)))
+            $bmp.Save($shot, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            return
+        }
+        $ui.Progress = 0.0
+        $win.Add_FormClosed({ $timer.Stop() }.GetNewClosure())
+        $timer.Start()
+        [System.Windows.Forms.Application]::Run($win)
+    } catch {
+        $state.Failed = $true
+        $state.Error = $_.Exception.Message
+        if ($shot) { throw }
+    } finally {
+        if ($timer) { $timer.Stop(); $timer.Dispose() }
+        if ($win) { $win.Dispose() }
+        if ($ui.Cache) { $ui.Cache.Dispose() }
+        if ($ui.FBody) { $ui.FBody.Dispose() }
+        $state.Done = $true
+    }
+}
+
+function Start-LauncherSplash {
+    # Starts the animated splash on its own thread and waits (briefly) until it is on screen. Returns $false when that cannot be done.
+    # The wait keeps the order the DPI rule needs: this window must exist before the process declares DPI awareness.
+    $state = [hashtable]::Synchronized(@{
+            Close = $false; Ready = $false; Failed = $false; Done = $false; Frame = 0; Progress = 0.0; Error = ''; Shot = ''
+            Status = 'Starting...'; Version = $AppVersion; Image = (Join-Path $PSScriptRoot 'assets\splash.jpg')
+        })
+    $rs = $null; $ps = $null
+    try {
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+        $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $rs.Open()
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($script:LauncherSplashBlock.ToString()).AddArgument($state)
+        $async = $ps.BeginInvoke()
+        $waited = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $state.Ready -and -not $state.Failed -and -not $async.IsCompleted -and $waited.ElapsedMilliseconds -lt 3000) { [System.Threading.Thread]::Sleep(4) }
+        if ($state.Ready) {
+            $script:SplashState = $state; $script:SplashPs = $ps; $script:SplashRs = $rs; $script:SplashAsync = $async
+            return $true
+        }
+    } catch { $null = $_ } # no runspace (restricted language mode, no memory): the plain splash below takes over
+    $state.Close = $true
+    foreach ($res in @($ps, $rs)) { if ($res) { try { $res.Dispose() } catch { $null = $_ } } } # never started or never showed: nothing to wait for
+    return $false
+}
+function Close-LauncherSplash([switch]$Wait) {
+    # Asks the splash thread to fade out and finish. Without -Wait the launcher is never held up: the thread is cleaned up by a timer once it is done.
+    if ($script:Splash) {
+        try { $script:Splash.Close(); $script:Splash.Dispose() } catch { $null = $_ } # already gone
+        $script:Splash = $null
+    }
+    if (-not $script:SplashPs) { return }
+    $ps = $script:SplashPs; $rs = $script:SplashRs; $async = $script:SplashAsync
+    $script:SplashPs = $null; $script:SplashRs = $null; $script:SplashAsync = $null
+    try { $script:SplashState.Close = $true } catch { $null = $_ } # the splash timer sees this and closes its window
+    $finish = {
+        try { if ($async.IsCompleted) { [void]$ps.EndInvoke($async) } else { [void]$ps.BeginStop($null, $null) } } catch { $null = $_ } # best effort
+        foreach ($res in @($ps, $rs)) { try { $res.Dispose() } catch { $null = $_ } }
+    }.GetNewClosure()
+    $done = $false
+    try { $done = $async.AsyncWaitHandle.WaitOne($(if ($Wait) { 400 } else { 0 })) } catch { $null = $_ }
+    if ($done) { & $finish; return }
+    if ($Wait) { & $finish; return }
+    try {
+        $cleanup = New-Object System.Windows.Forms.Timer
+        $cleanup.Interval = 250
+        $left = @{ N = 0 }
+        $cleanup.Add_Tick({
+                $left.N++
+                if ($async.IsCompleted -or $left.N -ge 24) { $cleanup.Stop(); $cleanup.Dispose(); & $finish }
+            }.GetNewClosure())
+        $cleanup.Start()
+    } catch { & $finish }
+}
+function Exit-LauncherMutex {
+    if ($script:LauncherMutex) {
+        try { $script:LauncherMutex.ReleaseMutex() } catch { $null = $_ } # not owned by this thread: the OS frees it when the process ends
+        try { $script:LauncherMutex.Dispose() } catch { $null = $_ } # already disposed
+        $script:LauncherMutex = $null
+    }
+}
+if ($env:QRA_SPLASH_SHOT) {
+    # Review screenshot of the splash (renders the same form, progress frozen, to the PNG named in the variable). QRA_SPLASH_IMAGE may point at another picture file.
+    $shotState = @{ Shot = $env:QRA_SPLASH_SHOT; Version = $AppVersion; Status = 'Starting...'; Image = $(if ($env:QRA_SPLASH_IMAGE) { $env:QRA_SPLASH_IMAGE } else { Join-Path $PSScriptRoot 'assets\splash.jpg' }) }
+    & $script:LauncherSplashBlock $shotState
+    exit 0
+}
+if ($startGui) {
+    $mutexMine = $true
+    try {
+        $mutexNew = $false
+        $script:LauncherMutex = New-Object System.Threading.Mutex($true, 'Local\QuarantineReviewAssistant.Launcher', [ref]$mutexNew)
+        if (-not $mutexNew) { $mutexMine = $false; $script:LauncherMutex.Dispose(); $script:LauncherMutex = $null }
+    } catch { $mutexMine = $true; $script:LauncherMutex = $null } # cannot create the mutex: carry on without the single-instance check
+    if (-not $mutexMine) {
+        # Another launcher is running: bring its window forward and leave without building anything.
+        try {
+            $other = @(Get-Process -Name powershell -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'Quarantine Review Assistant * - Host Launcher' })[0]
+            if ($other -and $other.MainWindowHandle -ne [IntPtr]::Zero -and [string]$ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') {
+                if (-not ('QRA.Wake' -as [type])) {
+                    Add-Type -Namespace QRA -Name Wake -ErrorAction Stop -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h); [DllImport("user32.dll")] public static extern bool IsIconic(System.IntPtr h);'
+                }
+                if ([QRA.Wake]::IsIconic($other.MainWindowHandle)) { [void][QRA.Wake]::ShowWindow($other.MainWindowHandle, 9) }   # SW_RESTORE, only for a minimised window
+                [void][QRA.Wake]::SetForegroundWindow($other.MainWindowHandle)
+            }
+        } catch { $null = $_ } # best effort: the running launcher is still there
+        Close-LauncherSplash   # no splash exists on this path; it is still the one place that guarantees none is left behind
+        exit 0
+    }
+    if (-not (Start-LauncherSplash)) {
+        try {
+            $sp = New-Object System.Windows.Forms.Form
+            $sp.AutoScaleMode = 'None'; $sp.FormBorderStyle = 'None'; $sp.ShowInTaskbar = $false; $sp.TopMost = $true; $sp.StartPosition = 'Manual'
+            $sp.BackColor = [System.Drawing.Color]::FromArgb(17, 38, 66); $sp.Size = New-Object System.Drawing.Size(380, 120)
+            $spT = New-Object System.Windows.Forms.Label
+            $spT.Text = 'Quarantine Review Assistant'; $spT.AutoSize = $true; $spT.Location = New-Object System.Drawing.Point(24, 24)
+            $spT.ForeColor = [System.Drawing.Color]::White; $spT.BackColor = [System.Drawing.Color]::Transparent
+            $spT.Font = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+            $spS = New-Object System.Windows.Forms.Label
+            $spS.Text = 'Starting...'; $spS.AutoSize = $true; $spS.Location = New-Object System.Drawing.Point(27, 70)
+            $spS.ForeColor = [System.Drawing.Color]::FromArgb(170, 196, 224); $spS.BackColor = [System.Drawing.Color]::Transparent
+            $spS.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+            $sp.Controls.AddRange(@($spT, $spS))
+            $spArea = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea   # the screen with the mouse
+            $sp.Location = New-Object System.Drawing.Point(($spArea.Left + [int](($spArea.Width - $sp.Width) / 2)), ($spArea.Top + [int](($spArea.Height - $sp.Height) / 2)))
+            $sp.Show(); $sp.Refresh()
+            [System.Windows.Forms.Application]::DoEvents()
+            $script:Splash = $sp
+        } catch { $script:Splash = $null } # the splash is cosmetic
+    }
+}
+function Set-LauncherSplashStatus([string]$text) {
+    if ($script:SplashState) { try { $script:SplashState.Status = $text } catch { $null = $_ } } # cosmetic
+}
 
 # Shared UI kit: DPI helpers, design tokens, fonts, painted controls (with plain fallbacks) and background work.
+Set-LauncherSplashStatus 'Loading the interface...'
 . (Join-Path $PSScriptRoot 'QraUi.ps1')
+# Optional release-request intake (Exchange Online). Dot-sourced WITHOUT arguments: its parameters are aliased so this script's $Incoming and $Screenshot stay untouched.
+. (Join-Path $PSScriptRoot 'ReleaseRequests.ps1')
+Set-LauncherSplashStatus 'Building the window...'
+if ($script:Splash) { [System.Windows.Forms.Application]::DoEvents() }
 # -ScreenshotDpi: emulate another display scale. Must run before any window exists.
 if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 trap {
+    Close-LauncherSplash -Wait; Exit-LauncherMutex
     if ($Screenshot) { [Console]::Error.WriteLine($_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage + "`n" + $_.ScriptStackTrace); exit 1 }   # headless: never wait on a dialog
     [System.Windows.Forms.MessageBox]::Show("The launcher hit an unexpected error:`r`n`r`n$($_.Exception.Message)`r`n`r`nIf your organisation blocks PowerShell scripts, ask IT security to allow this tool's folder.", 'Quarantine Review Assistant', 'OK', 'Error') | Out-Null
     break
 }
 
-# ---------------------------------------------------------------- configuration
-$AppVersion   = '2.2.0'
+# ---------------------------------------------------------------- configuration ($AppVersion is set at the top: the splash shows it)
 $Root         = Split-Path -Parent $PSScriptRoot
 $AppDir       = $PSScriptRoot
 $Incoming     = Join-Path $Root 'Incoming'
@@ -410,7 +721,7 @@ if (-not $Screenshot) { New-Item -ItemType Directory -Force -Path $Incoming | Ou
 if ($NoGui) { Get-ReadinessChecks | Format-Table Name, Status, Detail -AutoSize -Wrap; return }
 
 # hide the PowerShell console that launched us (purely cosmetic; ignored if blocked)
-if (-not $Screenshot) { Hide-QraConsole }
+if (-not $Screenshot) { Enable-QraForeground; Hide-QraConsole }   # the console is about to vanish: keep the right to come to the front
 
 # ================================================================= UI
 $Fonts = @{
@@ -448,6 +759,7 @@ $form.Size = New-Object System.Drawing.Size(1180, 820)
 $form.MinimumSize = New-Object System.Drawing.Size(1040, 720)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $C.Surface
+Set-QraWindowChrome $form -NoAppId:([bool]$Screenshot)   # app icon, own taskbar button, navy title bar (Windows 11)
 
 # ---- header: navy gradient, title, and (added after scaling) the PC / Python / Sandbox pills
 $header = New-Object System.Windows.Forms.Panel
@@ -612,9 +924,10 @@ $checksNote = New-TextLabel 'Reading the Windows edition, virtualization, resour
 $overall = New-Object System.Windows.Forms.Label
 $overall.Font = $Fonts.Overall; $overall.TextAlign = 'MiddleLeft'; $overall.BackColor = $C.Card; $overall.UseMnemonic = $false
 $recheck = New-QraButton 'Check again' 'Secondary' $QraGlyph.Refresh
+$bShortcut = New-QraButton 'Create desktop shortcut' 'Secondary' $QraGlyph.Link
 $overallSpin = New-QraSpinner 28
 $overallSpin.BackColor = $C.Card; Set-Shown $overallSpin $false
-$st1.Panel.Controls.AddRange(@($checksPanel, $checksNote, $overallSpin, $overall, $recheck))
+$st1.Panel.Controls.AddRange(@($checksPanel, $checksNote, $overallSpin, $overall, $bShortcut, $recheck))
 
 # Step 2: Check it in Defender
 $st2 = New-StepPanel 2 'Check it in Defender' 'Look at the message in the portal before anything is downloaded. Many decisions can already be made there.' @(
@@ -631,13 +944,15 @@ $st3 = New-StepPanel 3 'Download the message' 'The Sandbox reads the ZIP from th
     (New-SubStep 'In the portal, select the message.'),
     (New-SubStep 'Choose ... More > Download message.' '... More > Download message'),
     (New-SubStep 'Type a password you will remember for the next few minutes.'),
-    (New-SubStep 'Save the ZIP to the folder below. Do not open or extract it.')
+    (New-SubStep 'Save the ZIP to the folder below. Do not open or extract it.'),
+    (New-SubStep 'Optional: Fetch release requests saves the messages you select straight into this folder.' 'Fetch release requests')
 )
 $incomingLbl = New-Object System.Windows.Forms.TextBox
 $incomingLbl.ReadOnly = $true; $incomingLbl.Text = $Incoming; $incomingLbl.BorderStyle = 'FixedSingle'
 $incomingLbl.BackColor = $C.Surface; $incomingLbl.Font = $Fonts.Body
 $bOpenIncoming = New-QraButton 'Open folder' 'Secondary' $QraGlyph.Folder
 $bCopyIncoming = New-QraButton 'Copy path' 'Secondary' $QraGlyph.Copy
+$bFetch = New-QraButton 'Fetch release requests' 'Secondary' $QraGlyph.Mail
 $incomingList = New-Object System.Windows.Forms.ListView
 $incomingList.View = 'Details'; $incomingList.FullRowSelect = $true; $incomingList.HeaderStyle = 'Nonclickable'
 [void]$incomingList.Columns.Add('Waiting for review', (S 290))
@@ -646,7 +961,7 @@ $incomingList.View = 'Details'; $incomingList.FullRowSelect = $true; $incomingLi
 $incomingSpin = New-QraSpinner 20
 $incomingSpin.BackColor = $C.Card; Set-Shown $incomingSpin $false
 $incomingHint = New-TextLabel '' $Fonts.Body $C.TextMuted
-$st3.Panel.Controls.AddRange(@($incomingLbl, $bOpenIncoming, $bCopyIncoming, $incomingList, $incomingSpin, $incomingHint))
+$st3.Panel.Controls.AddRange(@($incomingLbl, $bOpenIncoming, $bCopyIncoming, $bFetch, $incomingList, $incomingSpin, $incomingHint))
 
 # Step 4: Analyze in the Sandbox
 $st4 = New-StepPanel 4 'Analyze in the Sandbox' 'Networking is off. Report export makes the Reports folder writable. Compatibility mode uses the Windows default for clipboard sharing.' @(
@@ -701,10 +1016,12 @@ foreach ($row in $script:RailRows) { Set-Access $row ("Step $($row.Tag.Index) of
 foreach ($k in 1..5) { Set-Access $script:Step[$k].Panel "Step $k of 5" }
 Set-Access $checksPanel 'Readiness checks' 'One row per check, with its status word and an action button where one is needed'
 Set-Access $recheck 'Check again'
+Set-Access $bShortcut 'Create a desktop shortcut for the launcher'
 Set-Access $bPortal 'Open Defender quarantine in the browser'
 Set-Access $bChecked "I've checked it in Defender, go to the next step"
 Set-Access $incomingLbl 'Incoming folder path'
 Set-Access $bOpenIncoming 'Open the Incoming folder'; Set-Access $bCopyIncoming 'Copy the Incoming folder path'
+Set-Access $bFetch 'Fetch release requests from Exchange Online and save the ones you select into Incoming'
 Set-Access $incomingList 'Files waiting for review'
 Set-Access $optReports 'Let the Sandbox save reports to this PC'; Set-Access $optProtected 'Protected Client mode'; Set-Access $optCompat 'Compatibility mode, weaker isolation'
 Set-Access $bLaunch 'Launch Sandbox review'
@@ -713,9 +1030,9 @@ Set-Access $bCopyBlock 'Copy block list'; Set-Access $bLog 'Open the decisions l
 Set-Access $bNext 'Review the next message'
 $rail.TabIndex = 0; $pane.TabIndex = 1
 $ti = 0; foreach ($row in $script:RailRows) { $row.TabIndex = $ti++ }
-$checksPanel.TabIndex = 0; $recheck.TabIndex = 1
+$checksPanel.TabIndex = 0; $recheck.TabIndex = 1; $bShortcut.TabIndex = 2
 $bPortal.TabIndex = 0; $bChecked.TabIndex = 1
-$ti = 0; foreach ($tabCtl in @($incomingLbl, $bOpenIncoming, $bCopyIncoming, $incomingList)) { $tabCtl.TabIndex = $ti++ }
+$ti = 0; foreach ($tabCtl in @($incomingLbl, $bOpenIncoming, $bCopyIncoming, $bFetch, $incomingList)) { $tabCtl.TabIndex = $ti++ }
 $ti = 0; foreach ($tabCtl in @($optReports, $optProtected, $optCompat, $bLaunch, $bAck)) { $tabCtl.TabIndex = $ti++ }
 $ti = 0; foreach ($tabCtl in @($bNext, $bCopyBlock, $bLog, $bReports, $bClean)) { $tabCtl.TabIndex = $ti++ }
 $form.ResumeLayout($false)
@@ -822,7 +1139,7 @@ function Update-StepContent([int]$n) {
     $w = $p.ClientSize.Width; $h = $p.ClientSize.Height
     $pad = S 28
     $cw = [Math]::Max((S 320), $w - 2 * $pad)
-    $tw = [Math]::Min($cw, (S 620))
+    $tw = [Math]::Min($cw, (S 900))   # lead, sub-steps and options use the content width up to a comfortable reading width
     $rw = [Math]::Min($cw, (S 760))
     $p.SuspendLayout()
     $y = Set-StepHead $st $pad $tw
@@ -831,14 +1148,20 @@ function Update-StepContent([int]$n) {
             $barH = S 40
             $top = $y
             $hasRows = ($checksPanel.Controls.Count -gt 0)
-            $checksPanel.SetBounds($pad, $top, $cw, [Math]::Max((S 120), $h - $top - $barH - (S 32)))
+            # Check again sits at the right end; Create desktop shortcut is left of it (same height, 8 px gap), or on its own row below when the text would get too narrow.
+            $wRe = Get-ButtonWidth $recheck (S 128); $wSc = Get-ButtonWidth $bShortcut (S 128)
+            $oneRow = (($cw - $wRe - (S 8) - $wSc - (S 8)) -ge (S 240))
+            $barBlock = if ($oneRow) { $barH } else { 2 * $barH + (S 8) }
+            $checksPanel.SetBounds($pad, $top, $cw, [Math]::Max((S 120), $h - $top - $barBlock - (S 32)))
             $checksNote.Visible = -not $hasRows
             if (-not $hasRows) { [void](Set-Wrapped $checksNote $pad ($top + (S 8)) $tw) }
             $by = $checksPanel.Bottom + (S 16)
-            $recheck.SetBounds(($pad + $cw - (Get-ButtonWidth $recheck (S 128))), $by, (Get-ButtonWidth $recheck (S 128)), $barH)
+            $recheck.SetBounds(($pad + $cw - $wRe), $by, $wRe, $barH)
+            if ($oneRow) { $bShortcut.SetBounds(($recheck.Left - (S 8) - $wSc), $by, $wSc, $barH); $textRight = $bShortcut.Left }
+            else { $bShortcut.SetBounds(($pad + $cw - $wSc), ($by + $barH + (S 8)), $wSc, $barH); $textRight = $recheck.Left }
             $overallSpin.SetBounds($pad, ($by + [int](($barH - (S 28)) / 2)), (S 28), (S 28))
             $ox = if (Test-Shown $overallSpin) { $pad + (S 40) } else { $pad }
-            $overall.SetBounds($ox, $by, [Math]::Max((S 120), $recheck.Left - $ox - (S 8)), $barH)
+            $overall.SetBounds($ox, $by, [Math]::Max((S 120), $textRight - $ox - (S 8)), $barH)
             $want = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24))
             foreach ($crow in @($checksPanel.Controls)) { if ($crow.Width -ne $want) { $crow.Width = $want; Fit-CheckRow $crow } }
         }
@@ -852,9 +1175,19 @@ function Update-StepContent([int]$n) {
             $wCopy = Get-ButtonWidth $bCopyIncoming; $wOpen = Get-ButtonWidth $bOpenIncoming
             $bCopyIncoming.SetBounds(($pad + $rw - $wCopy), $y, $wCopy, $bh)
             $bOpenIncoming.SetBounds(($bCopyIncoming.Left - (S 8) - $wOpen), $y, $wOpen, $bh)
-            $incomingLbl.Width = [Math]::Max((S 120), $bOpenIncoming.Left - (S 8) - $pad)
+            # Fetch sits left of Open folder when the path box keeps a usable width, else it gets its own row below.
+            $wFetch = Get-ButtonWidth $bFetch
+            $inline = (($bOpenIncoming.Left - (S 8) - $wFetch - (S 8) - $pad) -ge (S 220))
+            if ($inline) {
+                $bFetch.SetBounds(($bOpenIncoming.Left - (S 8) - $wFetch), $y, $wFetch, $bh)
+                $boxRight = $bFetch.Left
+            } else {
+                $boxRight = $bOpenIncoming.Left
+            }
+            $incomingLbl.Width = [Math]::Max((S 120), $boxRight - (S 8) - $pad)
             $incomingLbl.Location = New-Object System.Drawing.Point($pad, ($y + [int](($bh - $incomingLbl.Height) / 2)))
             $y += $bh + (S 16)
+            if (-not $inline) { $bFetch.SetBounds($pad, ($y - (S 8)), $wFetch, $bh); $y = $bFetch.Bottom + (S 16) }
             $hintH = (Measure-Wrapped $incomingHint.Text $incomingHint.Font ($rw - (S 28))) + (S 8)   # keep the hint under the list inside the card
             $listH = [Math]::Min((S 240), [Math]::Max((S 72), $h - $y - $hintH - (S 36)))
             $incomingList.SetBounds($pad, $y, $rw, $listH)
@@ -1048,6 +1381,28 @@ function Render-Checks {
     if ($firstBad) { try { $checksPanel.ScrollControlIntoView($firstBad) } catch { $null = $_ } } # best-effort scroll when control is not yet laid out
 }
 
+# Puts "Quarantine Review Assistant.lnk" on the user's Desktop (the real one, also when OneDrive redirects it). Asks before replacing. Nothing else is touched.
+function Invoke-CreateDesktopShortcut {
+    $title = 'Quarantine Review Assistant'
+    try {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        $lnkPath = Join-Path $desktop 'Quarantine Review Assistant.lnk'
+        $force = $false
+        if (Test-Path -LiteralPath $lnkPath) {
+            if ([System.Windows.Forms.MessageBox]::Show('Replace the existing desktop shortcut?', $title, 'YesNo', 'Question') -ne 'Yes') { return }
+            $force = $true
+        }
+        $icoPath = Join-Path $Root 'QuarantineReviewAssistant.ico'
+        if (-not (Test-Path -LiteralPath $icoPath)) {
+            try { if (-not (Write-QraIcoFile $icoPath)) { $icoPath = '' } } catch { $icoPath = '' }   # no icon file: the shortcut still works, with the default icon
+        }
+        $res = New-QraDesktopShortcut -ShortcutPath $lnkPath -Target (Join-Path $Root 'Start-Here.cmd') -WorkingDirectory $Root -IconPath $icoPath -Force:$force
+        if ($res.Status -in 'Created', 'Replaced') { Show-QraCopied $bShortcut 'Shortcut created'; return }
+        [System.Windows.Forms.MessageBox]::Show("The desktop shortcut could not be created.`r`n`r`n$($res.Message)", $title, 'OK', 'Warning') | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("The desktop shortcut could not be created.`r`n`r`n$($_.Exception.Message)", $title, 'OK', 'Warning') | Out-Null
+    }
+}
 function Set-RowButtons([bool]$enabled) {
     foreach ($row in @($checksPanel.Controls)) { if ($row.Tag -and $row.Tag.Btn) { $row.Tag.Btn.Enabled = $enabled } }
 }
@@ -1231,7 +1586,7 @@ function Refresh-LastDecision {
 function Show-LastDecision($d) {
     $script:LastDecision = $d
     if (-not $d) {
-        $lastDec.Text = 'No decision recorded yet. In the Sandbox: Decision tab > Record decision (needs "save reports to this PC" ticked in step 4).'
+        $lastDec.Text = 'No decision recorded yet. In the Sandbox: Decision tab > Record decision (needs "save reports to this PC" selected in step 4).'
         $lastDec.ForeColor = $C.TextMuted; $bCopyBlock.Enabled = $false
         return
     }
@@ -1596,6 +1951,7 @@ $waitTimer.Add_Tick({
 # texts that change while the launcher runs may need another line: lay the steps out again
 foreach ($lbl in @($launchHint, $lastDec, $incomingHint)) { $lbl.Add_TextChanged({ if ($script:LayoutReady) { Update-StepLayout } }) }
 $recheck.Add_Click({ Start-ReadinessRefresh; Refresh-Incoming })
+$bShortcut.Add_Click({ Invoke-CreateDesktopShortcut })
 $bChecked.Add_Click({ $script:DefenderChecked = $true; Update-Stepper; Select-LauncherStep 3 })
 $bAck.Add_Click({ $script:DecisionAcknowledged = $true; Update-Stepper; Select-LauncherStep 5 })
 $bNext.Add_Click({ Reset-LauncherSession; Update-Stepper; Select-LauncherStep 2 })
@@ -1603,6 +1959,13 @@ $optReports.Add_CheckedChanged({ if (-not $Screenshot) { Update-Stepper } })
 $bPortal.Add_Click({ Start-Process $QuarantineUrl })
 $bOpenIncoming.Add_Click({ Start-Process explorer.exe -ArgumentList ('"' + $Incoming + '"') })
 $bCopyIncoming.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($Incoming); Show-QraCopied $bCopyIncoming })
+# Modal, but the dialog works in its own runspace and polls with a timer, so this window's timers keep running while it is open.
+$bFetch.Add_Click({
+    try { Show-ReleaseRequestDialog -Incoming $Incoming -Owner $form }
+    catch { [System.Windows.Forms.MessageBox]::Show("The release-request window hit an unexpected error:`r`n`r`n$($_.Exception.Message)", 'Quarantine Review Assistant', 'OK', 'Error') | Out-Null }
+    Refresh-Incoming
+    Update-Stepper
+})
 $bCopyBlock.Add_Click({
     if (-not $optReports.Checked -or -not $script:DecisionCurrent) { return }
     $text = Get-VerifiedBlockList $Incoming $Reports $script:LastDecision
@@ -1663,12 +2026,15 @@ $bLaunch.Add_Click({
         $script:LaunchState = 'Starting'; $script:LaunchStarted = Get-Date; $script:SandboxSeen = $false
         Update-Stepper
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Could not start Windows Sandbox:`r`n$($_.Exception.Message)`r`n`r`nTry again with 'Compatibility mode' ticked.", 'Launch failed', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Could not start Windows Sandbox:`r`n$($_.Exception.Message)`r`n`r`nTry again with 'Compatibility mode' selected.", 'Launch failed', 'OK', 'Error') | Out-Null
     }
 })
 
 $checksPanel.Add_Resize({ if ($script:LayoutReady) { foreach ($ctl in $checksPanel.Controls) { $ctl.Width = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24)); Fit-CheckRow $ctl } } })
 if (-not $Screenshot) { $form.Add_Shown({
+    Close-LauncherSplash
+    # The console is hidden, so this process may have lost the right to come to the front: ask for it explicitly.
+    try { $form.Activate(); $form.TopMost = $true; $form.TopMost = $false; $form.BringToFront() } catch { $null = $_ } # cosmetic
     $form.Refresh()
     [void](Test-ConfigChanged $ConfigFile ([ref]$script:ConfigStamp))
     Refresh-Incoming        # Incoming and Reports first, so the first readiness result already lands on the right step
@@ -1678,7 +2044,11 @@ if (-not $Screenshot) { $form.Add_Shown({
     Update-StepLayout
 }) }
 $form.Add_FormClosing({
+    Exit-LauncherMutex
+    Close-LauncherSplash -Wait   # normally gone long ago
     $incomingTimer.Stop(); $timer.Stop(); $waitTimer.Stop()
+    # The release-request dialog is modal, so this should never find one. If it does, closing it signs out of Exchange Online (its FormClosing calls Close-RrSession).
+    foreach ($owned in @($form.OwnedForms)) { try { $owned.Close() } catch { $null = $_ } } # best effort on the way out
     if ($script:IncomingWatcher) { $script:IncomingWatcher.Dispose() }
     foreach ($running in @($script:HashWork, $script:ReadinessWork, $(if ($script:Busy) { $script:Busy.Work }))) { if ($running) { Stop-QraWork $running } }
 })
@@ -1762,8 +2132,30 @@ if ($Screenshot) {
         $bmp.Dispose()
     }
     $form.Dispose()
+    # The release-request dialog, built from synthetic rows (no connection, no real data, no file access beyond this PNG).
+    $rrDlg = New-RrDialog -Incoming 'D:\SecurityReview\Incoming' -NoAutoStart
+    try {
+        $rrDlg.Form.ShowInTaskbar = $false; $rrDlg.Form.Opacity = 0; $rrDlg.Form.StartPosition = 'Manual'
+        $rrDlg.Form.Location = New-Object System.Drawing.Point(-32000, -32000)
+        $rrDlg.Form.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+        Set-RrScreenshotState $rrDlg 'results'
+        $rrDlg.Form.ActiveControl = $null
+        [System.Windows.Forms.Application]::DoEvents()
+        $bmp = New-Object System.Drawing.Bitmap($rrDlg.Form.Width, $rrDlg.Form.Height)
+        $rrDlg.Form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $rrDlg.Form.Width, $rrDlg.Form.Height)))
+        $bmp.Save((Join-Path $Screenshot 'launcher-release-requests.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    } finally {
+        Stop-RrDialog $rrDlg
+        $rrDlg.Form.Dispose()
+    }
     exit 0
 }
 
 $ErrorActionPreference = 'Continue'
-[void]$form.ShowDialog()
+# ShowDialog() with no owner adopts the active window, which is the splash: closing the splash would then close the launcher.
+# An owner whose handle is zero means "no owner". Without that object (restricted language mode) the splash goes first.
+$noOwner = $null
+try { $noOwner = New-Object System.Windows.Forms.NativeWindow } catch { $noOwner = $null } # restricted language mode
+if ($noOwner) { [void]$form.ShowDialog($noOwner) } else { Close-LauncherSplash; [void]$form.ShowDialog() }

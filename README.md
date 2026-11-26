@@ -1,4 +1,4 @@
-# Quarantine Review Assistant v2.2.0
+# Quarantine Review Assistant v2.3.0
 
 [![License: MIT](https://img.shields.io/github/license/MahmoudGooda/quarantine-review-assistant)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/MahmoudGooda/quarantine-review-assistant?display_name=tag)](https://github.com/MahmoudGooda/quarantine-review-assistant/releases)
@@ -81,23 +81,80 @@ The full diagram and a description of each step are in [docs/architecture.md](do
 
 **Requirements:** Windows 10 (1903 or later) or Windows 11, **Pro, Enterprise or Education** (Home has no Windows Sandbox),
 CPU virtualization turned on, 4 GB RAM, and access to the Microsoft Defender quarantine page. The only download is the
-official Python embeddable package from python.org, once, checked against a pinned SHA256.
+official Python embeddable package from python.org, once, checked against a pinned SHA256. The optional release-request intake
+(below) is the only other network use.
 
 1. Download `QuarantineReviewAssistant-<version>.zip` from the [Releases](https://github.com/MahmoudGooda/quarantine-review-assistant/releases) page
    and check its `.sha256`. Extract the `SecurityReview` folder to a **local, non-synced** drive, for example `D:\SecurityReview`.
 2. Double-click **`Start-Here.cmd`**. Step 1, **Prepare this PC**, checks the PC and offers buttons to install Windows Sandbox and to
    download the analysis runtime.
+   Optional: **Create desktop shortcut** (next to **Check again**) puts a launcher shortcut on your Desktop. If you move the folder,
+   create the shortcut again.
 3. Steps 2 and 3 of the launcher cover Defender: open the quarantined message and choose **Download message** with a password. Save
    the ZIP into `Incoming` without opening it, then click **Launch Sandbox review** (step 4, **Analyze in the Sandbox**).
-4. In the Sandbox window, choose the package, type the password and press **Enter**. Read the **Decision** tab, then in step 5,
+4. In the Sandbox window, choose the package, type the password, click **Continue**, then click **Analyze**. Read the **Decision** tab, then in step 5,
    **Act in Defender and clean up**, act in Defender, close the Sandbox and click **Delete Incoming...**.
 
 | Decision | Evidence | Reviewer action |
 |---|---|---|
 | ![The Decision tab](docs/screenshots/decision.png) | ![The Findings tab](docs/screenshots/evidence.png) | ![Recording a decision](docs/screenshots/reviewer-action.png) |
 
+## Release-request intake (optional)
+
+Instead of downloading each message by hand in the Defender portal, the launcher can list the quarantined messages that have a
+**pending release request** and save the ones you choose into `Incoming`. Click **Fetch release requests** in step 3 of the
+launcher. Manual download from the portal still works and stays the default.
+
+- **One row per message, and you choose.** Exchange keeps one quarantine row per recipient copy, so a message sent to seven people is
+  seven rows. The list groups them and shows one row per message with Received, Sender, Recipients, Subject, Quarantine type, Copies and Expires. Click a column header
+  to sort (click again to reverse). **Recipients** shows the first known address and `(+N)` for the rest, or `7 recipients` when
+  Exchange did not list the addresses; hover the cell for the full list. Turning **Also show released and denied messages** on or
+  off refreshes the list at once and keeps your selection.
+  **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`, and a message that was
+  already released to some recipients is flagged. Every checkbox starts unselected. Nothing is downloaded automatically and there is
+  no select-all by default.
+  Microsoft lists quarantined messages either once per message or once per recipient (per-recipient since early 2026); the dialog groups both into one row per message.
+- **Optional view.** Select **Also show released and denied messages** to include messages that were released or denied (for example
+  released by an admin without a request). It is off by default.
+- **Each selected message is saved as one password-protected ZIP** in `Incoming`, one copy per message. The whole message goes into
+  one ZIP and its attachments stay inside the encrypted ZIP. Decide for all copies in Defender. The launcher checks the ZIP signature and that every entry is encrypted before it writes
+  the file, and it never writes an `.eml` or any other file type.
+- **Use the same download password in the Sandbox.** You type it once per batch in the dialog (it is not stored or shown again), then
+  type it again in the Sandbox review window.
+- **Window and limits.** The default window is 16 days (maximum 30). The list shows up to 1000 rows, and says so when it hits that
+  limit.
+
+**What it connects to.** The dialog connects **this PC** to Exchange Online but opens no message content. It reads the list and
+exports the encrypted ZIPs. Release, deny and delete stay in Defender: the intake uses no cmdlet that changes anything.
+
+**Sign-in.** It is the standard interactive Microsoft sign-in (a Windows account sign-in window, with MFA). There are no stored
+credentials, no app registration and no secrets. The tool disconnects when the dialog closes. The Windows account itself stays signed in to Windows, so a second sign-in
+in the same Windows session is usually faster.
+
+**The module.** The intake needs the `ExchangeOnlineManagement` PowerShell module. If it is missing, the dialog shows an install
+button. Nothing is installed unless you click it. It opens a visible Windows PowerShell 5.1 window that runs:
+
+```powershell
+Install-Module ExchangeOnlineManagement -Scope CurrentUser
+```
+
+You answer the prompts in that window. It installs for your account only and needs no admin rights.
+
+### Permissions
+
+Per [Microsoft Learn](https://learn.microsoft.com/defender-office-365/quarantine-admin-manage-messages-files), previewing and
+downloading quarantined messages for all users needs **Global Reader**, **Security Reader** or **Security Operator**. No release
+rights are needed. Verify this in your tenant, because roles and quarantine policies differ.
+
+Manual check before you rely on it:
+
+- [ ] Confirm with a least-privileged reviewer account (for example Security Reader) that listing and export work.
+
+The one-page description for an approver, with the full list of network calls, is in [docs/for-security-teams.md](docs/for-security-teams.md).
+
 ## Security design
 
+- For an approver who has never seen this tool: [docs/for-security-teams.md](docs/for-security-teams.md) (what runs where, the complete list of network calls, permissions, retention and how to verify a release).
 - Both Sandbox profiles disable **networking**. The default profile also disables clipboard and printer redirection, microphone and camera input, and vGPU. **Compatibility mode** leaves those settings and Protected Client at their Windows Sandbox defaults.
 - The tool folder is mapped **read-only**. Only the `Reports` folder can be written to, and only if you allow it.
 - **Nothing is executed, rendered or extracted to disk.** HTML is never rendered, attachments are never opened, and archives are
@@ -148,12 +205,13 @@ The review tool covers one step. The plan is a small kit for the whole life of a
 
 | Version | Component | Status |
 |---|---|---|
-| v2.3 | **Release-request intake.** List pending release requests using read-only Exchange Online PowerShell and export password-protected messages to `Incoming`. | Planned |
+| v2.3 | **Release-request intake.** List pending release requests using read-only Exchange Online PowerShell and export password-protected messages to `Incoming`. | In progress |
 | v2.4 | **Response pack.** Save the Defender steps checklist with the decision, export the block list as a `New-TenantAllowBlockListItems` script or CSV, find other copies with message trace or Content search, and provide a user-notification template. | Planned |
 | v2.5 | **Batch mode.** Analyze a folder of user-reported messages in one summary, remember the reviewer's name and improve `.msg` handling. | Planned |
 | v2.6 | **Decisions dashboard.** Summarize monthly review volume, malicious messages, false positives and common message types from `decisions-log.csv`. | Planned |
 | v2.7 | **Quarantine posture check.** Review quarantine policies for malware and high-confidence phishing, release-request alerts and reviewer roles. For general mail-protection settings, see [ORCA](https://github.com/cammurray/orca). | Planned |
-| v3.0 | **Playbook and training lab + signed release.** Publish a one-page release-request procedure, synthetic practice cases and a signed release. | Planned |
+| v2.8 | **Enterprise readiness.** Allow-list guidance in readiness checks, run the analyzer in any isolated VM with an HTML report, Intune deployment notes, code signing. | Planned |
+| v3.0 | **Playbook and training lab.** Publish a one-page release-request procedure and synthetic practice cases. | Planned |
 
 ## Contributing
 

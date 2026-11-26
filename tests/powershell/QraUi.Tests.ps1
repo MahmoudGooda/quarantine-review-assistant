@@ -56,7 +56,7 @@ Describe 'QraUi kit: compile and tokens' {
         $QraGlyph.Check | Should -Be ([string][char]0xE73E)
         $QraGlyph.Play | Should -Be ([string][char]0xE768)
         $QraGlyph.Refresh | Should -Be ([string][char]0xE72C)
-        $QraGlyph.Keys.Count | Should -Be 13
+        $QraGlyph.Keys.Count | Should -Be 14
     }
 }
 
@@ -443,5 +443,215 @@ Add-Type -AssemblyName System.Drawing
         foreach ($k in 'success','warning','danger','info','focus','disabled') { $out | Should -Contain ($k + '=True') }
         foreach ($k in 'themeInfo', 'themeFocus', 'dangerSoft') { $out | Should -Contain ($k + '=True') }
         $out | Should -Contain 'hc=True'
+    }
+}
+
+Describe 'QraUi kit: app icon and window chrome' {
+    It 'draws the app icon at the requested size' {
+        foreach ($px in 16, 32, 48) {
+            $ic = New-QraAppIcon $px
+            try {
+                $ic | Should -BeOfType [System.Drawing.Icon]
+                $ic.Width | Should -Be $px
+                $ic.Height | Should -Be $px
+            } finally { $ic.Dispose() }
+        }
+    }
+    It 'paints the navy rounded square with a light glyph and a transparent corner' {
+        $ic = New-QraAppIcon 32
+        try {
+            $bmp = $ic.ToBitmap()
+            try {
+                $bmp.GetPixel(0, 0).A | Should -Be 0 -Because 'the corner is rounded'
+                $edge = $bmp.GetPixel(3, 16)
+                $edge.R | Should -Be 17; $edge.G | Should -Be 38; $edge.B | Should -Be 66
+                $light = 0
+                foreach ($x in 8..24) { foreach ($y in 8..24) { if ($bmp.GetPixel($x, $y).R -gt 200) { $light++ } } }
+                $light | Should -BeGreaterThan 10 -Because 'the white shield glyph'
+            } finally { $bmp.Dispose() }
+        } finally { $ic.Dispose() }
+    }
+    It 'Set-QraWindowChrome sets the icon and does not throw in fallback display mode (child process)' {
+        $out = Invoke-ChildPs @"
+`$env:QRA_UI_FALLBACK = '1'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$f = New-Object System.Windows.Forms.Form
+`$f.ShowInTaskbar = `$false; `$f.Opacity = 0
+`$err = ''
+try { Set-QraWindowChrome `$f -NoAppId } catch { `$err = `$_.Exception.Message }
+'err=' + `$err
+'icon=' + (`$null -ne `$f.Icon)
+'native=' + `$script:UiNative
+`$f.Show(); [System.Windows.Forms.Application]::DoEvents()
+'shown=' + `$f.Visible
+`$f.Dispose()
+"@
+        $out | Should -Contain 'err='
+        $out | Should -Contain 'icon=True'
+        $out | Should -Contain 'native=False'
+        $out | Should -Contain 'shown=True'
+    }
+    It 'Set-QraWindowChrome and Enable-QraForeground skip the native calls where Add-Type is not allowed (child process)' {
+        $out = Invoke-ChildPs @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$script:QraWin2Ready = `$null
+`$script:QraLanguageMode = 'ConstrainedLanguage'
+`$f = New-Object System.Windows.Forms.Form
+`$err = ''
+try { Set-QraWindowChrome `$f; Enable-QraForeground } catch { `$err = `$_.Exception.Message }
+'err=' + `$err
+'ready=' + [bool]`$script:QraWin2Ready
+`$f.Dispose()
+"@
+        $out | Should -Contain 'err='
+        $out | Should -Contain 'ready=False'
+    }
+    It 'sets the app id once per process and the caption colours without throwing (child process)' {
+        $out = Invoke-ChildPs @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$f = New-Object System.Windows.Forms.Form
+`$f.ShowInTaskbar = `$false; `$f.Opacity = 0
+Set-QraWindowChrome `$f
+'idset=' + `$script:QraAppIdSet
+`$g = New-Object System.Windows.Forms.Form
+Set-QraWindowChrome `$g -AppId 'Other.Id'
+'idstill=' + `$script:QraAppIdSet
+`$f.Show(); [System.Windows.Forms.Application]::DoEvents()
+'shown=' + `$f.Visible
+`$f.Dispose(); `$g.Dispose()
+"@
+        $out | Should -Contain 'idset=True'
+        $out | Should -Contain 'idstill=True'
+        $out | Should -Contain 'shown=True'
+    }
+}
+
+Describe 'QraUi kit: app icon file (ICO writer)' {
+    BeforeAll {
+        $script:IcoPath = Join-Path $TestDrive 'QuarantineReviewAssistant.ico'
+        $script:IcoResult = Write-QraIcoFile $script:IcoPath
+        $script:IcoBytes = [System.IO.File]::ReadAllBytes($script:IcoPath)
+        $script:IcoSizes = 16, 24, 32, 48, 64, 256
+    }
+    It 'reports success and leaves no temp file behind' {
+        $script:IcoResult | Should -BeTrue
+        Test-Path -LiteralPath ($script:IcoPath + '.tmp') | Should -BeFalse
+    }
+    It 'starts with a valid ICONDIR: reserved 0, type 1, six entries' {
+        [BitConverter]::ToUInt16($script:IcoBytes, 0) | Should -Be 0
+        [BitConverter]::ToUInt16($script:IcoBytes, 2) | Should -Be 1
+        [BitConverter]::ToUInt16($script:IcoBytes, 4) | Should -Be 6
+    }
+    It 'describes every entry (size, 32 bit, image range) and stores 256 as 0' {
+        for ($i = 0; $i -lt 6; $i++) {
+            $e = 6 + 16 * $i
+            $want = $script:IcoSizes[$i]
+            $stored = if ($want -eq 256) { 0 } else { $want }
+            [int]$script:IcoBytes[$e] | Should -Be $stored -Because "width of entry $i"
+            [int]$script:IcoBytes[$e + 1] | Should -Be $stored -Because "height of entry $i"
+            [BitConverter]::ToUInt16($script:IcoBytes, $e + 4) | Should -Be 1
+            [BitConverter]::ToUInt16($script:IcoBytes, $e + 6) | Should -Be 32
+            $len = [BitConverter]::ToUInt32($script:IcoBytes, $e + 8); $off = [BitConverter]::ToUInt32($script:IcoBytes, $e + 12)
+            $len | Should -BeGreaterThan 8
+            ($off + $len) | Should -BeLessOrEqual $script:IcoBytes.Length
+        }
+    }
+    It 'has a PNG signature at the start of every image, and the images fill the file exactly' {
+        $end = 6 + 16 * 6
+        for ($i = 0; $i -lt 6; $i++) {
+            $e = 6 + 16 * $i
+            $len = [BitConverter]::ToUInt32($script:IcoBytes, $e + 8); $off = [BitConverter]::ToUInt32($script:IcoBytes, $e + 12)
+            $off | Should -Be $end -Because 'images follow the directory one after the other'
+            @($script:IcoBytes[$off..($off + 7)]) | Should -Be @(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+            $end += $len
+        }
+        $end | Should -Be $script:IcoBytes.Length
+    }
+    It 'loads as a System.Drawing.Icon in the 16, 48 and 64 pixel sizes' {
+        foreach ($px in 16, 48, 64) {
+            $ico = New-Object System.Drawing.Icon($script:IcoPath, $px, $px)
+            try { $ico.Width | Should -Be $px } finally { $ico.Dispose() }
+        }
+        $default = New-Object System.Drawing.Icon($script:IcoPath)
+        try { $default.Width | Should -BeGreaterThan 0 } finally { $default.Dispose() }
+    }
+    It 'draws each size with the shared bitmap helper at exactly that size' {
+        foreach ($px in 16, 40, 256) {
+            $bmp = New-QraAppIconBitmap $px
+            try { $bmp.Width | Should -Be $px; $bmp.Height | Should -Be $px; $bmp.GetPixel([int]($px / 2), [int]($px / 2)).A | Should -Be 255 } finally { $bmp.Dispose() }
+        }
+    }
+    It 'accepts a custom list of sizes' {
+        $p = Join-Path $TestDrive 'two.ico'
+        Write-QraIcoFile $p @(32, 256) | Should -BeTrue
+        $b = [System.IO.File]::ReadAllBytes($p)
+        [BitConverter]::ToUInt16($b, 4) | Should -Be 2
+    }
+}
+
+Describe 'QraUi kit: desktop shortcut (child Windows PowerShell 5.1, never the real Desktop)' {
+    BeforeAll {
+        $script:LnkDir = Join-Path $TestDrive 'desk'
+        New-Item -ItemType Directory -Force -Path $script:LnkDir | Out-Null
+        $script:LnkTarget = Join-Path $TestDrive 'Start-Here.cmd'
+        Set-Content -LiteralPath $script:LnkTarget -Value '@echo off'
+        $script:LnkIcon = Join-Path $TestDrive 'icon.ico'
+        $script:LnkPath = Join-Path $script:LnkDir 'Quarantine Review Assistant.lnk'
+        $body = @'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '__KIT__'
+$lnk = '__LNK__'; $target = '__TARGET__'; $wd = '__WD__'; $ico = '__ICO__'
+$r1 = New-QraDesktopShortcut -ShortcutPath $lnk -Target $target -WorkingDirectory $wd -IconPath $ico
+"s1=$($r1.Status)"
+$sh = New-Object -ComObject WScript.Shell
+$l = $sh.CreateShortcut($lnk)
+"target=$($l.TargetPath)"; "wd=$($l.WorkingDirectory)"; "icon=$($l.IconLocation)"; "style=$($l.WindowStyle)"; "desc=$($l.Description)"
+[void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($l); [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh)
+$stamp = (Get-Item -LiteralPath $lnk).LastWriteTimeUtc.Ticks
+$r2 = New-QraDesktopShortcut -ShortcutPath $lnk -Target $target -WorkingDirectory $wd -IconPath $ico
+"s2=$($r2.Status)"
+"unchanged=$((Get-Item -LiteralPath $lnk).LastWriteTimeUtc.Ticks -eq $stamp)"
+$r3 = New-QraDesktopShortcut -ShortcutPath $lnk -Target $target -WorkingDirectory $wd -IconPath $ico -Force
+"s3=$($r3.Status)"
+$r4 = New-QraDesktopShortcut -ShortcutPath ($lnk + '2.lnk') -Target ($target + '.missing') -WorkingDirectory $wd
+"s4=$($r4.Status)"
+$r5 = New-QraDesktopShortcut -ShortcutPath (Join-Path '__WD__\no-such-folder' 'x.lnk') -Target $target -WorkingDirectory $wd
+"s5=$($r5.Status)"; "s5msg=$([bool]$r5.Message)"
+'@
+        $body = $body.Replace('__KIT__', $script:KitPath).Replace('__LNK__', $script:LnkPath).Replace('__TARGET__', $script:LnkTarget).Replace('__WD__', $TestDrive).Replace('__ICO__', $script:LnkIcon)
+        $script:LnkOut = Invoke-ChildPs $body
+    }
+    It 'creates the shortcut with the right target, working directory, icon, window style and description' {
+        $script:LnkOut | Should -Contain 's1=Created'
+        $script:LnkOut | Should -Contain ('target=' + $script:LnkTarget)
+        $script:LnkOut | Should -Contain ('wd=' + $TestDrive)
+        $script:LnkOut | Should -Contain ('icon=' + $script:LnkIcon + ',0')
+        $script:LnkOut | Should -Contain 'style=7'
+        $script:LnkOut | Should -Contain 'desc=Quarantine Review Assistant - host launcher'
+    }
+    It 'reports Exists and changes nothing without -Force' {
+        $script:LnkOut | Should -Contain 's2=Exists'
+        $script:LnkOut | Should -Contain 'unchanged=True'
+    }
+    It 'reports Replaced with -Force' { $script:LnkOut | Should -Contain 's3=Replaced' }
+    It 'reports Error (and does not throw) for a missing target or an impossible path' {
+        $script:LnkOut | Should -Contain 's4=Error'
+        $script:LnkOut | Should -Contain 's5=Error'
+        $script:LnkOut | Should -Contain 's5msg=True'
+    }
+    It 'skips with an Error status where Constrained Language Mode is in force (no COM, no Add-Type)' {
+        Mock Get-QraCompileDecision { 'skip' }
+        $r = New-QraDesktopShortcut -ShortcutPath (Join-Path $TestDrive 'never.lnk') -Target $script:LnkTarget
+        $r.Status | Should -Be 'Error'
+        Test-Path -LiteralPath (Join-Path $TestDrive 'never.lnk') | Should -BeFalse
+        Write-QraIcoFile (Join-Path $TestDrive 'never.ico') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $TestDrive 'never.ico') | Should -BeFalse
     }
 }

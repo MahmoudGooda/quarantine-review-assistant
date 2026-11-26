@@ -66,6 +66,32 @@ function Hide-QraConsole {
     } catch { $null = $_ } # no console window to hide
 }
 
+# ---- Window helpers (taskbar identity, title bar colour, foreground). QRA.Win2 is a NEW type name: QRA.Win may already exist in a process with another signature.
+$script:QraWin2Ready = $null
+function Initialize-QraWin2 {
+    # True when the native helpers are available. Skipped silently where Add-Type is not allowed (Constrained Language Mode).
+    if ($null -ne $script:QraWin2Ready) { return [bool]$script:QraWin2Ready }
+    $script:QraWin2Ready = $false
+    if ((Get-QraCompileDecision) -ne 'compile') { return $false }
+    try {
+        if (-not ('QRA.Win2' -as [type])) {
+            Add-Type -Namespace QRA -Name Win2 -ErrorAction Stop -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
+[DllImport("user32.dll")] public static extern bool DestroyIcon(System.IntPtr h);
+[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int value, int size);
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+'@
+        }
+        $script:QraWin2Ready = $true
+    } catch { $script:QraWin2Ready = $false } # no native helpers: the window keeps its default icon grouping and title bar
+    [bool]$script:QraWin2Ready
+}
+function Enable-QraForeground {
+    # Lets any process (the Microsoft sign-in window, this window) come to the front after the console was hidden.
+    if (-not (Initialize-QraWin2)) { return }
+    try { [void][QRA.Win2]::AllowSetForegroundWindow(-1) } catch { $null = $_ } # best effort
+}
+
 # ---- Icon glyphs (identical in Segoe Fluent Icons and Segoe MDL2 Assets).
 $QraGlyph = @{}
 try {
@@ -73,7 +99,7 @@ try {
         Check = [string][char]0xE73E; Cancel = [string][char]0xE711; Warning = [string][char]0xE7BA; Info = [string][char]0xE946
         Folder = [string][char]0xE838; Copy = [string][char]0xE8C8; Shield = [string][char]0xEA18; Play = [string][char]0xE768
         Clock = [string][char]0xE823; Mail = [string][char]0xE715; Delete = [string][char]0xE74D; Globe = [string][char]0xE774
-        Refresh = [string][char]0xE72C
+        Refresh = [string][char]0xE72C; Link = [string][char]0xE71B
     }
 } catch { $null = $_ } # glyph table stays empty if char conversion fails
 
@@ -166,6 +192,148 @@ function Get-QraContrast([System.Drawing.Color]$fg, [System.Drawing.Color]$bg) {
     }
     $l1 = & $lum $fg; $l2 = & $lum $bg
     ([Math]::Max($l1, $l2) + 0.05) / ([Math]::Min($l1, $l2) + 0.05)
+}
+
+# ---- App icon and window chrome (taskbar identity, title bar colour). No binary file: the icon is drawn at runtime.
+function New-QraAppIconBitmap([int]$size = 32) {
+    # Rounded square in the header navy with a white shield glyph, drawn at $size x $size pixels (32-bit, transparent corners). The caller disposes it.
+    $size = [Math]::Max(16, $size)
+    $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $fill = $null; $path = $null; $family = $null; $gf = $null; $white = $null; $sf = $null
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $d = [single]($size * 0.46)   # corner diameter
+        $r = New-Object System.Drawing.RectangleF(0, 0, ($size - 1), ($size - 1))
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($r.X, $r.Y, $d, $d, 180, 90)
+        $path.AddArc(($r.Right - $d), $r.Y, $d, $d, 270, 90)
+        $path.AddArc(($r.Right - $d), ($r.Bottom - $d), $d, $d, 0, 90)
+        $path.AddArc($r.X, ($r.Bottom - $d), $d, $d, 90, 90)
+        $path.CloseFigure()
+        $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(17, 38, 66))   # the header navy ($C.Header, also in high contrast: an icon is not themed)
+        $g.FillPath($fill, $path)
+        $iconFont = Get-IconFont 10
+        $family = $iconFont.FontFamily
+        $gf = New-Object System.Drawing.Font($family, [single]($size * 0.62), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+        $sf = New-Object System.Drawing.StringFormat([System.Drawing.StringFormat]::GenericTypographic)
+        $sf.Alignment = [System.Drawing.StringAlignment]::Center; $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $g.DrawString([string]$QraGlyph.Shield, $gf, $white, (New-Object System.Drawing.RectangleF(0, 0, $size, $size)), $sf)
+        $iconFont.Dispose()
+    } finally {
+        foreach ($res in @($sf, $white, $gf, $fill, $path)) { if ($res) { $res.Dispose() } }
+        $g.Dispose()
+    }
+    $bmp
+}
+function New-QraAppIcon([int]$size = 32) {
+    # The app icon as a System.Drawing.Icon that owns its own handle.
+    $bmp = New-QraAppIconBitmap $size
+    $hIcon = $bmp.GetHicon()
+    try {
+        $tmp = [System.Drawing.Icon]::FromHandle($hIcon)
+        $icon = $tmp.Clone()   # the clone owns a copy, so the original handle can be destroyed
+        $tmp.Dispose()
+    } finally {
+        if (Initialize-QraWin2) { try { [void][QRA.Win2]::DestroyIcon($hIcon) } catch { $null = $_ } } # without P/Invoke the handle is reclaimed at process exit
+        $bmp.Dispose()
+    }
+    $icon
+}
+
+function Write-QraIcoFile {
+    # Writes a multi-size .ico: ICONDIR, one ICONDIRENTRY per size, then the PNG-compressed images (Windows Vista and later read these).
+    # A width or height of 256 is stored as 0. Needs System.Drawing, so it is skipped (returns $false) where Add-Type and .NET calls are not allowed.
+    param([string]$Path, [int[]]$Sizes = @(16, 24, 32, 48, 64, 256))
+    if ((Get-QraCompileDecision) -ne 'compile') { return $false }
+    $Sizes = @($Sizes | ForEach-Object { [Math]::Min(256, [Math]::Max(16, $_)) })   # the icon drawing starts at 16 px
+    $images = New-Object System.Collections.Generic.List[byte[]]
+    foreach ($px in $Sizes) {
+        $bmp = New-QraAppIconBitmap $px
+        $mem = New-Object System.IO.MemoryStream
+        try { $bmp.Save($mem, [System.Drawing.Imaging.ImageFormat]::Png); $images.Add($mem.ToArray()) } finally { $mem.Dispose(); $bmp.Dispose() }
+    }
+    $out = New-Object System.IO.MemoryStream
+    $bw = New-Object System.IO.BinaryWriter($out)
+    try {
+        $bw.Write([uint16]0); $bw.Write([uint16]1); $bw.Write([uint16]$Sizes.Count)   # ICONDIR: reserved, type 1 (icon), image count
+        $offset = 6 + 16 * $Sizes.Count
+        for ($i = 0; $i -lt $Sizes.Count; $i++) {
+            $dim = if ($Sizes[$i] -ge 256) { [byte]0 } else { [byte]$Sizes[$i] }
+            $bw.Write($dim); $bw.Write($dim); $bw.Write([byte]0); $bw.Write([byte]0)   # width, height, palette size, reserved
+            $bw.Write([uint16]1); $bw.Write([uint16]32)                                 # colour planes, bits per pixel
+            $bw.Write([uint32]$images[$i].Length); $bw.Write([uint32]$offset)           # image size, offset from the start of the file
+            $offset += $images[$i].Length
+        }
+        foreach ($img in $images) { $bw.Write($img) }
+        $bw.Flush()
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $tmpPath = $Path + '.tmp'
+        [System.IO.File]::WriteAllBytes($tmpPath, $out.ToArray())
+        Move-Item -LiteralPath $tmpPath -Destination $Path -Force
+    } finally { $bw.Dispose(); $out.Dispose() }
+    $true
+}
+function New-QraDesktopShortcut {
+    # Creates a .lnk through the WScript.Shell COM object. Returns Status (Created, Replaced, Exists, Error), Path and Message; it never throws.
+    # An existing shortcut is left alone unless -Force. Where COM or Add-Type is not allowed (Constrained Language Mode) the status is Error.
+    param([string]$ShortcutPath, [string]$Target, [string]$WorkingDirectory, [string]$IconPath, [string]$Description = 'Quarantine Review Assistant - host launcher', [switch]$Force)
+    $result = { param($status, $message) [pscustomobject]@{ Status = $status; Path = $ShortcutPath; Message = $message } }
+    if ((Get-QraCompileDecision) -ne 'compile') { return (& $result 'Error' 'This PC restricts PowerShell (Constrained Language Mode), so a shortcut cannot be created from here.') }
+    if (-not (Test-Path -LiteralPath $Target)) { return (& $result 'Error' "The launcher file was not found: $Target") }
+    $existed = Test-Path -LiteralPath $ShortcutPath
+    if ($existed -and -not $Force) { return (& $result 'Exists' 'A shortcut with this name already exists.') }
+    $shell = $null; $link = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut($ShortcutPath)
+        $link.TargetPath = $Target
+        if ($WorkingDirectory) { $link.WorkingDirectory = $WorkingDirectory }
+        if ($IconPath) { $link.IconLocation = "$IconPath,0" }
+        $link.Description = $Description
+        $link.WindowStyle = 7   # minimized: the little cmd window that starts the launcher does not flash
+        $link.Save()
+        return (& $result $(if ($existed) { 'Replaced' } else { 'Created' }) 'Shortcut saved.')
+    } catch {
+        return (& $result 'Error' $_.Exception.Message)
+    } finally {
+        foreach ($com in @($link, $shell)) { if ($com) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($com) } catch { $null = $_ } } }
+    }
+}
+
+$script:QraAppIcon = $null
+$script:QraAppIdSet = $false
+function Set-QraWindowChrome {
+    # Call right after creating a form (before it is shown). Sets the icon, the taskbar identity (once per process; the first call wins)
+    # and, when the handle exists, the title bar colours (Windows 11 build 22000+; ignored elsewhere and in high contrast).
+    param($form, [string]$AppId = 'QuarantineReviewAssistant.Launcher', [switch]$NoAppId)
+    try {
+        if (-not $script:QraAppIcon) { $script:QraAppIcon = New-QraAppIcon 32 }
+        $form.Icon = $script:QraAppIcon
+    } catch { $null = $_ } # keeps the default icon
+    if (-not $NoAppId -and -not $script:QraAppIdSet -and (Initialize-QraWin2)) {
+        $script:QraAppIdSet = $true
+        try { [void][QRA.Win2]::SetCurrentProcessExplicitAppUserModelID($AppId) } catch { $null = $_ } # taskbar groups with PowerShell instead
+    }
+    if ($script:QraHighContrast) { return }
+    try {
+        $form.Add_HandleCreated({ param($s, $e) Set-QraCaptionColor $s })
+        if ($form.IsHandleCreated) { Set-QraCaptionColor $form }
+    } catch { $null = $_ } # default title bar
+}
+function Set-QraCaptionColor($form) {
+    # DWMWA_CAPTION_COLOR (35) = header navy, DWMWA_TEXT_COLOR (36) = white; COLORREF is 0x00BBGGRR. Older Windows returns an error code: ignored.
+    if ($script:QraHighContrast -or -not (Initialize-QraWin2)) { return }
+    try {
+        $caption = (66 -shl 16) -bor (38 -shl 8) -bor 17
+        $text = 0x00FFFFFF
+        [void][QRA.Win2]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
+        [void][QRA.Win2]::DwmSetWindowAttribute($form.Handle, 36, [ref]$text, 4)
+    } catch { $null = $_ } # attributes exist only on Windows 11 22000 and later
 }
 
 # ---- Painted controls (C#, compiled once per process)

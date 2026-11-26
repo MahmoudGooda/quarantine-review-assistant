@@ -459,11 +459,76 @@ Describe 'Launcher: step texts' {
         $t.Contains('Type a password you will remember for the next few minutes.') | Should -BeTrue -Because 'Type a password you will remember for the next few minutes.'
         $t.Contains('Save the ZIP to the folder below. Do not open or extract it.') | Should -BeTrue -Because 'Save the ZIP to the folder below. Do not open or extract it.'
     }
+    It 'step 3 offers the optional Fetch release requests button and sub-step' {
+        $t = [IO.File]::ReadAllText($script:LauncherPath)
+        $t.Contains("New-QraButton 'Fetch release requests' 'Secondary'") | Should -BeTrue
+        $t.Contains("(New-SubStep 'Optional: Fetch release requests saves the messages you select straight into this folder.' 'Fetch release requests')") | Should -BeTrue
+        $t.Contains("Show-ReleaseRequestDialog -Incoming `$Incoming -Owner `$form") | Should -BeTrue
+        $t.Contains(". (Join-Path `$PSScriptRoot 'ReleaseRequests.ps1')") | Should -BeTrue -Because 'dot-sourced without arguments'
+    }
+}
+
+Describe 'Launcher: sandbox profile settings' {
+    BeforeAll {
+        Import-LauncherFunction 'Write-SandboxProfile'
+        $global:ProfilesDir = Join-Path $TestDrive 'Profiles'
+        $global:Reports = Join-Path $TestDrive 'Reports'
+        $global:Root = Join-Path $TestDrive 'tool root & more'
+        New-Item -ItemType Directory -Force -Path $global:Root | Out-Null
+        function Get-Wsb([bool]$exportOn, [bool]$protectedClient, [bool]$compat) {   # not named $reports: the launcher function reads $Reports (PowerShell names are case-insensitive)
+            $path = Write-SandboxProfile $exportOn $protectedClient $compat
+            [xml][IO.File]::ReadAllText($path)
+        }
+        function Get-Mapping($xml, [string]$sandboxFolder) {
+            @($xml.Configuration.MappedFolders.MappedFolder | Where-Object { $_.SandboxFolder -eq $sandboxFolder })
+        }
+    }
+    AfterAll { foreach ($n in 'ProfilesDir', 'Reports') { Remove-Variable -Name $n -Scope Global -ErrorAction SilentlyContinue }; $global:Root = $TestDrive }
+
+    It 'default mode: no network, every redirection and vGPU disabled, no Protected Client' {
+        $x = Get-Wsb $true $false $false
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput') { $x.Configuration.$opt | Should -Be 'Disable' -Because $opt }
+        $x.Configuration.ProtectedClient | Should -BeNullOrEmpty
+    }
+    It 'Protected mode adds ProtectedClient and keeps everything else disabled' {
+        $x = Get-Wsb $true $true $false
+        $x.Configuration.ProtectedClient | Should -Be 'Enable'
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput') { $x.Configuration.$opt | Should -Be 'Disable' -Because $opt }
+    }
+    It 'Compatibility mode leaves the redirections at the Windows default (no elements) but keeps networking disabled' {
+        $x = Get-Wsb $true $true $true       # Protected is ignored in compatibility mode
+        $x.Configuration.Networking | Should -Be 'Disable'
+        foreach ($opt in 'vGPU', 'ClipboardRedirection', 'PrinterRedirection', 'AudioInput', 'VideoInput', 'ProtectedClient') { $x.Configuration.$opt | Should -BeNullOrEmpty -Because $opt }
+    }
+    It 'maps the tool folder read-only in every mode' {
+        foreach ($combo in @(@($true, $false, $false), @($false, $true, $false), @($true, $false, $true))) {
+            $x = Get-Wsb $combo[0] $combo[1] $combo[2]
+            $m = @(Get-Mapping $x 'C:\Review')
+            $m.Count | Should -Be 1
+            $m[0].ReadOnly | Should -Be 'true'
+            $m[0].HostFolder | Should -Be $global:Root
+        }
+    }
+    It 'maps Reports writable only when report export is on' {
+        $on = @(Get-Mapping (Get-Wsb $true $false $false) 'C:\Reports')
+        $on.Count | Should -Be 1
+        $on[0].ReadOnly | Should -Be 'false'
+        $on[0].HostFolder | Should -Be $global:Reports
+        (Get-Mapping (Get-Wsb $false $false $false) 'C:\Reports').Count | Should -Be 0
+        (Get-Mapping (Get-Wsb $false $true $true) 'C:\Reports').Count | Should -Be 0
+        @((Get-Wsb $false $false $false).Configuration.MappedFolders.MappedFolder).Count | Should -Be 1
+    }
+    It 'starts the review window in the Sandbox and nothing else' {
+        $x = Get-Wsb $true $false $false
+        $x.Configuration.LogonCommand.Command | Should -Be 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Review\app\QuarantineReview.ps1'
+    }
 }
 
 Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
     BeforeAll {
-        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'all-done'
+        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'all-done', 'release-requests'
         function Invoke-LauncherShots([string]$dir, [string]$extra = '') {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:LauncherPath, '-Screenshot', $dir)
@@ -494,5 +559,170 @@ Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
         try { $r = Invoke-LauncherShots $dir } finally { Remove-Item Env:\QRA_UI_FALLBACK -ErrorAction SilentlyContinue }
         $r.Exit | Should -Be 0 -Because $r.Output
         foreach ($s in $script:ShotStates) { Test-Path -LiteralPath (Join-Path $dir "launcher-$s.png") | Should -BeTrue -Because $s }
+    }
+}
+
+Describe 'Launcher: start-up (splash, single instance, bring to front)' {
+    BeforeAll { $script:LauncherText = [IO.File]::ReadAllText($script:LauncherPath) }
+    It 'shows a plain-WinForms splash before the UI kit is loaded, only for a real GUI run' {
+        $t = $script:LauncherText
+        $kit = $t.IndexOf("QraUi.ps1')")
+        $splash = $t.IndexOf("`$spT.Text = 'Quarantine Review Assistant'")
+        $splash | Should -BeGreaterThan 0
+        $splash | Should -BeLessThan $kit -Because 'the splash must be up before the slow part starts'
+        $t.Contains('FromArgb(17, 38, 66)') | Should -BeTrue
+        $t.Contains("`$spT.Text = 'Quarantine Review Assistant'") | Should -BeTrue
+        $t.Contains("`$sp.FormBorderStyle = 'None'") | Should -BeTrue
+        $t.Contains('$sp.ShowInTaskbar = $false; $sp.TopMost = $true') | Should -BeTrue
+        $t.Contains('Screen]::FromPoint([System.Windows.Forms.Cursor]::Position)') | Should -BeTrue
+        $t.Contains('[System.Windows.Forms.Application]::DoEvents()') | Should -BeTrue
+        $t.Contains('$startGui = (-not $Screenshot) -and (-not $NoGui)') | Should -BeTrue
+        $t.Substring(0, $kit) | Should -Not -Match 'Name Win2' -Because 'the splash needs no native code from the kit'
+    }
+    It 'closes the splash in the Shown handler and in the trap' {
+        $t = $script:LauncherText
+        $t.Substring($t.IndexOf('trap {'), 200) | Should -Match 'Close-LauncherSplash'
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 300) | Should -Match 'Close-LauncherSplash'
+    }
+    It 'brings the window to the front in the Shown handler' {
+        $t = $script:LauncherText
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 700) | Should -Match '\$form\.Activate\(\); \$form\.TopMost = \$true; \$form\.TopMost = \$false; \$form\.BringToFront\(\)'
+        $t | Should -Match 'Enable-QraForeground; Hide-QraConsole'
+    }
+    It 'allows only one launcher: named mutex, wake the first window, release on close' {
+        $t = $script:LauncherText
+        $t.Contains("'Local\QuarantineReviewAssistant.Launcher'") | Should -BeTrue
+        $t.Contains("-like 'Quarantine Review Assistant * - Host Launcher'") | Should -BeTrue
+        $t.Contains('ShowWindow($other.MainWindowHandle, 9)') | Should -BeTrue
+        $t.Contains('SetForegroundWindow($other.MainWindowHandle)') | Should -BeTrue
+        $t.Substring($t.IndexOf('$form.Add_FormClosing({'), 200) | Should -Match 'Exit-LauncherMutex'
+        $t.IndexOf('System.Threading.Mutex') | Should -BeLessThan $t.IndexOf('if (-not (Start-LauncherSplash))') -Because 'a second launcher must leave before it shows a splash'
+    }
+    It 'runs without the splash or the mutex in -NoGui mode' {
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath -NoGui 2>&1 | Out-String
+        $out | Should -Match 'Windows edition'
+    }
+}
+
+Describe 'Launcher: layout widths' {
+    It 'lead and sub-steps use the content width up to a reading width of 900, not 620' {
+        $t = [IO.File]::ReadAllText($script:LauncherPath)
+        $t.Contains('$tw = [Math]::Min($cw, (S 900))') | Should -BeTrue
+        $t.Contains('(S 620)') | Should -BeFalse
+        $t.Contains('$rw = [Math]::Min($cw, (S 760))') | Should -BeTrue -Because 'the step-3 list and button row keep their own width'
+    }
+}
+
+Describe 'Launcher: wording' {
+    It 'has no tick/ticked/unticked in any user-facing string' {
+        $strings = $script:LauncherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
+        @($strings | Where-Object { $_.Value -match '(?i)\b(un)?tick(ed)?\b' } | ForEach-Object { $_.Value }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
+    BeforeAll {
+        $script:LauncherText = [IO.File]::ReadAllText($script:LauncherPath)
+        $t = $script:LauncherText
+        $script:SplashBlockText = $t.Substring($t.IndexOf('$script:LauncherSplashBlock = {'), $t.IndexOf('function Start-LauncherSplash') - $t.IndexOf('$script:LauncherSplashBlock = {'))
+    }
+    It 'runs the splash in an STA runspace with its own message loop' {
+        $t = $script:LauncherText
+        $t.Contains('RunspaceFactory]::CreateRunspace()') | Should -BeTrue
+        $t.Contains('$rs.ApartmentState = [System.Threading.ApartmentState]::STA') | Should -BeTrue
+        $t.Contains('PSThreadOptions]::ReuseThread') | Should -BeTrue
+        $script:SplashBlockText.Contains('[System.Windows.Forms.Application]::Run($win)') | Should -BeTrue
+        $script:LauncherFunctions.ContainsKey('Start-LauncherSplash') | Should -BeTrue
+    }
+    It 'uses plain WinForms and GDI+ only in the splash (no compiled or native code)' {
+        $script:SplashBlockText | Should -Not -Match 'Add-Type\s+(-Namespace|-TypeDefinition|-MemberDefinition)'
+        $script:SplashBlockText | Should -Not -Match 'DllImport'
+        $script:SplashBlockText | Should -Match 'HighQualityBicubic'
+        $script:SplashBlockText | Should -Match "DoubleBuffered"
+        # greyscale anti-aliasing without grid fitting: closest to how Windows 11 draws its own text (ClearType grid fit looked too sharp)
+        $script:SplashBlockText | Should -Match 'TextRenderingHint\]::AntiAlias\b'
+        $script:SplashBlockText | Should -Not -Match 'ClearTypeGridFit'
+    }
+    It 'sets the close flag in Close-LauncherSplash, which the Shown handler, the trap and the single-instance exit all call' {
+        $t = $script:LauncherText
+        $script:LauncherFunctions['Close-LauncherSplash'].Extent.Text | Should -Match '\$script:SplashState\.Close = \$true'
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 200) | Should -Match 'Close-LauncherSplash'
+        $t.Substring($t.IndexOf('trap {'), 200) | Should -Match 'Close-LauncherSplash -Wait'
+        $mutexLeft = $t.Substring($t.IndexOf('if (-not $mutexMine) {'))
+        $mutexLeft = $mutexLeft.Substring(0, $mutexLeft.IndexOf('exit 0'))
+        $mutexLeft | Should -Match 'Close-LauncherSplash'
+    }
+    It 'never blocks the window thread for more than a short wait when the splash is closed' {
+        $fn = $script:LauncherFunctions['Close-LauncherSplash'].Extent.Text
+        $fn | Should -Match 'WaitOne\(\$\(if \(\$Wait\) \{ 400 \} else \{ 0 \}\)\)'
+        $fn | Should -Match 'BeginStop'
+    }
+    It 'starts the splash only for a real GUI run, after the single-instance check, and keeps the plain splash as the fallback' {
+        $t = $script:LauncherText
+        $t.Contains('$startGui = (-not $Screenshot) -and (-not $NoGui) -and ($env:USERNAME -ne ''WDAGUtilityAccount'')') | Should -BeTrue
+        $call = $t.IndexOf('if (-not (Start-LauncherSplash)) {')
+        $call | Should -BeGreaterThan $t.IndexOf('if ($startGui) {')
+        $call | Should -BeGreaterThan $t.IndexOf('System.Threading.Mutex')
+        $call | Should -BeLessThan $t.IndexOf("QraUi.ps1')")
+        $t.IndexOf('$sp = New-Object System.Windows.Forms.Form') | Should -BeGreaterThan $call -Because 'the plain splash only runs when the animated one cannot start'
+    }
+    It 'keeps the zero-handle owner for the main window' {
+        $t = $script:LauncherText
+        $t.Contains('[void]$form.ShowDialog($noOwner)') | Should -BeTrue
+    }
+    It 'step 1 has a Create desktop shortcut button beside Check again, with its own click handler and feedback' {
+        $t = $script:LauncherText
+        $t.Contains("`$bShortcut = New-QraButton 'Create desktop shortcut' 'Secondary' `$QraGlyph.Link") | Should -BeTrue
+        $t.Contains('$bShortcut.Add_Click({ Invoke-CreateDesktopShortcut })') | Should -BeTrue
+        $t.Contains("Show-QraCopied `$bShortcut 'Shortcut created'") | Should -BeTrue
+        $t.Contains("'Replace the existing desktop shortcut?'") | Should -BeTrue
+        $t.Contains("[Environment]::GetFolderPath('Desktop')") | Should -BeTrue
+        $t | Should -Match 'Start-Here\.cmd'
+    }
+    Context 'rendering the splash to a PNG (QRA_SPLASH_SHOT, a child Windows PowerShell 5.1)' {
+        BeforeAll {
+            function Invoke-SplashShot([string]$png, [string]$image) {
+                $env:QRA_SPLASH_SHOT = $png
+                if ($image) { $env:QRA_SPLASH_IMAGE = $image }
+                try {
+                    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath 2>&1
+                    [pscustomobject]@{ Exit = $LASTEXITCODE; Output = ($out | Out-String) }
+                } finally { Remove-Item Env:\QRA_SPLASH_SHOT, Env:\QRA_SPLASH_IMAGE -ErrorAction SilentlyContinue }
+            }
+            function Get-ShotPixel([string]$png, [int]$x, [int]$y) {
+                $bmp = New-Object System.Drawing.Bitmap($png)
+                try { $px = $bmp.GetPixel($x, $y); @($px.R, $px.G, $px.B, $bmp.Width, $bmp.Height) } finally { $bmp.Dispose() }
+            }
+        }
+        It 'renders the 640 x 357 splash with the picture' {
+            $png = Join-Path $TestDrive 'splash.png'
+            $r = Invoke-SplashShot $png ''
+            $r.Exit | Should -Be 0 -Because $r.Output
+            $px = Get-ShotPixel $png 200 170
+            $px[3] | Should -Be 640; $px[4] | Should -Be 357
+            ($px[0] + $px[1] + $px[2]) | Should -BeGreaterThan 300 -Because 'the shield is bright'
+        }
+        It 'falls back to a plain navy splash, same size, when the picture is missing, and still exits 0' {
+            $png = Join-Path $TestDrive 'splash-nopic.png'
+            $r = Invoke-SplashShot $png (Join-Path $TestDrive 'no-such-picture.jpg')
+            $r.Exit | Should -Be 0 -Because $r.Output
+            $px = Get-ShotPixel $png 200 170
+            $px[3] | Should -Be 640; $px[4] | Should -Be 357
+            @($px[0], $px[1], $px[2]) | Should -Be @(17, 38, 66)
+        }
+        It 'falls back the same way when the picture file is not an image' {
+            $bad = Join-Path $TestDrive 'bad.jpg'
+            Set-Content -LiteralPath $bad -Value 'not a picture'
+            $png = Join-Path $TestDrive 'splash-badpic.png'
+            $r = Invoke-SplashShot $png $bad
+            $r.Exit | Should -Be 0 -Because $r.Output
+            (Get-ShotPixel $png 200 170)[0] | Should -Be 17
+        }
+    }
+    It 'ships a splash picture of a sensible size' {
+        $jpg = Join-Path $script:Repo 'src\SecurityReview\app\assets\splash.jpg'
+        (Get-Item -LiteralPath $jpg).Length | Should -BeLessThan 200KB
+        $img = [System.Drawing.Image]::FromFile($jpg)
+        try { $img.Width | Should -Be 1280; $img.Height | Should -Be 714 } finally { $img.Dispose() }
     }
 }

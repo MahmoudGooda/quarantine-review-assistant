@@ -35,6 +35,24 @@ Started by `Start-Here.cmd`. It reads the incoming file to compute its SHA-256. 
 - disables vGPU, clipboard and printer redirection, microphone and camera input in the default profile. Compatibility mode leaves these settings and Protected Client at the Windows Sandbox defaults;
 - enables **Copy block list** for a completed decision matching the SHA-256 of the single incoming package.
 
+### Optional: release-request intake (v2.3)
+
+The launcher can open a dialog (`app/ReleaseRequests.ps1`) that connects the **host PC** to Exchange Online. This is the only
+host-side connection besides the one-time Python download, and it sits at the trust boundary: only metadata (the message list) and
+the **bytes of password-protected ZIPs** cross it. Nothing is decoded, opened, rendered or extracted on the host. The ZIP bytes are
+checked structurally (signature, central directory, every entry encrypted) and written to `Incoming` as `.zip` files only. Parsing
+and extraction still happen only inside the Sandbox.
+
+- One long-lived **STA background runspace** per dialog holds the Exchange Online session, so the window stays responsive during
+  sign-in. The dialog polls it with a timer.
+- The sign-in is the module's default interactive (Windows account) sign-in. Before it starts, the launcher hides its console
+  window so the sign-in window opens in front.
+- The session is **disconnected when the dialog closes**, including when the launcher itself closes. Disconnecting ends the Exchange
+  Online session; the Windows account stays signed in to Windows.
+- The intake uses read and export cmdlets only. Release, deny, delete and block list changes stay in Defender.
+
+For the plain-language version, see [for-security-teams.md](for-security-teams.md).
+
 ## 2. Review window: `app/QuarantineReview.ps1`
 
 Runs inside the Sandbox. It checks that it really is in a Sandbox, offline and read-only (the status chips), starts the

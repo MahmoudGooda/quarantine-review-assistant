@@ -37,7 +37,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-VERSION = '2.2.0'
+VERSION = '2.3.0'
 
 # --------------------------------------------------------------------------- limits
 MAX_SOURCE = 150 * 1024 * 1024          # input file on disk

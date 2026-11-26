@@ -19,7 +19,7 @@ trap {
     break
 }
 
-$AppVersion = '2.2.0'
+$AppVersion = '2.3.0'
 $ReviewRoot = 'C:\Review'
 $AppDir     = $PSScriptRoot
 $Incoming   = Join-Path $ReviewRoot 'Incoming'
@@ -91,6 +91,7 @@ $form.MinimumSize = New-Object System.Drawing.Size(1100, 720)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $C.Surface
 $form.KeyPreview = $true
+Set-QraWindowChrome $form -AppId 'QuarantineReviewAssistant.Review' -NoAppId:([bool]$Screenshot)   # app icon, own taskbar button, navy title bar (Windows 11)
 
 # ---- header with environment pills (the pills are added after scaling: they size themselves from their font)
 $header = New-Object System.Windows.Forms.Panel
@@ -202,6 +203,8 @@ $pwdBox = New-Object System.Windows.Forms.TextBox
 $pwdBox.UseSystemPasswordChar = $true; $pwdBox.Size = New-Object System.Drawing.Size(230, 26)
 $showPwd = New-Object System.Windows.Forms.CheckBox
 $showPwd.Text = 'Show'; $showPwd.AutoSize = $true
+$bContinue = New-QraButton 'Continue' 'Primary' $QraGlyph.Check
+$bContinue.Size = New-Object System.Drawing.Size(130, 34); $bContinue.Enabled = $false
 $capsLbl = New-Object System.Windows.Forms.Label
 $capsLbl.Text = "$($Sym.WARN) Caps Lock is on"; $capsLbl.ForeColor = $C.Warning; $capsLbl.AutoSize = $true; $capsLbl.Visible = $false
 $attLbl = New-Object System.Windows.Forms.Label
@@ -210,7 +213,7 @@ $attLbl.AutoSize = $false; $attLbl.UseMnemonic = $false
 $attPwd = New-Object System.Windows.Forms.TextBox
 $attPwd.Multiline = $true; $attPwd.ScrollBars = 'Vertical'; $attPwd.Size = New-Object System.Drawing.Size(330, 46)
 $hint3 = New-Hint 'For password-protected ZIPs attached by the sender. Passwords written in the email body are tried automatically.' 2
-Add-StepBody 2 @($pwdBox, $showPwd, $capsLbl, $attLbl, $attPwd)
+Add-StepBody 2 @($pwdBox, $showPwd, $capsLbl, $bContinue, $attLbl, $attPwd)
 
 # ---- step 3: analyze (button, Cancel while running, stage tracker with a fixed-width elapsed label so the ticking number never moves anything)
 $bAnalyze = New-QraButton 'Analyze' 'Primary' $QraGlyph.Play
@@ -348,6 +351,26 @@ $tree.Dock = 'Fill'; $tree.BorderStyle = 'None'; $tree.HideSelection = $false; $
 $nodeDetails = New-ReadOnlyText $true
 $attSplit.Panel1.Controls.Add($tree); $attSplit.Panel2.Controls.Add($nodeDetails)
 $tAttach.Controls.Add($attSplit)
+# The split has no real width until the Attachments tab is shown (a hidden tab page keeps the default 150 px), so the 45 % distance is applied
+# whenever the split is laid out at a usable width, unless the user dragged the splitter.
+$script:AttSplitMoved = $false
+$script:AttSplitApplying = $false
+function Set-AttachmentSplit {
+    if ($script:AttSplitMoved -or $script:AttSplitApplying) { return }
+    $min1 = S 200; $min2 = S 280
+    $w = $attSplit.Width
+    if ($w -le ($min1 + $min2 + $attSplit.SplitterWidth)) { return }   # not laid out yet (or too narrow for both panes)
+    $script:AttSplitApplying = $true
+    try {
+        $attSplit.Panel1MinSize = $min1; $attSplit.Panel2MinSize = $min2
+        $want = [int]($w * 0.45)
+        $attSplit.SplitterDistance = [Math]::Max($min1, [Math]::Min($want, $w - $min2 - $attSplit.SplitterWidth))
+    } catch { $null = $_ } # ignore if the window is too narrow for the requested splitter distance
+    finally { $script:AttSplitApplying = $false }
+}
+$attSplit.Add_SplitterMoving({ if (-not $script:AttSplitApplying) { $script:AttSplitMoved = $true } })   # raised only while the user drags
+$attSplit.Add_SizeChanged({ Set-AttachmentSplit })
+$tabs.Add_SelectedIndexChanged({ if ($tabs.SelectedTab -eq $tAttach) { Set-AttachmentSplit } })
 
 $tLinks = New-Tab 'Links'
 $lvLinks = New-ListView @('Risk', 'Link (defanged - not clickable)', 'Why flagged', 'Found in') @(70, 460, 330, 260)
@@ -525,6 +548,7 @@ function Set-LeftBounds([int]$W) {
                     $capsLbl.Visible = $script:CapsOn
                     if ($script:CapsOn) { $capsLbl.Location = New-Object System.Drawing.Point($bx, $by); $by += $capsLbl.Height + (S 2) }
                     $by += (S 6)
+                    $bContinue.Location = New-Object System.Drawing.Point($bx, $by); $by += $bContinue.Height + (S 12)
                     $attLbl.SetBounds($bx, $by, $bw, ($attLbl.Font.Height + (S 2))); $by += $attLbl.Height + (S 2)
                     $attPwd.SetBounds($bx, $by, $bw, (S 46)); $by += (S 46) + (S 6)
                     $h = (Measure-Wrapped $hint3.Text $hint3.Font $bw) + (S 2)
@@ -1396,8 +1420,11 @@ function Show-Result($r) {
 }
 
 # ================================================================= analysis run (asynchronous)
+# Continue (step 2) needs a password in the box and no analysis running.
+function Update-ContinueState { $bContinue.Enabled = (-not $script:IsBusy) -and ($pwdBox.Text.Length -gt 0) }
 function Set-Busy([bool]$busy) {
     $script:IsBusy = $busy
+    Update-ContinueState
     $bAnalyze.Enabled = -not $busy; $bBrowse.Enabled = -not $busy; $bRefresh.Enabled = -not $busy; $fileList.Enabled = -not $busy
     $bClear.Enabled = -not $busy   # a new review would wipe the screen under a running analysis
     $bAnalyze.Text = if ($busy) { 'Analyzing...' } else { 'Analyze' }
@@ -1489,7 +1516,7 @@ function Update-StageLayout {
 }
 # The empty-state prompt follows the selection: with a package chosen the next thing to do is the password.
 function Get-EmptyPrompt([bool]$HasSelection) {
-    if ($HasSelection) { return 'Enter the download password and click Analyze.' }
+    if ($HasSelection) { return 'Enter the download password, then click Continue.' }
     return 'Choose a package and click Analyze.'
 }
 function Set-ResultsMode([ValidateSet('Empty', 'Analysing', 'Result')][string]$mode) {
@@ -1692,7 +1719,7 @@ $runTimer.Add_Tick({
 $showPwd.Add_CheckedChanged({ $pwdBox.UseSystemPasswordChar = -not $showPwd.Checked })
 $pwdBox.Add_KeyUp({ $script:CapsOn = [System.Windows.Forms.Control]::IsKeyLocked('CapsLock'); Update-LeftLayout })
 $pwdBox.Add_Enter({ $script:CapsOn = [System.Windows.Forms.Control]::IsKeyLocked('CapsLock'); Update-LeftLayout })
-$pwdBox.Add_TextChanged({ Update-ReviewStepper -Keep })
+$pwdBox.Add_TextChanged({ Update-ContinueState; Update-ReviewStepper -Keep })
 # A click on a package moves on to the password; arrow keys inside the list do not (they would fold the list away under the user).
 $fileList.Add_SelectedIndexChanged({
     if ($script:ResultsMode -eq 'Empty' -and $script:StageUiReady) { $script:stText.Text = Get-EmptyPrompt ([bool]$fileList.SelectedItems.Count); Update-StageLayout }
@@ -1709,7 +1736,16 @@ $script:AdvanceTimer.Add_Tick({
     Update-ReviewStepper
 })
 foreach ($entry in $script:StepUi) { $entry.Card.Add_Leave({ $script:AdvanceTimer.Stop(); $script:AdvanceTimer.Start() }) }
-$pwdBox.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Start-Analysis } })
+# Step 2 -> step 3: the password is entered, so the stepper moves on and the Analyze button gets the focus. Nothing is analyzed yet:
+# Enter in the box (or Continue) = go to Analyze, Enter on the Analyze button = analyze.
+function Complete-PasswordStep {
+    if (-not $bContinue.Enabled) { return }
+    Update-ReviewStepper
+    Set-ReviewStepFocus $script:Expanded
+    if ($script:Expanded -eq 3 -and $bAnalyze.Enabled) { [void]$bAnalyze.Select() }   # also makes it the active control when the window is not foreground yet
+}
+$pwdBox.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { $e.SuppressKeyPress = $true; Complete-PasswordStep } })
+$bContinue.Add_Click({ Complete-PasswordStep })
 $bAnalyze.Add_Click({ Start-Analysis })
 $bCancel.Add_Click({ Stop-Analysis 'Analysis cancelled - keep the message quarantined.' })
 $bRecord.Add_Click({ Save-DecisionRecord })
@@ -1750,10 +1786,10 @@ $form.Add_KeyDown({ param($s, $e)
 if (-not $Screenshot) { $form.Add_Shown({
     try { $split.SplitterDistance = (S 420) } catch { $null = $_ } # ignore if window is too narrow for the requested splitter distance
     Update-LeftLayout; Update-HeaderLayout
-    try { $attSplit.SplitterDistance = [Math]::Max((S 200), [int]($attSplit.Width * 0.45)) } catch { $null = $_ } # ignore if window is too narrow for the requested splitter distance
+    Set-AttachmentSplit   # a no-op while the Attachments tab is hidden: the tab's own events apply it when it appears
     Refresh-Files $null
     if ($envProblems.Count -and -not $AllowHost) { $bAnalyze.Enabled = $false; $status.Text = 'Analysis disabled: see the red warning at the top.'; $status.ForeColor = $C.Danger }
-    elseif ($fileList.Items.Count) { $pwdBox.Focus(); $status.Text = 'Enter the download password and press Enter.' }
+    elseif ($fileList.Items.Count) { $pwdBox.Focus(); $status.Text = 'Enter the download password, then click Continue.' }
     if (-not (Test-Path -LiteralPath $PythonExe)) { $status.Text = 'Analysis runtime missing - run Start-Here.cmd on the host and click Download.'; $status.ForeColor = $C.Danger }
 }) }
 $form.Add_FormClosing({ Stop-Analysis 'Analysis cancelled - keep the message quarantined.' })
@@ -1762,10 +1798,11 @@ $form.Add_FormClosing({ Stop-Analysis 'Analysis cancelled - keep the message qua
 Set-Access $fileList 'Downloaded packages' 'Files in the Incoming folder. Select the package to analyze.'
 Set-Access $bBrowse 'Browse for a package'
 Set-Access $bRefresh 'Refresh the file list' 'Shortcut F5'
-Set-Access $pwdBox 'Download password' 'The password typed in the Defender Download message dialog. Press Enter to analyze.'
+Set-Access $pwdBox 'Download password' 'The password typed in the Defender Download message dialog. Press Enter or Continue to go to the Analyze step.'
+Set-Access $bContinue 'Continue' 'Moves to the Analyze step. Nothing is analyzed until you click Analyze.'
 Set-Access $showPwd 'Show password'
 Set-Access $attPwd 'Attachment passwords' 'Optional. One password per line.'
-Set-Access $bAnalyze 'Analyze' 'Starts the offline analysis. Enter in the password box does the same.'
+Set-Access $bAnalyze 'Analyze' 'Starts the offline analysis.'
 Set-Access $bCancel 'Cancel the analysis' 'Stops the analysis and keeps the message quarantined.'
 Set-Access $elapsedLbl 'Elapsed seconds'
 Set-Access $tabs 'Result tabs' 'Ctrl+1 to Ctrl+8 switch tabs'
@@ -1775,7 +1812,7 @@ Set-Access $lvLinks 'Links table'; Set-Access $lvHeaders 'Headers table'; Set-Ac
 Set-Access $decSteps 'What to do in Defender'
 Set-Access $decChoice 'Final decision'; Set-Access $decReviewer 'Reviewer name'; Set-Access $decNote 'Decision note'; Set-Access $bRecord 'Record decision'
 Set-Access $bSave 'Save report' 'Shortcut Ctrl+S'; Set-Access $bClear 'New review'
-$ti = 0; foreach ($tabCtl in @($fileList, $bBrowse, $bRefresh, $pwdBox, $showPwd, $attPwd, $bAnalyze, $bCancel)) { $tabCtl.TabIndex = $ti++ }
+$ti = 0; foreach ($tabCtl in @($fileList, $bBrowse, $bRefresh, $pwdBox, $showPwd, $bContinue, $attPwd, $bAnalyze, $bCancel)) { $tabCtl.TabIndex = $ti++ }
 $split.Panel1.TabIndex = 0; $split.Panel2.TabIndex = 1
 for ($i = 0; $i -lt 4; $i++) { $script:StepUi[$i].Card.TabIndex = $i; $script:StepUi[$i].Link.TabIndex = 0 }
 $status.TabIndex = 4
@@ -1837,9 +1874,15 @@ if ($Screenshot) {
     }
     # empty: a package is selected, nothing typed yet
     Clear-Results
-    $status.Text = 'Enter the download password and press Enter.'; $status.ForeColor = $C.TextMuted
+    $status.Text = 'Enter the download password, then click Continue.'; $status.ForeColor = $C.TextMuted
     Update-ReviewStepper
     Save-ShotImage 'empty'
+    # password: a (fake) password is in the box, so Continue is enabled and step 2 stays open
+    $pwdBox.Text = 'sample-pass'
+    Update-ReviewStepper -Keep
+    Save-ShotImage 'password'
+    $pwdBox.Clear()
+    Update-ReviewStepper
     # analysing: a fake run at the "Analysing message" stage (no process); the large spinner is forced visible
     Clear-Results
     $script:PwdUsed = $true
@@ -1880,6 +1923,9 @@ if ($Screenshot) {
         Save-ShotImage 'decision-recorded'
         $tabs.SelectedTab = $tFindings
         Save-ShotImage 'result-findings'
+        $tabs.SelectedTab = $tAttach
+        [System.Windows.Forms.Application]::DoEvents()
+        Save-ShotImage 'result-attachments'
     }
     $form.Dispose()
     exit 0

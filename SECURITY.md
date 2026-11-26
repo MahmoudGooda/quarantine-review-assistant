@@ -8,6 +8,11 @@ Please report security problems **privately** through GitHub Security Advisories
 Include what you did, what you expected and what happened, the version (shown in the window title and in the report), and
 the Windows build. You will get an answer within a few days.
 
+## What the tool does and does not do
+
+For a plain-language description for an approver (what runs where, every network call, permissions, retention and how to verify a
+release), see [docs/for-security-teams.md](docs/for-security-teams.md).
+
 ## Never send real quarantined mail
 
 Do **not** attach real quarantined messages, real attachments, real tenant or company names, passwords or screenshots that show

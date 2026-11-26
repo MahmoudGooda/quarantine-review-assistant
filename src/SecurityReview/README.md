@@ -1,4 +1,4 @@
-# Quarantine Review Assistant v2.2.0
+# Quarantine Review Assistant v2.3.0
 
 Offline review of emails held in **Microsoft Defender / EOP quarantine**, done inside a disposable,
 network-less **Windows Sandbox**. It inventories the message, its attachments and anything nested in them
@@ -30,8 +30,11 @@ extracted to disk.
       first. Do not release. Then click **I've checked it - next**.
    3. **Download the message.** In the portal choose **... More > Download message** with a password, and save the ZIP
       into `Incoming` without opening it. The step finishes by itself when the file appears.
+      Optional: **Fetch release requests** lists the messages with a pending release request (read-only, through Exchange Online
+      PowerShell) and saves the ones you select as password-protected ZIPs in `Incoming`. The manual portal download above still works.
+      See `docs/for-security-teams.md` in the repository for what it connects to.
    4. **Analyze in the Sandbox.** Click **Launch Sandbox review**. The review window opens by itself inside the
-      Sandbox. Follow the four steps in the left column: pick the file, type the download password, press **Enter**. If you turned off saving reports to this PC,
+      Sandbox. Follow the four steps in the left column: pick the file, type the download password, click **Continue**, then click **Analyze**. If you turned off saving reports to this PC,
       click **I've recorded my decision - next** when you are done.
    5. **Act in Defender and clean up.** Carry the decision out in Defender, close the Sandbox, then click
       **Delete Incoming...**. When everything is done, **Review the next message** starts over at step 2.
@@ -114,8 +117,8 @@ and a **Change** link; later steps are dimmed but you can open any of them at an
 1. **Choose the package.** Click the downloaded file in the list (the newest is selected for you), or use
    **Browse...** / **Refresh**.
 2. **Enter the download password.** The one you typed in Defender > Download message. Attachment passwords are
-   optional. The step summary only ever says *Password entered*; the password is never shown in the summary, logged or saved.
-3. **Analyze.** Click **Analyze** (or press **Enter** in the password box). A stage tracker shows *Reading file*,
+   optional. Click **Continue** (or press **Enter** in the box) to move on. The step summary only ever says *Password entered*; the password is never shown in the summary, logged or saved.
+3. **Analyze.** Click **Analyze**. A stage tracker shows *Reading file*,
    *Opening package*, *Analysing message n of m* and *Building report* with a running seconds counter, and the
    results area shows a spinner with the current stage. **Cancel** stops the analysis at any time; the message
    stays quarantined.
