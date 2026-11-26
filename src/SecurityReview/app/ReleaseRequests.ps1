@@ -1,0 +1,1107 @@
+﻿# Quarantine Review Assistant - release-request intake (optional, v2.3).
+# Lists messages that have a pending release request through Exchange Online PowerShell and saves the ones the reviewer ticks
+# as password-protected ZIPs in Incoming. Read-only: it never releases, deletes or blocks anything and never opens a message.
+# Dot-sourced by Launcher.ps1 (functions only, no window) or run on its own:  ReleaseRequests.ps1 [-Incoming <folder>] [-Screenshot <folder>]
+# Windows PowerShell 5.1 compatible. ASCII only (glyphs are built from char codes).
+param(
+    [Alias('Incoming')][string]$RrIncoming,
+    [Alias('Screenshot')][string]$RrScreenshot,
+    [Alias('ScreenshotState')][string]$RrScreenshotState
+)
+# The parameters carry the RR prefix so that dot-sourcing this file never overwrites $Incoming or $Screenshot of the launcher.
+
+# ================================================================= pure functions (no Exchange, no window)
+
+function Get-RrInstallCommand {
+    "Install-Module ExchangeOnlineManagement -Scope CurrentUser; if (Get-Module -ListAvailable ExchangeOnlineManagement) { Write-Host ''; Write-Host 'Installed. Close this window to return to Quarantine Review Assistant.' -ForegroundColor Green } else { Write-Host ''; Write-Host 'The install did not finish. Read the message above, then close this window.' -ForegroundColor Yellow }"
+}
+
+function Get-RrModuleState {
+    $mod = Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    $ver = ''
+    if ($mod) { $ver = [string]$mod.Version }
+    [pscustomobject]@{ Installed = [bool]$mod; Version = $ver; InstallCommand = (Get-RrInstallCommand) }
+}
+
+function Start-RrModuleInstall {
+    # A visible Windows PowerShell 5.1 window: the user answers the prompts. The caller watches for the process to exit (never waits).
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Start-Process -FilePath $exe -ArgumentList '-NoProfile', '-NoExit', '-Command', (Get-RrInstallCommand) -PassThru
+}
+
+function Get-RrWindowDays([int]$days) {
+    if ($days -eq 0) { return 16 }
+    [Math]::Min(30, [Math]::Max(1, $days))
+}
+
+function Get-RrQuarantineParams([int]$Days, [string]$Recipient, [datetime]$Now = (Get-Date)) {
+    $span = Get-RrWindowDays $Days
+    $p = @{
+        ReleaseStatus     = 'Requested'
+        PageSize          = 1000
+        StartReceivedDate = $Now.AddDays(-$span)
+        EndReceivedDate   = $Now
+    }
+    if ($Recipient -and $Recipient.Trim()) { $p.RecipientAddress = $Recipient.Trim() }
+    $p
+}
+
+function ConvertTo-RrRow($message) {
+    $rcpt = @($message.RecipientAddress | Where-Object { $_ }) -join '; '
+    $types = @($message.QuarantineTypes | Where-Object { $_ }) -join ', '
+    [pscustomobject]@{
+        Identity        = [string]$message.Identity
+        Received        = $message.ReceivedTime
+        Sender          = [string]$message.SenderAddress
+        Recipient       = $rcpt
+        Subject         = [string]$message.Subject
+        QuarantineTypes = $types
+        Expires         = $message.Expires
+    }
+}
+
+function Get-RrRequests([int]$Days = 0, [string]$Recipient = '', [datetime]$Now = (Get-Date)) {
+    $p = Get-RrQuarantineParams -Days $Days -Recipient $Recipient -Now $Now
+    foreach ($msg in @(Get-QuarantineMessage @p -ErrorAction Stop)) { ConvertTo-RrRow $msg }
+}
+
+function Get-RrCapMessage([int]$count) {
+    if ($count -ge 1000) { return 'Showing the first 1000. Narrow the date range or filter by recipient.' }
+    ''
+}
+
+function Get-RrFileName([datetime]$Received, [string]$Identity) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Identity)) } finally { $sha.Dispose() }
+    $hex = (@($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 10)
+    '{0}-{1}.zip' -f $Received.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture), $hex
+}
+
+function Get-RrZipSummary([byte[]]$Bytes) {
+    # Structure only: signature, size, central directory fields. Never entry names, comments or content.
+    $len = 0
+    if ($Bytes) { $len = $Bytes.Length }
+    $sig = ''
+    for ($i = 0; $i -lt [Math]::Min(4, $len); $i++) { $sig += $Bytes[$i].ToString('x2') }
+    $isZip = ($len -ge 4 -and $Bytes[0] -eq 0x50 -and $Bytes[1] -eq 0x4B -and $Bytes[2] -eq 3 -and $Bytes[3] -eq 4)
+    if (-not $isZip) { return [pscustomobject]@{ Signature = $sig; Length = $len; IsZip = $false; Note = 'not a ZIP' } }
+    $entries = New-Object System.Collections.Generic.List[object]
+    $found = $false
+    try {
+        $pos = -1
+        $min = [Math]::Max(0, $len - 22 - 65535)
+        $i = $len - 22
+        while ($i -ge $min) {
+            $i = [Array]::LastIndexOf($Bytes, [byte]0x50, $i, ($i - $min + 1))
+            if ($i -lt 0) { break }
+            if ($Bytes[$i + 1] -eq 0x4B -and $Bytes[$i + 2] -eq 5 -and $Bytes[$i + 3] -eq 6) { $pos = $i; break }
+            $i--
+        }
+        if ($pos -ge 0) {
+            $total = [int][BitConverter]::ToUInt16($Bytes, $pos + 10)
+            $cdSize = [long][BitConverter]::ToUInt32($Bytes, $pos + 12)
+            $cdOff = [long][BitConverter]::ToUInt32($Bytes, $pos + 16)
+            $good = (($cdOff + $cdSize) -le $pos)
+            $at = $cdOff
+            for ($n = 0; $good -and $n -lt $total; $n++) {
+                if (($at + 46) -gt $len -or $Bytes[$at] -ne 0x50 -or $Bytes[$at + 1] -ne 0x4B -or $Bytes[$at + 2] -ne 1 -or $Bytes[$at + 3] -ne 2) { $good = $false; break }
+                $flag = [BitConverter]::ToUInt16($Bytes, [int]$at + 8)
+                $method = [BitConverter]::ToUInt16($Bytes, [int]$at + 10)
+                $csize = [BitConverter]::ToUInt32($Bytes, [int]$at + 20)
+                $usize = [BitConverter]::ToUInt32($Bytes, [int]$at + 24)
+                $nameLen = [int][BitConverter]::ToUInt16($Bytes, [int]$at + 28)
+                $extraLen = [int][BitConverter]::ToUInt16($Bytes, [int]$at + 30)
+                $commentLen = [int][BitConverter]::ToUInt16($Bytes, [int]$at + 32)
+                $next = $at + 46 + $nameLen + $extraLen + $commentLen
+                if ($next -gt $len) { $good = $false; break }
+                $aes = $false
+                $ex = $at + 46 + $nameLen
+                $exEnd = $ex + $extraLen
+                while (($ex + 4) -le $exEnd) {
+                    if ([BitConverter]::ToUInt16($Bytes, [int]$ex) -eq 0x9901) { $aes = $true }
+                    $ex += 4 + [BitConverter]::ToUInt16($Bytes, [int]$ex + 2)
+                }
+                $entries.Add([pscustomobject]@{
+                        Flag             = ('0x{0:x4}' -f $flag)
+                        Method           = [int]$method
+                        CompressedSize   = [long]$csize
+                        UncompressedSize = [long]$usize
+                        AesExtra         = $aes
+                    })
+                $at = $next
+            }
+            $found = $good
+        }
+    } catch { $found = $false }
+    if (-not $found) { $entries.Clear() }
+    [pscustomobject]@{ Signature = $sig; Length = $len; IsZip = $true; EocdFound = $found; EntryCount = $entries.Count; Entries = $entries.ToArray() }
+}
+
+function Test-RrZipBytes([byte[]]$Bytes) {
+    if (-not $Bytes -or $Bytes.Length -eq 0) { return [pscustomobject]@{ Ok = $false; Reason = 'the export is empty' } }
+    $s = Get-RrZipSummary $Bytes
+    if (-not $s.IsZip) { return [pscustomobject]@{ Ok = $false; Reason = 'it is not a ZIP file' } }
+    if (-not $s.EocdFound) { return [pscustomobject]@{ Ok = $false; Reason = 'the ZIP structure is incomplete' } }
+    if ($s.EntryCount -lt 1) { return [pscustomobject]@{ Ok = $false; Reason = 'the ZIP has no entries' } }
+    foreach ($entry in $s.Entries) {
+        $flag = [Convert]::ToInt32($entry.Flag.Substring(2), 16)
+        if (($flag -band 1) -eq 0) { return [pscustomobject]@{ Ok = $false; Reason = 'an entry is not password-protected' } }
+    }
+    [pscustomobject]@{ Ok = $true; Reason = '' }
+}
+
+function Format-RrZipSummary($summary) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Signature (first 4 bytes): $($summary.Signature)")
+    $lines.Add("Length: $($summary.Length) bytes")
+    $lines.Add("Is ZIP: $($summary.IsZip)")
+    if ($summary.PSObject.Properties['Note']) { $lines.Add("Note: $($summary.Note)") }
+    if ($summary.PSObject.Properties['EocdFound']) {
+        $lines.Add("End of central directory found: $($summary.EocdFound)")
+        $lines.Add("Entries: $($summary.EntryCount)")
+        $k = 0
+        foreach ($entry in @($summary.Entries)) {
+            $k++
+            $lines.Add(('Entry {0}: flag {1}, method {2}, compressed {3}, uncompressed {4}, AES extra field {5}' -f $k, $entry.Flag, $entry.Method, $entry.CompressedSize, $entry.UncompressedSize, $(if ($entry.AesExtra) { 'yes' } else { 'no' })))
+        }
+    }
+    $lines -join "`r`n"
+}
+
+function Get-RrErrorText($err) {
+    $e = $null
+    if ($err -is [System.Management.Automation.ErrorRecord]) { $e = $err.Exception } elseif ($err -is [System.Exception]) { $e = $err }
+    $text = ''
+    if ($e) {
+        while ($e.InnerException) { $e = $e.InnerException }
+        $text = $e.Message
+    } else { $text = [string]$err }
+    $text = (($text -split '\r?\n')[0]).Trim()
+    if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + '...' }
+    $text
+}
+
+function New-RrResult([string]$Status, [string]$FileName, [string]$Message, $Summary) {
+    [pscustomobject]@{ Status = $Status; FileName = $FileName; Message = $Message; Summary = $Summary }
+}
+
+function Save-RrExport {
+    param(
+        [Parameter(Mandatory)][string]$Identity,
+        [Parameter(Mandatory)][datetime]$Received,
+        [Parameter(Mandatory)][securestring]$Password,
+        [Parameter(Mandatory)][string]$Incoming
+    )
+    # Exports one message, checks the bytes in memory and writes them only when they are a password-protected ZIP.
+    $bytes = $null
+    $disk = $null
+    try {
+        try {
+            $export = Export-QuarantineMessage -Identity $Identity -CompressOutput -Password $Password -ReasonForExport 'Offline review with Quarantine Review Assistant' -ErrorAction Stop
+        } catch {
+            return (New-RrResult 'Failed' '' ('The export failed: ' + (Get-RrErrorText $_)) $null)
+        }
+        $b64 = ''
+        if ($export) { $b64 = [string]@($export)[0].Eml }
+        if ([string]::IsNullOrWhiteSpace($b64)) { return (New-RrResult 'Failed' '' 'The export returned no data.' $null) }
+        try { $bytes = [Convert]::FromBase64String($b64) } catch { $bytes = New-Object byte[] 0 }
+        $check = Test-RrZipBytes $bytes
+        if (-not $check.Ok) {
+            return (New-RrResult 'Rejected' '' ("Not saved: $($check.Reason). The export is not a password-protected ZIP.") (Get-RrZipSummary $bytes))
+        }
+        $name = Get-RrFileName $Received $Identity
+        $target = Join-Path $Incoming $name
+        if (Test-Path -LiteralPath $target) { return (New-RrResult 'Exists' $name 'Already in Incoming.' $null) }
+        [void][System.IO.Directory]::CreateDirectory($Incoming)
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($target, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            if (Test-Path -LiteralPath $target) { return (New-RrResult 'Exists' $name 'Already in Incoming.' $null) }
+            return (New-RrResult 'Failed' '' ('The file could not be created: ' + (Get-RrErrorText $_)) $null)
+        } catch {
+            return (New-RrResult 'Failed' '' ('The file could not be created: ' + (Get-RrErrorText $_)) $null)
+        }
+        try {
+            try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
+        } catch {
+            Remove-Item -LiteralPath $target -ErrorAction SilentlyContinue
+            return (New-RrResult 'Failed' '' ('The file could not be written: ' + (Get-RrErrorText $_)) $null)
+        }
+        $disk = [System.IO.File]::ReadAllBytes($target)
+        $again = Test-RrZipBytes $disk
+        if (-not $again.Ok) {
+            $sum = Get-RrZipSummary $disk
+            Remove-Item -LiteralPath $target -ErrorAction SilentlyContinue
+            return (New-RrResult 'Rejected' '' ("The saved file failed the check ($($again.Reason)) and was deleted.") $sum)
+        }
+        New-RrResult 'Saved' $name "Saved $name." $null
+    } finally {
+        if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+        if ($disk) { [Array]::Clear($disk, 0, $disk.Length) }
+    }
+}
+
+# ================================================================= session: one STA runspace per dialog (the Exchange connection lives in it)
+
+function New-RrSession([string[]]$Functions = @()) {
+    $state = [hashtable]::Synchronized(@{})
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('State', $state, 'Shared state')))
+    foreach ($fn in $Functions) {
+        $body = (Get-Item -LiteralPath "function:$fn").ScriptBlock.ToString()
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $body)))
+    }
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+    $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+    $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $rs.Open()
+    [pscustomobject]@{ Runspace = $rs; State = $state; Closed = $false; Current = $null }
+}
+
+function Invoke-RrStep($Session, [scriptblock]$Script, [hashtable]$Variables = @{}) {
+    # Variables (such as the password SecureString) enter the runspace as variables, never as script text.
+    foreach ($key in $Variables.Keys) { $Session.Runspace.SessionStateProxy.SetVariable([string]$key, $Variables[$key]) }
+    $ps = [powershell]::Create()
+    $ps.Runspace = $Session.Runspace
+    [void]$ps.AddScript($Script.ToString(), $true)
+    $handle = $ps.BeginInvoke()
+    $work = [pscustomobject]@{ PowerShell = $ps; Handle = $handle; Session = $Session; Started = [DateTime]::UtcNow; Disposed = $false; Result = $null }
+    $Session.Current = $work
+    $work
+}
+
+function Complete-RrStep($Work) {
+    if ($Work.Result) { return $Work.Result }
+    $out = @()
+    $err = $null
+    try {
+        $out = @($Work.PowerShell.EndInvoke($Work.Handle))
+    } catch {
+        $err = Get-RrErrorText $_
+    }
+    if (-not $err -and $Work.PowerShell.Streams.Error.Count -gt 0) { $err = Get-RrErrorText $Work.PowerShell.Streams.Error[0] }
+    try { $Work.PowerShell.Dispose() } catch { $null = $_ } # best-effort cleanup
+    $Work.Disposed = $true
+    if ($Work.Session -and $Work.Session.Current -eq $Work) { $Work.Session.Current = $null }
+    $Work.Result = [pscustomobject]@{ Output = $out; Error = $err }
+    $Work.Result
+}
+
+function Close-RrSession($Session, [int]$TimeoutMs = 5000) {
+    # Signs out of Exchange Online (with a timeout) and always ends with the runspace stopped or abandoned. Safe to call twice.
+    if (-not $Session -or $Session.Closed) { return }
+    $Session.Closed = $true
+    $rs = $Session.Runspace
+    $clean = $true
+    try {
+        $cur = $Session.Current
+        if ($cur -and -not $cur.Disposed -and -not $cur.Handle.IsCompleted) {
+            $stop = $cur.PowerShell.BeginStop($null, $null)
+            if (-not $stop.AsyncWaitHandle.WaitOne(1500)) { $clean = $false }
+        }
+    } catch { $clean = $false }
+    $ps = $null
+    try {
+        if ($clean -and $rs.RunspaceStateInfo.State -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened) {
+            $ps = [powershell]::Create()
+            $ps.Runspace = $rs
+            [void]$ps.AddScript('Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue')
+            $done = $ps.BeginInvoke()
+            if (-not $done.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+                $stop = $ps.BeginStop($null, $null)
+                if (-not $stop.AsyncWaitHandle.WaitOne(1000)) { $clean = $false }
+            }
+        }
+    } catch { $clean = $false }
+    try {
+        if ($clean) {
+            if ($ps) { $ps.Dispose() }
+            $rs.Dispose()
+        } else {
+            $rs.CloseAsync()   # a pipeline that will not stop: abandon the runspace without blocking the window
+        }
+    } catch { $null = $_ } # nothing more to do for a runspace that cannot close
+}
+
+function Enable-RrForeground {
+    # Lets the sign-in window of the module come to the front (with the console hidden this is what makes it open in front).
+    if (-not (Get-Command Get-QraCompileDecision -ErrorAction SilentlyContinue)) { return }
+    if ((Get-QraCompileDecision) -ne 'compile') { return }
+    try {
+        if (-not ('QRA.Fg' -as [type])) {
+            Add-Type -Namespace QRA -Name Fg -MemberDefinition '[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);' -ErrorAction Stop
+        }
+        [void][QRA.Fg]::AllowSetForegroundWindow(-1)
+    } catch { $null = $_ } # compiling is not allowed here: sign-in may open behind the window
+}
+
+function Get-RrConnectScript {
+    {
+        if (-not (Get-Command Connect-ExchangeOnline -ErrorAction SilentlyContinue)) { Import-Module ExchangeOnlineManagement -ErrorAction Stop }
+        Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+    }
+}
+
+function Get-RrSessionFunctionNames {
+    @('Get-RrWindowDays', 'Get-RrQuarantineParams', 'ConvertTo-RrRow', 'Get-RrRequests', 'Get-RrFileName', 'Get-RrZipSummary', 'Test-RrZipBytes',
+        'Get-RrErrorText', 'New-RrResult', 'Save-RrExport')
+}
+
+# ================================================================= dialog
+
+function Format-RrDate($value, [string]$format) {
+    if ($null -eq $value -or "$value" -eq '') { return '' }
+    try {
+        $dt = [datetime]$value
+        if ($dt.Kind -eq [System.DateTimeKind]::Utc) { $dt = $dt.ToLocalTime() }
+        $dt.ToString($format, [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch { [string]$value }
+}
+
+function New-RrLabel([string]$text, $font, $color) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $text; $l.Font = $font; $l.ForeColor = $color; $l.BackColor = $C.Card
+    $l.AutoSize = $false; $l.UseMnemonic = $false
+    $l.Visible = $false
+    $l
+}
+
+function New-RrButton([string]$text, [string]$variant, [string]$glyph, $font) {
+    $b = New-QraButton $text $variant $glyph
+    $b.Font = $font   # buttons otherwise fall back to a tiny default font
+    $b.Visible = $false
+    $b
+}
+
+function Get-RrButtonWidth($btn, [int]$min = 0) {
+    $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix
+    $tw = [System.Windows.Forms.TextRenderer]::MeasureText([string]$btn.Text, $btn.Font, (New-Object System.Drawing.Size([int]::MaxValue, 0)), $flags).Width
+    $gw = 0
+    if ($btn.GetType().FullName -eq 'QraUi.ModernButton' -and $btn.Glyph) { $gw = [int]($btn.Font.Height * 1.4) }
+    [Math]::Max($min, $tw + $gw + (S 40))
+}
+
+function Set-RrBounds($ctl, [int]$x, [int]$y, [int]$w, [int]$h) {
+    $ctl.SetBounds($x, $y, $w, $h)
+    $ctl.Visible = $true
+}
+
+function Set-RrWrapped($lbl, [int]$x, [int]$y, [int]$w) {
+    if (-not $lbl.Text) { $lbl.Visible = $false; return $y }
+    $lbl.SetBounds($x, $y, $w, ((Measure-Wrapped $lbl.Text $lbl.Font $w) + (S 4)))
+    $lbl.Visible = $true
+    $lbl.Bottom
+}
+
+function Hide-RrControls($list) {
+    foreach ($ctl in $list) { $ctl.Visible = $false }
+}
+
+function Get-RrStepStates($d) {
+    $k = $d.Ctl
+    $s = @('Pending', 'Pending', 'Pending', 'Pending')
+    if ($null -eq $d.Module) { $s[0] = 'Working'; return $s }
+    if (-not $d.Module.Installed) {
+        $s[0] = 'Current'
+        if ($d.InstallState -eq 'waiting') { $s[0] = 'Working' } elseif ($d.InstallState -eq 'failed') { $s[0] = 'Warning' }
+        return $s
+    }
+    $s[0] = 'Done'
+    if ($d.ConnectState -eq 'working') { $s[1] = 'Working' } elseif ($d.ConnectState -eq 'failed') { $s[1] = 'Warning' } elseif ($d.ConnectState -eq 'done') { $s[1] = 'Done' } else { $s[1] = 'Current' }
+    if ($d.ConnectState -ne 'done') { return $s }
+    $n = $k.List.CheckedItems.Count
+    if ($d.ListState -eq 'loading') { $s[2] = 'Working' } elseif ($n -ge 1) { $s[2] = 'Done' } else { $s[2] = 'Current' }
+    if ($d.SaveState -eq 'saving') { $s[3] = 'Working' } elseif ($n -ge 1 -or $d.SaveState -eq 'done') { $s[3] = 'Current' }
+    $s
+}
+
+function Update-RrSaveButton($d) {
+    if (-not $d -or -not $d.Ready) { return }
+    $k = $d.Ctl
+    $k.BSave.Enabled = ($d.ConnectState -eq 'done') -and (-not $d.Work) -and ($d.ListState -ne 'loading') -and ($k.List.CheckedItems.Count -ge 1) -and ($k.Pw.Text.Length -ge 1)
+    if ($d.ListState -eq 'loaded') {   # keep the ticked count under the list current
+        $d.ListMsg = Get-RrListNote @($d.Rows).Count $k.List.CheckedItems.Count
+        $k.LblList.Text = $d.ListMsg
+    }
+    $st = Get-RrStepStates $d
+    for ($i = 0; $i -lt 4; $i++) { Set-QraBadgeState $d.Steps[$i].Badge $st[$i] }
+}
+
+function Update-RrView($d) {
+    if (-not $d -or -not $d.Ready -or $d.InLayout) { return }
+    $d.InLayout = $true
+    $k = $d.Ctl
+    $scroll = $k.Scroll
+    try {
+        $scroll.SuspendLayout()
+        $st = Get-RrStepStates $d
+        $installed = ($null -ne $d.Module -and $d.Module.Installed)
+        $connected = ($d.ConnectState -eq 'done')
+        $pad = S 24
+        $textX = $pad + (S 44)
+        $w = [Math]::Max((S 360), $scroll.ClientSize.Width - $textX - $pad)
+        $y = S 14
+
+        # ---- step summaries
+        if ($null -eq $d.Module) { $d.Steps[0].Sum.Text = 'Checking whether the module is installed...' }
+        elseif ($installed) { $d.Steps[0].Sum.Text = "ExchangeOnlineManagement $($d.Module.Version) is installed." }
+        else { $d.Steps[0].Sum.Text = 'Not installed yet. It installs for your Windows account only, without administrator rights.' }
+        if ($connected) { $d.Steps[1].Sum.Text = 'Signed in. This window signs out again when you close it.' }
+        elseif ($installed) { $d.Steps[1].Sum.Text = 'Sign in with your work account. This tool only reads the release requests.' }
+        else { $d.Steps[1].Sum.Text = 'Opens the Microsoft sign-in window.' }
+        $d.Steps[2].Sum.Text = $(if ($connected) { 'Nothing is ticked by default. Tick the messages to save.' } else { 'Lists the messages that have a pending release request.' })
+        $d.Steps[3].Sum.Text = 'Saves each ticked message as a password-protected ZIP.'
+
+        # ---- hide every optional control, then show what the state needs
+        Hide-RrControls @($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.List, $k.SpList, $k.LblList,
+                $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet))
+        Set-QraSpinner $k.SpInstall ($d.InstallState -eq 'waiting') 'Waiting for the install window to close'
+        Set-QraSpinner $k.SpConnect ($d.ConnectState -eq 'working') 'Waiting for you to sign in'
+        Set-QraSpinner $k.SpList ($d.ListState -eq 'loading') 'Loading release requests'
+        Set-QraSpinner $k.SpSave ($d.SaveState -eq 'saving') 'Saving to Incoming'
+
+        for ($i = 0; $i -lt 4; $i++) {
+            $step = $d.Steps[$i]
+            Set-QraBadgeState $step.Badge $st[$i]
+            Set-RrBounds $step.Badge $pad $y (S 30) (S 30)
+            $step.Title.ForeColor = $(if ($st[$i] -eq 'Pending') { $C.TextMuted } else { $C.Text })
+            $yy = Set-RrWrapped $step.Title $textX ($y + (S 3)) $w
+            if ($i -lt 2 -and $st[$i] -eq 'Done') {
+                # a finished step is one line: the title, then its summary beside it
+                $tw = (Get-RrTextWidth $step.Title.Text $step.Title.Font) + (S 16)
+                $step.Title.Width = $tw
+                $yb = Set-RrWrapped $step.Sum ($textX + $tw) ($y + (S 5)) ($w - $tw)
+                $yy = [Math]::Max($yy, $yb)
+                $yy += S 4
+            } else {
+                $yy = Set-RrWrapped $step.Sum $textX ($yy + (S 2)) $w
+                $yy += S 10
+            }
+
+            if ($i -eq 0 -and -not $installed -and $null -ne $d.Module) {
+                for ($n = 0; $n -lt 3; $n++) {
+                    Set-RrBounds $k.I0Num[$n] $textX $yy (S 22) (S 22)
+                    $yy = (Set-RrWrapped $k.I0Txt[$n] ($textX + (S 24)) $yy ($w - (S 24))) + (S 4)
+                }
+                $yy += S 6
+                if ($d.InstallState -eq 'waiting') {
+                    Set-RrBounds $k.SpInstall $textX $yy (S 24) (S 24)
+                    $yb = Set-RrWrapped $k.LblWait ($textX + (S 34)) $yy ($w - (S 34))
+                    $k.SpInstall.Top = $k.LblWait.Top + [int](($k.LblWait.Height - $k.SpInstall.Height) / 2)
+                    $yy = [Math]::Max($yb, $k.SpInstall.Bottom) + (S 6)
+                } else {
+                    if ($d.InstallMsg) { $k.LblInstallMsg.Text = $d.InstallMsg; $yy = (Set-RrWrapped $k.LblInstallMsg $textX $yy $w) + (S 8) }
+                    $bw = Get-RrButtonWidth $k.BInstall (S 200)
+                    Set-RrBounds $k.BInstall $textX $yy $bw (S 38)
+                    $cw = Get-RrButtonWidth $k.BCopyCmd (S 150)
+                    Set-RrBounds $k.BCopyCmd ($k.BInstall.Right + (S 10)) $yy $cw (S 38)
+                    $yy = $k.BInstall.Bottom + (S 6)
+                }
+            }
+            if ($i -eq 1 -and $installed -and -not $connected) {
+                if ($d.ConnectState -eq 'working') {
+                    Set-RrBounds $k.SpConnect $textX $yy (S 24) (S 24)
+                    $yb = Set-RrWrapped $k.LblConnect ($textX + (S 34)) $yy ($w - (S 34))
+                    $k.SpConnect.Top = $k.LblConnect.Top + [int](($k.LblConnect.Height - $k.SpConnect.Height) / 2)
+                    $yy = [Math]::Max($yb, $k.SpConnect.Bottom) + (S 6)
+                } else {
+                    if ($d.ConnectState -eq 'failed') { $k.LblConnectErr.Text = $d.ConnectMsg; $yy = (Set-RrWrapped $k.LblConnectErr $textX $yy $w) + (S 8) }
+                    $k.BSignIn.Text = $(if ($d.ConnectState -eq 'failed') { 'Retry' } else { 'Sign in' })
+                    Set-RrBounds $k.BSignIn $textX $yy (Get-RrButtonWidth $k.BSignIn (S 140)) (S 38)
+                    $yy = $k.BSignIn.Bottom + (S 6)
+                }
+            }
+            if ($i -eq 2 -and $connected) {
+                $rowH = S 30
+                $x = $textX
+                $k.LblDays.Text = 'Days to look back'
+                $lw = (Get-RrTextWidth $k.LblDays.Text $k.LblDays.Font) + (S 8)
+                Set-RrBounds $k.LblDays $x $yy $lw $rowH
+                $k.LblDays.TextAlign = 'MiddleLeft'
+                $k.Days.SetBounds(($x + $lw), ($yy + [int](($rowH - $k.Days.Height) / 2)), (S 64), $k.Days.Height); $k.Days.Visible = $true
+                $x = $k.Days.Right + (S 24)
+                $rw = (Get-RrTextWidth $k.LblRecip.Text $k.LblRecip.Font) + (S 8)
+                Set-RrBounds $k.LblRecip $x $yy $rw $rowH
+                $k.LblRecip.TextAlign = 'MiddleLeft'
+                $k.Recip.SetBounds(($x + $rw), ($yy + [int](($rowH - $k.Recip.Height) / 2)), (S 230), $k.Recip.Height); $k.Recip.Visible = $true
+                $bw = Get-RrButtonWidth $k.BRefresh (S 130)
+                Set-RrBounds $k.BRefresh ($k.Recip.Right + (S 16)) ($yy - (S 2)) $bw (S 34)
+                $k.BRefresh.Enabled = ($d.ListState -ne 'loading') -and (-not $d.Work)
+                $yy += $rowH + (S 6)
+                Set-RrBounds $k.List $textX $yy $w (S 150)
+                $yy = $k.List.Bottom + (S 6)
+                $note = $d.ListMsg
+                $lx = $textX
+                if ($d.ListState -eq 'loading') { Set-RrBounds $k.SpList $textX $yy (S 24) (S 24); $lx = $textX + (S 34) }
+                $k.LblList.Text = $note
+                $k.LblList.ForeColor = $(if ($d.ListState -eq 'failed') { $C.Danger } else { $C.TextMuted })
+                $yb = Set-RrWrapped $k.LblList $lx $yy ($w - ($lx - $textX))
+                if ($d.ListState -eq 'loading') { $k.SpList.Top = $k.LblList.Top + [int](($k.LblList.Height - $k.SpList.Height) / 2); $yb = [Math]::Max($yb, $k.SpList.Bottom) }
+                $yy = [Math]::Max($yb, $yy + (S 20)) + (S 6)
+            }
+            if ($i -eq 3 -and $connected) {
+                $rowH = S 30
+                $pwText = 'Download password'
+                $pw = (Get-RrTextWidth $pwText $k.LblPw.Font) + (S 10)
+                $k.LblPw.Text = $pwText
+                Set-RrBounds $k.LblPw $textX $yy $pw $rowH
+                $k.LblPw.TextAlign = 'MiddleLeft'
+                $k.Pw.SetBounds(($textX + $pw), ($yy + [int](($rowH - $k.Pw.Height) / 2)), (S 260), $k.Pw.Height); $k.Pw.Visible = $true
+                $yy += $rowH + (S 2)
+                $yy = (Set-RrWrapped $k.LblPwNote $textX $yy $w) + (S 6)
+                $bw = Get-RrButtonWidth $k.BSave (S 170)
+                Set-RrBounds $k.BSave $textX $yy $bw (S 38)
+                if ($d.SaveState -eq 'saving') {
+                    Set-RrBounds $k.SpSave ($k.BSave.Right + (S 14)) ($yy + (S 7)) (S 24) (S 24)
+                    $k.LblSave.Text = $d.SaveProgress
+                    $yb = Set-RrWrapped $k.LblSave ($k.SpSave.Right + (S 10)) ($yy + (S 8)) ($w - $bw - (S 48))
+                    $k.SpSave.Top = $k.LblSave.Top + [int](($k.LblSave.Height - $k.SpSave.Height) / 2)
+                }
+                $yy = $k.BSave.Bottom + (S 8)
+                if ($d.SaveState -eq 'done' -and $d.SaveSummary) {
+                    $k.LblSaved.Text = $d.SaveSummary
+                    $k.LblSaved.ForeColor = $(if ($d.SaveAllOk) { $C.Success } else { $C.Warning })
+                    $yy = (Set-RrWrapped $k.LblSaved $textX $yy $w) + (S 4)
+                    $k.LblProblems.Text = $d.SaveProblems
+                    $yy = (Set-RrWrapped $k.LblProblems $textX $yy $w) + (S 4)
+                    if ($d.RejectedText) {
+                        $k.LblRejHead.Text = 'This export was not saved. These details contain no message names or content. Copy them if you need to report it.'
+                        $yy = (Set-RrWrapped $k.LblRejHead $textX ($yy + (S 4)) $w) + (S 4)
+                        $k.Rej.Text = $d.RejectedText
+                        Set-RrBounds $k.Rej $textX $yy $w (S 120)
+                        $yy = $k.Rej.Bottom + (S 6)
+                        Set-RrBounds $k.BCopyDet $textX $yy (Get-RrButtonWidth $k.BCopyDet (S 140)) (S 34)
+                        $yy = $k.BCopyDet.Bottom + (S 4)
+                    }
+                }
+            }
+            $y = [Math]::Max($yy, $step.Badge.Bottom) + (S 14)
+        }
+        $scroll.AutoScrollMinSize = New-Object System.Drawing.Size(0, $y)
+        Update-RrSaveButton $d
+    } finally {
+        $scroll.ResumeLayout($true)
+        $d.InLayout = $false
+    }
+}
+
+function Get-RrTextWidth([string]$text, $font) {
+    $fl = [System.Windows.Forms.TextFormatFlags]::NoPadding -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::NoPrefix
+    [System.Windows.Forms.TextRenderer]::MeasureText($text, $font, (New-Object System.Drawing.Size([int]::MaxValue, 0)), $fl).Width
+}
+
+function Set-RrRows($d, $rows) {
+    $lv = $d.Ctl.List
+    $d.Rows = @($rows)
+    $lv.BeginUpdate()
+    try {
+        $lv.Items.Clear()
+        foreach ($r in $d.Rows) {
+            $it = New-Object System.Windows.Forms.ListViewItem -ArgumentList ([string](Format-RrDate $r.Received 'yyyy-MM-dd HH:mm'))
+            foreach ($cell in @($r.Sender, $r.Recipient, $r.Subject, $r.QuarantineTypes, (Format-RrDate $r.Expires 'yyyy-MM-dd'))) { [void]$it.SubItems.Add([string]$cell) }
+            $it.Tag = $r
+            [void]$lv.Items.Add($it)
+        }
+    } finally { $lv.EndUpdate() }
+}
+
+function Get-RrListNote([int]$count, [int]$ticked = 0) {
+    if ($count -eq 0) { return 'No pending release requests in this period.' }
+    $word = $(if ($count -eq 1) { 'request' } else { 'requests' })
+    $tickText = $(if ($ticked -eq 0) { 'Nothing is ticked yet.' } else { "$ticked ticked." })
+    $cap = Get-RrCapMessage $count
+    if ($cap) { return "$cap $tickText" }
+    "$count pending release $word. $tickText"
+}
+
+function Get-RrDialogSession($d) {
+    if (-not $d.Session) { $d.Session = New-RrSession ((Get-RrSessionFunctionNames) + $d.SessionFunctions) }
+    $d.Session
+}
+
+function Update-RrModuleStep($d) {
+    $d.Module = Get-RrModuleState
+    if ($d.Module.Installed) { $d.InstallState = 'idle'; $d.InstallMsg = '' }
+    Update-RrView $d
+}
+
+function Start-RrInstall($d) {
+    if ($d.InstallProc) { return }
+    try {
+        $proc = Start-RrModuleInstall
+    } catch {
+        $d.InstallState = 'failed'
+        $d.InstallMsg = 'Could not open the PowerShell window: ' + (Get-RrErrorText $_)
+        Update-RrView $d
+        return
+    }
+    $d.InstallProc = $proc
+    $d.InstallState = 'waiting'
+    $d.InstallMsg = ''
+    $d.InstallWatch.Start()
+    Update-RrView $d
+}
+
+function Invoke-RrInstallWatch($d) {
+    $proc = $d.InstallProc
+    if (-not $proc) { $d.InstallWatch.Stop(); return }
+    $exited = $true
+    try { $exited = [bool]$proc.HasExited } catch { $exited = $true }
+    if (-not $exited) { return }
+    $d.InstallWatch.Stop()
+    try { $proc.Dispose() } catch { $null = $_ } # the process is gone either way
+    $d.InstallProc = $null
+    $d.Module = Get-RrModuleState
+    if ($d.Module.Installed) { $d.InstallState = 'idle'; $d.InstallMsg = '' }
+    else { $d.InstallState = 'failed'; $d.InstallMsg = 'The install did not complete. Check the PowerShell window output.' }
+    Update-RrView $d
+    $d.Form.Activate()
+}
+
+function Start-RrConnect($d) {
+    if ($d.Work -or $d.ConnectState -eq 'working') { return }
+    $d.ConnectState = 'working'
+    $d.ConnectMsg = ''
+    $session = Get-RrDialogSession $d
+    Enable-RrForeground
+    $d.Work = Invoke-RrStep $session (Get-RrConnectScript) @{}
+    $d.WorkKind = 'connect'
+    $d.Poll.Start()
+    Update-RrView $d
+}
+
+function Start-RrList($d) {
+    if ($d.Work -or $d.ConnectState -ne 'done') { return }
+    $k = $d.Ctl
+    $d.ListState = 'loading'
+    $d.ListMsg = 'Loading release requests...'
+    $d.Work = Invoke-RrStep (Get-RrDialogSession $d) { Get-RrRequests -Days $RrDays -Recipient $RrRecipient } @{ RrDays = [int]$k.Days.Value; RrRecipient = $k.Recip.Text.Trim() }
+    $d.WorkKind = 'list'
+    $d.Poll.Start()
+    Update-RrView $d
+}
+
+function Start-RrSave($d) {
+    $k = $d.Ctl
+    if ($d.Work -or $k.List.CheckedItems.Count -lt 1 -or $k.Pw.Text.Length -lt 1) { return }
+    $secret = New-Object System.Security.SecureString
+    foreach ($ch in $k.Pw.Text.ToCharArray()) { $secret.AppendChar($ch) }
+    $secret.MakeReadOnly()
+    $k.Pw.Clear()
+    $items = @()
+    foreach ($it in $k.List.CheckedItems) { $items += $it }
+    $d.Batch = @{ Items = $items; Index = 0; Results = @(); Password = $secret }
+    $d.SaveState = 'saving'
+    $d.SaveSummary = ''; $d.SaveProblems = ''; $d.RejectedText = ''
+    Start-RrNextExport $d
+}
+
+function Start-RrNextExport($d) {
+    $b = $d.Batch
+    if ($b.Index -ge $b.Items.Count) { Complete-RrBatch $d; return }
+    $row = $b.Items[$b.Index].Tag
+    $d.SaveProgress = 'Saving {0} of {1}...' -f ($b.Index + 1), $b.Items.Count
+    $vars = @{ RrIdentity = [string]$row.Identity; RrReceived = [datetime]$row.Received; RrPassword = $b.Password; RrIncoming = [string]$d.Incoming }
+    $d.Work = Invoke-RrStep (Get-RrDialogSession $d) { Save-RrExport -Identity $RrIdentity -Received $RrReceived -Password $RrPassword -Incoming $RrIncoming } $vars
+    $d.WorkKind = 'export'
+    $d.Poll.Start()
+    Update-RrView $d
+}
+
+function Complete-RrBatch($d) {
+    $b = $d.Batch
+    $d.Batch = $null
+    try { $d.Session.Runspace.SessionStateProxy.SetVariable('RrPassword', $null) } catch { $null = $_ } # variable removal is best effort
+    try { $b.Password.Dispose() } catch { $null = $_ } # zeroes the SecureString
+    $total = $b.Items.Count
+    $saved = 0
+    $problems = New-Object System.Collections.Generic.List[string]
+    $rejected = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $total; $i++) {
+        $res = $b.Results[$i]
+        $row = $b.Items[$i].Tag
+        $label = "$(Format-RrDate $row.Received 'yyyy-MM-dd HH:mm') from $($row.Sender)"
+        if ($res.Status -eq 'Saved') { $saved++; $b.Items[$i].Checked = $false }
+        elseif ($res.Status -eq 'Exists') { $problems.Add("${label}: already in Incoming ($($res.FileName)), skipped."); $b.Items[$i].Checked = $false }
+        else {
+            $problems.Add("${label}: $($res.Message)")
+            if ($res.Status -eq 'Rejected' -and $res.Summary) { $rejected.Add("Item $($i + 1) of ${total}`r`n" + (Format-RrZipSummary $res.Summary)) }
+        }
+    }
+    $d.SaveState = 'done'
+    $d.SaveSummary = "Saved $saved of $total to Incoming"
+    $d.SaveAllOk = ($saved -eq $total)
+    $d.SaveProblems = ($problems -join "`r`n")
+    $d.RejectedText = ($rejected -join "`r`n`r`n")
+    Update-RrView $d
+}
+
+function Complete-RrExport($d, $res) {
+    $b = $d.Batch
+    $r = $null
+    if ($res.Error) { $r = New-RrResult 'Failed' '' ('The export failed: ' + $res.Error) $null }
+    else { $r = @($res.Output | Where-Object { $_ -and $_.PSObject.Properties['Status'] }) | Select-Object -Last 1 }
+    if (-not $r) { $r = New-RrResult 'Failed' '' 'The export returned no result.' $null }
+    $b.Results += $r
+    $b.Index++
+    Start-RrNextExport $d
+}
+
+function Invoke-RrPoll($d) {
+    $work = $d.Work
+    if (-not $work) { $d.Poll.Stop(); return }
+    if (-not $work.Handle.IsCompleted) { return }
+    $d.Poll.Stop()
+    $d.Work = $null
+    $res = Complete-RrStep $work
+    switch ($d.WorkKind) {
+        'connect' {
+            if ($res.Error) {
+                $d.ConnectState = 'failed'
+                $d.ConnectMsg = 'Sign-in did not finish: ' + $res.Error
+                Update-RrView $d
+            } else {
+                $d.ConnectState = 'done'
+                $d.ConnectMsg = ''
+                Update-RrView $d
+                $d.Form.Activate()
+                Start-RrList $d
+            }
+        }
+        'list' {
+            if ($res.Error -and @($res.Output).Count -eq 0) {
+                $d.ListState = 'failed'
+                $d.ListMsg = 'Could not list release requests: ' + $res.Error
+            } else {
+                $rows = @($res.Output | Where-Object { $_ })
+                Set-RrRows $d $rows
+                $d.ListState = 'loaded'
+                $d.ListMsg = Get-RrListNote $rows.Count
+            }
+            Update-RrView $d
+        }
+        'export' { Complete-RrExport $d $res }
+    }
+}
+
+function Stop-RrDialog($d) {
+    # FormClosing: nothing may fire on a disposed form, and the Exchange session ends here.
+    if (-not $d) { return }
+    foreach ($tm in @($d.Poll, $d.InstallWatch)) { if ($tm) { $tm.Stop() } }
+    if ($d.InstallProc) {
+        try { $d.InstallProc.Dispose() } catch { $null = $_ } # the install window keeps running on its own
+        $d.InstallProc = $null
+    }
+    if ($d.Batch) {
+        try { $d.Batch.Password.Dispose() } catch { $null = $_ } # zeroes the SecureString
+        $d.Batch = $null
+    }
+    if ($d.Session) {
+        try { $d.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor } catch { $null = $_ } # signing out can take a moment
+        Close-RrSession $d.Session
+    }
+}
+
+function New-RrDialog {
+    param([string]$Incoming = '', [string[]]$SessionFunctions = @(), [switch]$NoAutoStart)
+    $fonts = @{
+        Title = (New-Font 18 'Bold' 'Display'); Sub = (New-Font 10); Row = (New-Font 11 'Bold'); Body = (New-Font 10); BodyBold = (New-Font 10 'Bold')
+        Mono = (New-Font 9.5 'Regular' 'Mono'); Note = (New-Font 9.5)
+    }
+    $form = New-Object System.Windows.Forms.Form
+    $form.SuspendLayout()
+    Initialize-QraForm $form
+    $form.Text = 'Fetch release requests - Quarantine Review Assistant'
+    $form.Size = New-Object System.Drawing.Size(1000, 880)
+    $form.MinimumSize = New-Object System.Drawing.Size(760, 640)
+    $form.StartPosition = 'CenterScreen'
+    $form.BackColor = $C.Surface
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'; $header.Height = 78; $header.BackColor = $C.Header
+    $header.Add_Paint({ param($s, $e)
+            if ($script:QraHighContrast -or $s.ClientRectangle.Width -le 0 -or $s.ClientRectangle.Height -le 0) { return }
+            $br = New-Object System.Drawing.Drawing2D.LinearGradientBrush($s.ClientRectangle, $C.Header, $C.HeaderEnd, [single]90)
+            $e.Graphics.FillRectangle($br, $s.ClientRectangle); $br.Dispose() })
+    $hTitle = New-Object System.Windows.Forms.Label
+    $hTitle.Text = 'Fetch release requests'; $hTitle.Font = $fonts.Title; $hTitle.ForeColor = $C.HeaderText; $hTitle.BackColor = [System.Drawing.Color]::Transparent
+    $hTitle.AutoSize = $true; $hTitle.Location = New-Object System.Drawing.Point(22, 10)
+    $hSub = New-Object System.Windows.Forms.Label
+    $hSub.Text = 'Lists release requests and saves the messages you choose to Incoming. Nothing is opened on this PC.'
+    $hSub.Font = $fonts.Sub; $hSub.ForeColor = $C.HeaderSub; $hSub.BackColor = [System.Drawing.Color]::Transparent
+    $hSub.AutoSize = $true; $hSub.Location = New-Object System.Drawing.Point(24, 46)
+    $header.Controls.AddRange(@($hTitle, $hSub))
+
+    $footer = New-Object System.Windows.Forms.Panel
+    $footer.Dock = 'Bottom'; $footer.Height = 56; $footer.BackColor = $C.Surface
+
+    $body = New-Object System.Windows.Forms.Panel
+    $body.Dock = 'Fill'; $body.BackColor = $C.Surface
+    $body.Padding = New-Object System.Windows.Forms.Padding(16, 16, 16, 8)
+    $card = New-QraCard
+    $card.Dock = 'Fill'
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Dock = 'Fill'; $scroll.AutoScroll = $true; $scroll.BackColor = $C.Card
+    $card.Controls.Add($scroll)
+    $body.Controls.Add($card)
+    $form.Controls.Add($body)
+    $form.Controls.Add($footer)
+    $form.Controls.Add($header)
+    $form.ResumeLayout($false)
+    # Applied after ResumeLayout, like the launcher: an earlier ambient font would scale every control twice.
+    $form.Font = $fonts.Body
+    Limit-FormToScreen $form
+
+    # ---- everything below is created after scaling, so every number goes through S()
+    $k = @{ Scroll = $scroll }
+    $d = @{
+        Form = $form; Incoming = $Incoming; Fonts = $fonts; Ctl = $k; SessionFunctions = $SessionFunctions
+        Session = $null; Work = $null; WorkKind = ''; Module = $null; InstallProc = $null; Batch = $null
+        InstallState = 'idle'; InstallMsg = ''; ConnectState = 'idle'; ConnectMsg = ''; ListState = 'idle'; ListMsg = ''
+        SaveState = 'idle'; SaveProgress = ''; SaveSummary = ''; SaveProblems = ''; SaveAllOk = $false; RejectedText = ''; Rows = @()
+        Steps = @(); Ready = $false; InLayout = $false
+    }
+    $form.Tag = $d
+
+    $stepTitles = @('Exchange Online module', 'Sign in', 'Choose messages', 'Save to Incoming')
+    for ($i = 0; $i -lt 4; $i++) {
+        $badge = New-QraStepBadge ($i + 1)
+        $badge.Size = SSize 30 30
+        $title = New-RrLabel $stepTitles[$i] $fonts.Row $C.Text
+        $sum = New-RrLabel '' $fonts.Body $C.TextMuted
+        $scroll.Controls.AddRange(@($badge, $title, $sum))
+        $d.Steps += @{ Badge = $badge; Title = $title; Sum = $sum }
+    }
+
+    # step 1: install instructions
+    $instr = @('Click the button below. A PowerShell window opens and installs the module.',
+        'If it asks about NuGet or an untrusted repository, type Y and press Enter.',
+        'When it shows "Installed. Close this window...", close that PowerShell window. This window continues by itself.')
+    $k.I0Num = @(); $k.I0Txt = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $k.I0Num += New-RrLabel ("{0}." -f ($i + 1)) $fonts.BodyBold $C.Primary
+        $k.I0Txt += New-RrLabel $instr[$i] $fonts.Body $C.Text
+    }
+    $k.BInstall = New-RrButton 'Install ExchangeOnlineManagement for my account' 'Primary' $QraGlyph.Play $fonts.BodyBold
+    $k.BCopyCmd = New-RrButton 'Copy command' 'Secondary' $QraGlyph.Copy $fonts.Body
+    $k.SpInstall = New-QraSpinner (S 24); $k.SpInstall.Visible = $false
+    $k.LblWait = New-RrLabel 'Waiting for the install window to close...' $fonts.BodyBold $C.Text
+    $k.LblInstallMsg = New-RrLabel '' $fonts.BodyBold $C.Warning
+
+    # step 2: sign in
+    $k.BSignIn = New-RrButton 'Sign in' 'Primary' $QraGlyph.Shield $fonts.BodyBold
+    $k.SpConnect = New-QraSpinner (S 24); $k.SpConnect.Visible = $false
+    $k.LblConnect = New-RrLabel "Waiting for you to sign in... If you don't see the sign-in window, check the taskbar." $fonts.BodyBold $C.Text
+    $k.LblConnectErr = New-RrLabel '' $fonts.BodyBold $C.Danger
+
+    # step 3: choose messages
+    $k.LblDays = New-RrLabel 'Days to look back' $fonts.Body $C.Text
+    $k.Days = New-Object System.Windows.Forms.NumericUpDown
+    $k.Days.Minimum = 1; $k.Days.Maximum = 30; $k.Days.Value = 16; $k.Days.Font = $fonts.Body; $k.Days.Visible = $false
+    $k.LblRecip = New-RrLabel 'Recipient (optional)' $fonts.Body $C.Text
+    $k.Recip = New-Object System.Windows.Forms.TextBox
+    $k.Recip.Font = $fonts.Body; $k.Recip.Visible = $false
+    $k.BRefresh = New-RrButton 'Refresh list' 'Secondary' $QraGlyph.Refresh $fonts.Body
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.MultiSelect = $false
+    $lv.HeaderStyle = 'Nonclickable'; $lv.BorderStyle = 'FixedSingle'; $lv.Font = $fonts.Body
+    $lv.BackColor = $C.Card; $lv.ForeColor = $C.Text; $lv.Visible = $false
+    foreach ($col in @(@('Received', 135), @('Sender', 165), @('Recipient', 150), @('Subject', 185), @('Quarantine type', 115), @('Expires', 85))) {
+        [void]$lv.Columns.Add([string]$col[0], (S $col[1]))
+    }
+    $k.List = $lv
+    $k.SpList = New-QraSpinner (S 24); $k.SpList.Visible = $false
+    $k.LblList = New-RrLabel '' $fonts.Body $C.TextMuted
+
+    # step 4: save
+    $k.LblPw = New-RrLabel 'Download password' $fonts.BodyBold $C.Text
+    $k.Pw = New-Object System.Windows.Forms.TextBox
+    $k.Pw.UseSystemPasswordChar = $true; $k.Pw.Font = $fonts.Body; $k.Pw.Visible = $false
+    $k.LblPwNote = New-RrLabel 'Use this same password in the Sandbox review window.' $fonts.Body $C.TextMuted
+    $k.BSave = New-RrButton 'Save to Incoming' 'Primary' $QraGlyph.Folder $fonts.BodyBold
+    $k.BSave.Enabled = $false
+    $k.SpSave = New-QraSpinner (S 24); $k.SpSave.Visible = $false
+    $k.LblSave = New-RrLabel '' $fonts.Body $C.Text
+    $k.LblSaved = New-RrLabel '' $fonts.BodyBold $C.Success
+    $k.LblProblems = New-RrLabel '' $fonts.Body $C.Warning
+    $k.LblRejHead = New-RrLabel '' $fonts.Body $C.Text
+    $k.Rej = New-Object System.Windows.Forms.TextBox
+    $k.Rej.Multiline = $true; $k.Rej.ReadOnly = $true; $k.Rej.ScrollBars = 'Vertical'; $k.Rej.Font = $fonts.Mono; $k.Rej.Visible = $false
+    $k.BCopyDet = New-RrButton 'Copy details' 'Secondary' $QraGlyph.Copy $fonts.Body
+
+    $scroll.Controls.AddRange(@($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.List, $k.SpList, $k.LblList,
+                $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet)))
+
+    # footer: a read-only reminder on the left, Close on the right
+    $k.BClose = New-RrButton 'Close' 'Secondary' '' $fonts.Body
+    $k.BClose.Visible = $true
+    $k.FootNote = New-Object System.Windows.Forms.Label
+    $k.FootNote.Text = 'Read-only: this tool never releases, deletes or blocks a message.'
+    $k.FootNote.Font = $fonts.Note; $k.FootNote.ForeColor = $C.TextMuted; $k.FootNote.BackColor = $C.Surface
+    $k.FootNote.AutoSize = $false; $k.FootNote.UseMnemonic = $false; $k.FootNote.TextAlign = 'MiddleLeft'
+    $footer.Controls.AddRange(@($k.FootNote, $k.BClose))
+    $k.Footer = $footer
+    $placeFooter = {
+        param($s)
+        $dd = $s.FindForm().Tag
+        if (-not $dd) { return }
+        $kk = $dd.Ctl
+        $kk.BClose.SetBounds(($kk.Footer.ClientSize.Width - (S 24) - (S 110)), (S 10), (S 110), (S 36))
+        $kk.FootNote.SetBounds((S 26), (S 10), ($kk.Footer.ClientSize.Width - (S 190)), (S 36))
+    }
+    $footer.Add_Resize($placeFooter)
+
+    # timers
+    $d.Poll = New-Object System.Windows.Forms.Timer
+    $d.Poll.Interval = 200
+    $d.Poll.Tag = $d
+    $d.Poll.Add_Tick({ param($s) Invoke-RrPoll $s.Tag })
+    $d.InstallWatch = New-Object System.Windows.Forms.Timer
+    $d.InstallWatch.Interval = 500
+    $d.InstallWatch.Tag = $d
+    $d.InstallWatch.Add_Tick({ param($s) Invoke-RrInstallWatch $s.Tag })
+
+    # events
+    $k.BInstall.Add_Click({ param($s) Start-RrInstall $s.FindForm().Tag })
+    $k.BCopyCmd.Add_Click({ param($s)
+            try { [System.Windows.Forms.Clipboard]::SetText((Get-RrInstallCommand)); Show-QraCopied $s 'Copied' } catch { $null = $_ } # the clipboard can be busy
+        })
+    $k.BSignIn.Add_Click({ param($s) Start-RrConnect $s.FindForm().Tag })
+    $k.BRefresh.Add_Click({ param($s) Start-RrList $s.FindForm().Tag })
+    $k.BSave.Add_Click({ param($s) Start-RrSave $s.FindForm().Tag })
+    $k.BCopyDet.Add_Click({ param($s)
+            $dd = $s.FindForm().Tag
+            try { [System.Windows.Forms.Clipboard]::SetText([string]$dd.RejectedText); Show-QraCopied $s 'Copied' } catch { $null = $_ } # the clipboard can be busy
+        })
+    $k.BClose.Add_Click({ param($s) $s.FindForm().Close() })
+    $k.List.Add_ItemChecked({ param($s) Update-RrSaveButton $s.FindForm().Tag })
+    $k.Pw.Add_TextChanged({ param($s) Update-RrSaveButton $s.FindForm().Tag })
+    $scroll.Add_Resize({ param($s) Update-RrView $s.FindForm().Tag })
+    $form.Add_FormClosing({ param($s) Stop-RrDialog $s.Tag })
+    if (-not $NoAutoStart) { $form.Add_Shown({ param($s) Update-RrModuleStep $s.Tag }) }
+
+    Set-Access $k.BInstall 'Install the ExchangeOnlineManagement module for my account'
+    Set-Access $k.BCopyCmd 'Copy the install command'
+    Set-Access $k.BSignIn 'Sign in to Exchange Online'
+    Set-Access $k.Days 'Days to look back'
+    Set-Access $k.Recip 'Recipient address filter, optional'
+    Set-Access $k.BRefresh 'Refresh the list of release requests'
+    Set-Access $k.List 'Release requests, tick the messages to save'
+    Set-Access $k.Pw 'Download password'
+    Set-Access $k.BSave 'Save the ticked messages to Incoming'
+    Set-Access $k.Rej 'Details of the rejected export'
+    Set-Access $k.BCopyDet 'Copy the details of the rejected export'
+    Set-Access $k.BClose 'Close this window'
+    $ti = 0
+    foreach ($ctl in @($k.BInstall, $k.BCopyCmd, $k.BSignIn, $k.Days, $k.Recip, $k.BRefresh, $k.List, $k.Pw, $k.BSave, $k.Rej, $k.BCopyDet)) { $ctl.TabIndex = $ti++ }
+    $k.BClose.TabIndex = 0
+
+    $d.Ready = $true
+    & $placeFooter $footer $null
+    $d
+}
+
+function Show-ReleaseRequestDialog {
+    param([string]$Incoming, $Owner)
+    $d = New-RrDialog -Incoming $Incoming
+    try {
+        if ($Owner) { $d.Form.StartPosition = 'CenterParent'; [void]$d.Form.ShowDialog($Owner) } else { [void]$d.Form.ShowDialog() }
+    } finally {
+        Stop-RrDialog $d
+        $d.Form.Dispose()
+    }
+}
+
+# ================================================================= screenshot support (synthetic data, no connection, no file access)
+
+function ConvertTo-RrShotDate([string]$text) {
+    [datetime]::ParseExact($text, 'yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Set-RrScreenshotState($d, [string]$State = 'results') {
+    $k = $d.Ctl
+    $d.Module = [pscustomobject]@{ Installed = $true; Version = '3.11.1'; InstallCommand = (Get-RrInstallCommand) }
+    $d.InstallState = 'idle'; $d.InstallMsg = ''
+    if ($State -eq 'missing') {
+        $d.Module = [pscustomobject]@{ Installed = $false; Version = ''; InstallCommand = (Get-RrInstallCommand) }
+        $d.ConnectState = 'idle'; $d.ListState = 'idle'; $d.SaveState = 'idle'
+        Set-RrRows $d @()
+        Update-RrView $d
+        return
+    }
+    $expires = ConvertTo-RrShotDate '2026-12-25 00:00'
+    $fake = @(
+        @('08:12', 'billing@invoice-pay.example', 'a.rivera@corp.example', 'Invoice 4471 - action required', 'HighConfPhish'),
+        @('09:03', 'it-helpdesk@contoso-mail.example', 'j.chen@corp.example', 'Password expires today - verify now', 'Phish'),
+        @('09:47', 'shipping@parcel-track.example', 'm.okafor@corp.example', 'Parcel on hold: confirm your delivery', 'Spam'),
+        @('10:15', 'hr-benefits@payroll-update.example', 's.novak@corp.example', 'Updated benefits statement', 'Malware'),
+        @('10:31', 'accounts@invoice-pay.example', 'd.silva@corp.example', 'Overdue payment notice', 'HighConfPhish')
+    )
+    $rows = @()
+    for ($i = 0; $i -lt $fake.Count; $i++) {
+        $f = $fake[$i]
+        $rows += [pscustomobject]@{
+            Identity        = ('00000000-0000-4000-8000-00000000000{0}\00000000-0000-4000-8000-0000000000a{0}' -f ($i + 1))
+            Received        = (ConvertTo-RrShotDate ('2026-11-25 ' + $f[0]))
+            Sender          = $f[1]; Recipient = $f[2]; Subject = $f[3]; QuarantineTypes = $f[4]; Expires = $expires
+        }
+    }
+    Set-RrRows $d $rows
+    $d.ConnectState = 'done'
+    $d.ListState = 'loaded'
+    $d.ListMsg = Get-RrListNote $rows.Count
+    $k.List.Items[0].Checked = $true
+    $k.List.Items[2].Checked = $true
+    $k.Pw.Text = '        '   # eight blanks: the box shows mask dots only, there is no secret in a screenshot
+    $d.SaveState = 'done'
+    $d.SaveSummary = 'Saved 2 of 2 to Incoming'
+    $d.SaveAllOk = $true
+    $d.SaveProblems = ''
+    $d.RejectedText = ''
+    Update-RrView $d
+}
+
+# ================================================================= standalone mode (not dot-sourced)
+if ($MyInvocation.InvocationName -ne '.') {
+    $ErrorActionPreference = 'Stop'
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    . (Join-Path $PSScriptRoot 'QraUi.ps1')
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    if (-not $RrIncoming) { $RrIncoming = Join-Path (Split-Path -Parent $PSScriptRoot) 'Incoming' }
+    if ($RrScreenshot) {
+        try {
+            [void][System.IO.Directory]::CreateDirectory($RrScreenshot)
+            $dlg = New-RrDialog -Incoming 'D:\SecurityReview\Incoming' -NoAutoStart
+            $dlg.Form.ShowInTaskbar = $false; $dlg.Form.Opacity = 0; $dlg.Form.StartPosition = 'Manual'
+            $dlg.Form.Location = New-Object System.Drawing.Point(-32000, -32000)
+            $dlg.Form.Show()
+            [System.Windows.Forms.Application]::DoEvents()
+            $shots = @(@('results', 'release-requests.png'), @('missing', 'release-requests-missing.png'))
+            if ($RrScreenshotState) { $shots = @(, @($RrScreenshotState, 'release-requests.png')) }
+            foreach ($shot in $shots) {
+                Set-RrScreenshotState $dlg $shot[0]
+                $dlg.Form.ActiveControl = $null
+                [System.Windows.Forms.Application]::DoEvents()
+                $bmp = New-Object System.Drawing.Bitmap($dlg.Form.Width, $dlg.Form.Height)
+                $dlg.Form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $dlg.Form.Width, $dlg.Form.Height)))
+                $bmp.Save((Join-Path $RrScreenshot $shot[1]), [System.Drawing.Imaging.ImageFormat]::Png)
+                $bmp.Dispose()
+            }
+            $dlg.Form.Dispose()
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage + "`n" + $_.ScriptStackTrace)
+            exit 1
+        }
+        exit 0
+    }
+    Hide-QraConsole
+    try {
+        Show-ReleaseRequestDialog -Incoming $RrIncoming
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("The release-request window hit an unexpected error:`r`n`r`n$($_.Exception.Message)", 'Quarantine Review Assistant', 'OK', 'Error') | Out-Null
+    }
+}
