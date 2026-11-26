@@ -1,4 +1,4 @@
-# Quarantine Review Assistant v2.2.0
+# Quarantine Review Assistant v2.3.0
 
 Offline review of emails held in **Microsoft Defender / EOP quarantine**, done inside a disposable,
 network-less **Windows Sandbox**. It inventories the message, its attachments and anything nested in them
@@ -30,6 +30,9 @@ extracted to disk.
       first. Do not release. Then click **I've checked it - next**.
    3. **Download the message.** In the portal choose **... More > Download message** with a password, and save the ZIP
       into `Incoming` without opening it. The step finishes by itself when the file appears.
+      Optional: **Fetch release requests** lists the messages with a pending release request (read-only, through Exchange Online
+      PowerShell) and saves the ones you tick as password-protected ZIPs in `Incoming`. The manual portal download above still works.
+      See `docs/for-security-teams.md` in the repository for what it connects to.
    4. **Analyze in the Sandbox.** Click **Launch Sandbox review**. The review window opens by itself inside the
       Sandbox. Follow the four steps in the left column: pick the file, type the download password, press **Enter**. If you turned off saving reports to this PC,
       click **I've recorded my decision - next** when you are done.
