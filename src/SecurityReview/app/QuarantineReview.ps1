@@ -659,25 +659,34 @@ function Fit-Columns($lv, [int[]]$min, [int[]]$max) {
     }
 }
 
-# Hover tooltip for list rows (the full path or link). Shown by hand because ListView item tooltips are unreliable over sub-item cells.
+# Hover tooltip for list cells: the full text of the cell under the mouse, only when its column cuts it off.
+# Shown by hand because ListView item tooltips are unreliable over sub-item cells.
 $script:RowTip = New-Object System.Windows.Forms.ToolTip
 $script:RowTip.AutoPopDelay = 30000; $script:RowTip.ReshowDelay = 0
-$script:RowTipItem = $null
+$script:RowTipKey = $null
 function Get-RowTipText($lv, $point) {
+    $none = @{ Key = $null; Text = '' }
     $hit = $lv.HitTest($point)
-    if ($hit.Item) { return @{ Item = $hit.Item; Text = [string]$hit.Item.ToolTipText } }
-    return @{ Item = $null; Text = '' }
+    if (-not $hit.Item -or -not $hit.SubItem) { return $none }
+    $col = $hit.Item.SubItems.IndexOf($hit.SubItem)
+    if ($col -lt 0 -or $col -ge $lv.Columns.Count) { return $none }
+    $key = '{0}:{1}' -f $hit.Item.Index, $col
+    $text = [string]$hit.SubItem.Text
+    # the cell padding is about 6 px on each side at 96 dpi
+    $need = [System.Windows.Forms.TextRenderer]::MeasureText($text, $lv.Font).Width + (S 12)
+    if (-not $text -or $need -le $lv.Columns[$col].Width) { return @{ Key = $key; Text = '' } }
+    return @{ Key = $key; Text = $text }
 }
 function Enable-RowTips($lv) {
     $lv.Add_MouseMove({ param($s, $e)
         $t = Get-RowTipText $s $e.Location
-        if ($t.Item -ne $script:RowTipItem) {
-            $script:RowTipItem = $t.Item
+        if ($t.Key -ne $script:RowTipKey) {
+            $script:RowTipKey = $t.Key
             $script:RowTip.Hide($s)
             if ($t.Text) { $script:RowTip.Show($t.Text, $s, ($e.X + (S 16)), ($e.Y + (S 22)), 30000) }
         }
     })
-    $lv.Add_MouseLeave({ param($s, $e) $script:RowTipItem = $null; $script:RowTip.Hide($s) })
+    $lv.Add_MouseLeave({ param($s, $e) $script:RowTipKey = $null; $script:RowTip.Hide($s) })
 }
 
 function Show-FindingDetail {

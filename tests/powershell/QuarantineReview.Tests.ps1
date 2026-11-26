@@ -204,6 +204,44 @@ function N(`$col) { (@(foreach (`$n in 'WindowText','HighlightText','GrayText','
     }
 }
 
+Describe 'Review window: list hover tips' {
+    It 'shows the full text of the hovered cell only, and only when the column cuts it off (child process)' {
+        $kit = Join-Path $script:Repo 'src\SecurityReview\app\QraUi.ps1'
+        $fn = $script:ReviewFunctions['Get-RowTipText'].Extent.Text
+        $tmp = Join-Path $TestDrive 'tips.ps1'
+        $body = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$kit'
+$fn
+`$form = New-Object System.Windows.Forms.Form
+`$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.Size = New-Object System.Drawing.Size(900, 300)
+`$lv = New-Object System.Windows.Forms.ListView
+`$lv.View = 'Details'; `$lv.FullRowSelect = `$true; `$lv.Dock = 'Fill'
+foreach (`$w in 80, 120, 120) { [void]`$lv.Columns.Add('c', `$w) }
+`$it = New-Object System.Windows.Forms.ListViewItem('HIGH')
+[void]`$it.SubItems.Add('A finding title that is much too long for a narrow column')
+[void]`$it.SubItems.Add('Message 1 > Weekly-schedule.zip > Schedule-demo.exe')
+`$it.ToolTipText = 'Message 1 > Weekly-schedule.zip > Schedule-demo.exe'
+[void]`$lv.Items.Add(`$it)
+`$form.Controls.Add(`$lv); `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+`$y = `$it.Bounds.Top + 3
+'sev=' + (Get-RowTipText `$lv (New-Object System.Drawing.Point(20, `$y))).Text
+'title=' + (Get-RowTipText `$lv (New-Object System.Drawing.Point(140, `$y))).Text
+'where=' + (Get-RowTipText `$lv (New-Object System.Drawing.Point(260, `$y))).Text
+'empty=' + (Get-RowTipText `$lv (New-Object System.Drawing.Point(20, 250))).Text
+`$form.Close()
+"@
+        [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($true)))
+        $out = @(& powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $tmp 2>&1 | ForEach-Object { "$_" })
+        $all = $out -join "`n"
+        $out | Should -Contain 'sev=' -Because $all
+        $out | Should -Contain 'title=A finding title that is much too long for a narrow column' -Because $all
+        $out | Should -Contain 'where=Message 1 > Weekly-schedule.zip > Schedule-demo.exe' -Because $all
+        $out | Should -Contain 'empty=' -Because $all
+    }
+}
+
 Describe 'Review window: decision publication' {
     BeforeAll {
         foreach ($name in 'Save-DecisionRecord', 'Invoke-SaveTargets', 'Write-DecisionTarget', 'Get-ReviewRestriction', 'Show-NodeDetails', 'Test-IncompleteReview', 'Update-DecisionOutcome', 'Get-StepsFor') {

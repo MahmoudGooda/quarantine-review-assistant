@@ -126,7 +126,7 @@ and a **Change** link; later steps are dimmed but you can open any of them at an
 * **Verdict banner**: `HIGH RISK`, `SUSPICIOUS`, `NO STRONG INDICATORS` or `INCOMPLETE`, plus what to do next.
 * **Tabs**
   * **Summary:** sender, authentication, Microsoft's own verdict, and each attachment with what it contains.
-  * **Findings:** every indicator, colour-coded, with its exact location (`Message 1 > Invoice.zip > pay.html`). Hover a row to see the full path; select it to read the title, severity, full location, ATT&CK ID and details in the box underneath. The severity is always written as a word, never colour alone.
+  * **Findings:** every indicator, colour-coded, with its exact location (`Message 1 > Invoice.zip > pay.html`). Hover a cell that is cut off to see its full text; select a row to read the title, severity, full location, ATT&CK ID and details in the box underneath. The severity is always written as a word, never colour alone.
   * **Attachments:** a tree of the whole chain. Click a node for its hashes (SHA256/SHA1/MD5) and findings.
   * **Links:** every URL, defanged and not clickable, with the reason it was flagged.
   * **Headers:** SPF, DKIM, DMARC, compauth, EOP fields (CAT, SFV, SCL, BCL, CIP, CTRY) and Received hops.

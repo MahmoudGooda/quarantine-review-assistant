@@ -26,7 +26,7 @@ First release from the public repository.
   amber decision colour, and that is what changed.
 - **High-DPI displays.** Both windows are now DPI-aware, scale their layout at 125 %, 150 % and 175 %, and never open larger than the screen.
   The review window reduces horizontal tab padding at narrower widths so all eight labels fit at 175% scaling at the minimum window size.
-- **Findings tab:** the "Where" column no longer hides the path. Columns are sized to their text, hovering a row shows the full path, and a box
+- **Findings tab:** the "Where" column no longer hides the path. Columns are sized to their text, hovering a cell that is cut off shows its full text, and a box
   under the list shows the selected finding's title, severity, full location, ATT&CK ID and details.
 - **Defender steps box** is as tall as its text instead of a fixed, mostly empty rectangle.
 
