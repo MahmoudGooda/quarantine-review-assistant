@@ -14,11 +14,15 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
   folder, only when clicked, and asks before replacing an existing shortcut.
 - **Release-request intake (optional).** A **Fetch release requests** button in step 3 of the launcher opens a dialog that lists
   quarantined messages with a pending release request through read-only Exchange Online PowerShell. Exchange keeps one row per
-  recipient copy, so the list shows **one row per message** (Received, Sender, Subject, Quarantine type, Copies, Expires). **Copies**
+  recipient copy, so the list shows **one row per message** (Received, Sender, Recipients, Subject, Quarantine type, Copies, Expires). **Copies**
   summarises the recipient copies by status (for example `2 pending · 2 released · 3 not requested`) and flags a message that was
   already released to some recipients. An optional **Also show released and denied messages** view is off by default. Every checkbox
   starts unselected and saving exports one copy per selected message. The default window is 16 days (maximum 30) and the query returns
   up to 1000 rows.
+- **Recipients column, sorting and automatic refresh.** **Recipients** shows the first known address with `(+N)` for the rest (or
+  `7 recipients` when Exchange gave no address) and lists everyone in the tooltip, from data the listing already returned. A click on a
+  column header sorts the list (again to reverse; newest first by default). Turning **Also show released and denied messages**
+  on or off refreshes the list by itself, and the selection is kept across sorting and refreshing.
 - **Encrypted ZIP only.** An export is written to `Incoming` as a password-protected ZIP only after its bytes pass a check: ZIP
   signature, a readable central directory, at least one entry, and the encryption flag on every entry. A rejected export writes
   nothing and shows a summary that contains no entry names or content.
@@ -36,6 +40,8 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
   switch is not used.
 
 ### Changed
+- Sandbox review window, step 2: a **Continue** button (or Enter in the password box) moves on to the Analyze step. Analysis starts only
+  when you click **Analyze**.
 - Roadmap: code signing moved from v3.0 to v2.8 (Enterprise readiness), and v3.0 is now "Playbook and training lab".
 
 ## [2.2.0] - 2026-11-25

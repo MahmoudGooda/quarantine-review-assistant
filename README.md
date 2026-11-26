@@ -92,7 +92,7 @@ official Python embeddable package from python.org, once, checked against a pinn
    create the shortcut again.
 3. Steps 2 and 3 of the launcher cover Defender: open the quarantined message and choose **Download message** with a password. Save
    the ZIP into `Incoming` without opening it, then click **Launch Sandbox review** (step 4, **Analyze in the Sandbox**).
-4. In the Sandbox window, choose the package, type the password and press **Enter**. Read the **Decision** tab, then in step 5,
+4. In the Sandbox window, choose the package, type the password, click **Continue**, then click **Analyze**. Read the **Decision** tab, then in step 5,
    **Act in Defender and clean up**, act in Defender, close the Sandbox and click **Delete Incoming...**.
 
 | Decision | Evidence | Reviewer action |
@@ -106,7 +106,10 @@ Instead of downloading each message by hand in the Defender portal, the launcher
 launcher. Manual download from the portal still works and stays the default.
 
 - **One row per message, and you choose.** Exchange keeps one quarantine row per recipient copy, so a message sent to seven people is
-  seven rows. The list groups them and shows one row per message with Received, Sender, Subject, Quarantine type, Copies and Expires.
+  seven rows. The list groups them and shows one row per message with Received, Sender, Recipients, Subject, Quarantine type, Copies and Expires. Click a column header
+  to sort (click again to reverse). **Recipients** shows the first known address and `(+N)` for the rest, or `7 recipients` when
+  Exchange did not list the addresses; hover the cell for the full list. Turning **Also show released and denied messages** on or
+  off refreshes the list at once and keeps your selection.
   **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`, and a message that was
   already released to some recipients is flagged. Every checkbox starts unselected. Nothing is downloaded automatically and there is
   no select-all by default.
