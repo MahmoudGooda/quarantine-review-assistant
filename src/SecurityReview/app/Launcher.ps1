@@ -8,14 +8,77 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# ---------------------------------------------------------------- start-up: single instance, then a splash while the window is built
+# Only for a real GUI run (not -Screenshot, -NoGui or inside the Sandbox). Plain WinForms and .NET only: nothing here needs Add-Type or the UI kit,
+# so the splash is on screen before the slow part (loading the kit and building the form) starts.
+$script:LauncherMutex = $null
+$script:Splash = $null
+$startGui = (-not $Screenshot) -and (-not $NoGui) -and ($env:USERNAME -ne 'WDAGUtilityAccount')
+function Close-LauncherSplash {
+    if ($script:Splash) {
+        try { $script:Splash.Close(); $script:Splash.Dispose() } catch { $null = $_ } # already gone
+        $script:Splash = $null
+    }
+}
+function Exit-LauncherMutex {
+    if ($script:LauncherMutex) {
+        try { $script:LauncherMutex.ReleaseMutex() } catch { $null = $_ } # not owned by this thread: the OS frees it when the process ends
+        try { $script:LauncherMutex.Dispose() } catch { $null = $_ } # already disposed
+        $script:LauncherMutex = $null
+    }
+}
+if ($startGui) {
+    $mutexMine = $true
+    try {
+        $mutexNew = $false
+        $script:LauncherMutex = New-Object System.Threading.Mutex($true, 'Local\QuarantineReviewAssistant.Launcher', [ref]$mutexNew)
+        if (-not $mutexNew) { $mutexMine = $false; $script:LauncherMutex.Dispose(); $script:LauncherMutex = $null }
+    } catch { $mutexMine = $true; $script:LauncherMutex = $null } # cannot create the mutex: carry on without the single-instance check
+    if (-not $mutexMine) {
+        # Another launcher is running: bring its window forward and leave without building anything.
+        try {
+            $other = @(Get-Process -Name powershell -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.MainWindowTitle -like 'Quarantine Review Assistant * - Host Launcher' })[0]
+            if ($other -and $other.MainWindowHandle -ne [IntPtr]::Zero -and [string]$ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') {
+                if (-not ('QRA.Wake' -as [type])) {
+                    Add-Type -Namespace QRA -Name Wake -ErrorAction Stop -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h); [DllImport("user32.dll")] public static extern bool IsIconic(System.IntPtr h);'
+                }
+                if ([QRA.Wake]::IsIconic($other.MainWindowHandle)) { [void][QRA.Wake]::ShowWindow($other.MainWindowHandle, 9) }   # SW_RESTORE, only for a minimised window
+                [void][QRA.Wake]::SetForegroundWindow($other.MainWindowHandle)
+            }
+        } catch { $null = $_ } # best effort: the running launcher is still there
+        exit 0
+    }
+    try {
+        $sp = New-Object System.Windows.Forms.Form
+        $sp.AutoScaleMode = 'None'; $sp.FormBorderStyle = 'None'; $sp.ShowInTaskbar = $false; $sp.TopMost = $true; $sp.StartPosition = 'Manual'
+        $sp.BackColor = [System.Drawing.Color]::FromArgb(17, 38, 66); $sp.Size = New-Object System.Drawing.Size(380, 120)
+        $spT = New-Object System.Windows.Forms.Label
+        $spT.Text = 'Quarantine Review Assistant'; $spT.AutoSize = $true; $spT.Location = New-Object System.Drawing.Point(24, 24)
+        $spT.ForeColor = [System.Drawing.Color]::White; $spT.BackColor = [System.Drawing.Color]::Transparent
+        $spT.Font = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+        $spS = New-Object System.Windows.Forms.Label
+        $spS.Text = 'Starting...'; $spS.AutoSize = $true; $spS.Location = New-Object System.Drawing.Point(27, 70)
+        $spS.ForeColor = [System.Drawing.Color]::FromArgb(170, 196, 224); $spS.BackColor = [System.Drawing.Color]::Transparent
+        $spS.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+        $sp.Controls.AddRange(@($spT, $spS))
+        $spArea = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea   # the screen with the mouse
+        $sp.Location = New-Object System.Drawing.Point(($spArea.Left + [int](($spArea.Width - $sp.Width) / 2)), ($spArea.Top + [int](($spArea.Height - $sp.Height) / 2)))
+        $sp.Show(); $sp.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        $script:Splash = $sp
+    } catch { $script:Splash = $null } # the splash is cosmetic
+}
+
 # Shared UI kit: DPI helpers, design tokens, fonts, painted controls (with plain fallbacks) and background work.
 . (Join-Path $PSScriptRoot 'QraUi.ps1')
 # Optional release-request intake (Exchange Online). Dot-sourced WITHOUT arguments: its parameters are aliased so this script's $Incoming and $Screenshot stay untouched.
 . (Join-Path $PSScriptRoot 'ReleaseRequests.ps1')
+if ($script:Splash) { [System.Windows.Forms.Application]::DoEvents() }
 # -ScreenshotDpi: emulate another display scale. Must run before any window exists.
 if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 trap {
+    Close-LauncherSplash; Exit-LauncherMutex
     if ($Screenshot) { [Console]::Error.WriteLine($_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage + "`n" + $_.ScriptStackTrace); exit 1 }   # headless: never wait on a dialog
     [System.Windows.Forms.MessageBox]::Show("The launcher hit an unexpected error:`r`n`r`n$($_.Exception.Message)`r`n`r`nIf your organisation blocks PowerShell scripts, ask IT security to allow this tool's folder.", 'Quarantine Review Assistant', 'OK', 'Error') | Out-Null
     break
@@ -412,7 +475,7 @@ if (-not $Screenshot) { New-Item -ItemType Directory -Force -Path $Incoming | Ou
 if ($NoGui) { Get-ReadinessChecks | Format-Table Name, Status, Detail -AutoSize -Wrap; return }
 
 # hide the PowerShell console that launched us (purely cosmetic; ignored if blocked)
-if (-not $Screenshot) { Hide-QraConsole }
+if (-not $Screenshot) { Enable-QraForeground; Hide-QraConsole }   # the console is about to vanish: keep the right to come to the front
 
 # ================================================================= UI
 $Fonts = @{
@@ -450,6 +513,7 @@ $form.Size = New-Object System.Drawing.Size(1180, 820)
 $form.MinimumSize = New-Object System.Drawing.Size(1040, 720)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $C.Surface
+Set-QraWindowChrome $form -NoAppId:([bool]$Screenshot)   # app icon, own taskbar button, navy title bar (Windows 11)
 
 # ---- header: navy gradient, title, and (added after scaling) the PC / Python / Sandbox pills
 $header = New-Object System.Windows.Forms.Panel
@@ -634,7 +698,7 @@ $st3 = New-StepPanel 3 'Download the message' 'The Sandbox reads the ZIP from th
     (New-SubStep 'Choose ... More > Download message.' '... More > Download message'),
     (New-SubStep 'Type a password you will remember for the next few minutes.'),
     (New-SubStep 'Save the ZIP to the folder below. Do not open or extract it.'),
-    (New-SubStep 'Optional: Fetch release requests saves the messages you tick straight into this folder.' 'Fetch release requests')
+    (New-SubStep 'Optional: Fetch release requests saves the messages you select straight into this folder.' 'Fetch release requests')
 )
 $incomingLbl = New-Object System.Windows.Forms.TextBox
 $incomingLbl.ReadOnly = $true; $incomingLbl.Text = $Incoming; $incomingLbl.BorderStyle = 'FixedSingle'
@@ -709,7 +773,7 @@ Set-Access $bPortal 'Open Defender quarantine in the browser'
 Set-Access $bChecked "I've checked it in Defender, go to the next step"
 Set-Access $incomingLbl 'Incoming folder path'
 Set-Access $bOpenIncoming 'Open the Incoming folder'; Set-Access $bCopyIncoming 'Copy the Incoming folder path'
-Set-Access $bFetch 'Fetch release requests from Exchange Online and save the ones you tick into Incoming'
+Set-Access $bFetch 'Fetch release requests from Exchange Online and save the ones you select into Incoming'
 Set-Access $incomingList 'Files waiting for review'
 Set-Access $optReports 'Let the Sandbox save reports to this PC'; Set-Access $optProtected 'Protected Client mode'; Set-Access $optCompat 'Compatibility mode, weaker isolation'
 Set-Access $bLaunch 'Launch Sandbox review'
@@ -827,7 +891,7 @@ function Update-StepContent([int]$n) {
     $w = $p.ClientSize.Width; $h = $p.ClientSize.Height
     $pad = S 28
     $cw = [Math]::Max((S 320), $w - 2 * $pad)
-    $tw = [Math]::Min($cw, (S 620))
+    $tw = [Math]::Min($cw, (S 900))   # lead, sub-steps and options use the content width up to a comfortable reading width
     $rw = [Math]::Min($cw, (S 760))
     $p.SuspendLayout()
     $y = Set-StepHead $st $pad $tw
@@ -1246,7 +1310,7 @@ function Refresh-LastDecision {
 function Show-LastDecision($d) {
     $script:LastDecision = $d
     if (-not $d) {
-        $lastDec.Text = 'No decision recorded yet. In the Sandbox: Decision tab > Record decision (needs "save reports to this PC" ticked in step 4).'
+        $lastDec.Text = 'No decision recorded yet. In the Sandbox: Decision tab > Record decision (needs "save reports to this PC" selected in step 4).'
         $lastDec.ForeColor = $C.TextMuted; $bCopyBlock.Enabled = $false
         return
     }
@@ -1685,12 +1749,15 @@ $bLaunch.Add_Click({
         $script:LaunchState = 'Starting'; $script:LaunchStarted = Get-Date; $script:SandboxSeen = $false
         Update-Stepper
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Could not start Windows Sandbox:`r`n$($_.Exception.Message)`r`n`r`nTry again with 'Compatibility mode' ticked.", 'Launch failed', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Could not start Windows Sandbox:`r`n$($_.Exception.Message)`r`n`r`nTry again with 'Compatibility mode' selected.", 'Launch failed', 'OK', 'Error') | Out-Null
     }
 })
 
 $checksPanel.Add_Resize({ if ($script:LayoutReady) { foreach ($ctl in $checksPanel.Controls) { $ctl.Width = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24)); Fit-CheckRow $ctl } } })
 if (-not $Screenshot) { $form.Add_Shown({
+    Close-LauncherSplash
+    # The console is hidden, so this process may have lost the right to come to the front: ask for it explicitly.
+    try { $form.Activate(); $form.TopMost = $true; $form.TopMost = $false; $form.BringToFront() } catch { $null = $_ } # cosmetic
     $form.Refresh()
     [void](Test-ConfigChanged $ConfigFile ([ref]$script:ConfigStamp))
     Refresh-Incoming        # Incoming and Reports first, so the first readiness result already lands on the right step
@@ -1700,6 +1767,7 @@ if (-not $Screenshot) { $form.Add_Shown({
     Update-StepLayout
 }) }
 $form.Add_FormClosing({
+    Exit-LauncherMutex
     $incomingTimer.Stop(); $timer.Stop(); $waitTimer.Stop()
     # The release-request dialog is modal, so this should never find one. If it does, closing it signs out of Exchange Online (its FormClosing calls Close-RrSession).
     foreach ($owned in @($form.OwnedForms)) { try { $owned.Close() } catch { $null = $_ } } # best effort on the way out
@@ -1808,4 +1876,8 @@ if ($Screenshot) {
 }
 
 $ErrorActionPreference = 'Continue'
-[void]$form.ShowDialog()
+# ShowDialog() with no owner adopts the active window, which is the splash: closing the splash would then close the launcher.
+# An owner whose handle is zero means "no owner". Without that object (restricted language mode) the splash goes first.
+$noOwner = $null
+try { $noOwner = New-Object System.Windows.Forms.NativeWindow } catch { $noOwner = $null } # restricted language mode
+if ($noOwner) { [void]$form.ShowDialog($noOwner) } else { Close-LauncherSplash; [void]$form.ShowDialog() }

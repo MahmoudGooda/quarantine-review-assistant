@@ -462,7 +462,7 @@ Describe 'Launcher: step texts' {
     It 'step 3 offers the optional Fetch release requests button and sub-step' {
         $t = [IO.File]::ReadAllText($script:LauncherPath)
         $t.Contains("New-QraButton 'Fetch release requests' 'Secondary'") | Should -BeTrue
-        $t.Contains("(New-SubStep 'Optional: Fetch release requests saves the messages you tick straight into this folder.' 'Fetch release requests')") | Should -BeTrue
+        $t.Contains("(New-SubStep 'Optional: Fetch release requests saves the messages you select straight into this folder.' 'Fetch release requests')") | Should -BeTrue
         $t.Contains("Show-ReleaseRequestDialog -Incoming `$Incoming -Owner `$form") | Should -BeTrue
         $t.Contains(". (Join-Path `$PSScriptRoot 'ReleaseRequests.ps1')") | Should -BeTrue -Because 'dot-sourced without arguments'
     }
@@ -559,5 +559,63 @@ Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
         try { $r = Invoke-LauncherShots $dir } finally { Remove-Item Env:\QRA_UI_FALLBACK -ErrorAction SilentlyContinue }
         $r.Exit | Should -Be 0 -Because $r.Output
         foreach ($s in $script:ShotStates) { Test-Path -LiteralPath (Join-Path $dir "launcher-$s.png") | Should -BeTrue -Because $s }
+    }
+}
+
+Describe 'Launcher: start-up (splash, single instance, bring to front)' {
+    BeforeAll { $script:LauncherText = [IO.File]::ReadAllText($script:LauncherPath) }
+    It 'shows a plain-WinForms splash before the UI kit is loaded, only for a real GUI run' {
+        $t = $script:LauncherText
+        $kit = $t.IndexOf("QraUi.ps1')")
+        $splash = $t.IndexOf("'Starting...'")
+        $splash | Should -BeGreaterThan 0
+        $splash | Should -BeLessThan $kit -Because 'the splash must be up before the slow part starts'
+        $t.Contains('FromArgb(17, 38, 66)') | Should -BeTrue
+        $t.Contains("`$spT.Text = 'Quarantine Review Assistant'") | Should -BeTrue
+        $t.Contains("`$sp.FormBorderStyle = 'None'") | Should -BeTrue
+        $t.Contains('$sp.ShowInTaskbar = $false; $sp.TopMost = $true') | Should -BeTrue
+        $t.Contains('Screen]::FromPoint([System.Windows.Forms.Cursor]::Position)') | Should -BeTrue
+        $t.Contains('[System.Windows.Forms.Application]::DoEvents()') | Should -BeTrue
+        $t.Contains('$startGui = (-not $Screenshot) -and (-not $NoGui)') | Should -BeTrue
+        $t.Substring(0, $kit) | Should -Not -Match 'Name Win2' -Because 'the splash needs no native code from the kit'
+    }
+    It 'closes the splash in the Shown handler and in the trap' {
+        $t = $script:LauncherText
+        $t.Substring($t.IndexOf('trap {'), 200) | Should -Match 'Close-LauncherSplash'
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 300) | Should -Match 'Close-LauncherSplash'
+    }
+    It 'brings the window to the front in the Shown handler' {
+        $t = $script:LauncherText
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 700) | Should -Match '\$form\.Activate\(\); \$form\.TopMost = \$true; \$form\.TopMost = \$false; \$form\.BringToFront\(\)'
+        $t | Should -Match 'Enable-QraForeground; Hide-QraConsole'
+    }
+    It 'allows only one launcher: named mutex, wake the first window, release on close' {
+        $t = $script:LauncherText
+        $t.Contains("'Local\QuarantineReviewAssistant.Launcher'") | Should -BeTrue
+        $t.Contains("-like 'Quarantine Review Assistant * - Host Launcher'") | Should -BeTrue
+        $t.Contains('ShowWindow($other.MainWindowHandle, 9)') | Should -BeTrue
+        $t.Contains('SetForegroundWindow($other.MainWindowHandle)') | Should -BeTrue
+        $t.Substring($t.IndexOf('$form.Add_FormClosing({'), 200) | Should -Match 'Exit-LauncherMutex'
+        $t.IndexOf('System.Threading.Mutex') | Should -BeLessThan $t.IndexOf("'Starting...'") -Because 'a second launcher must leave before it shows a splash'
+    }
+    It 'runs without the splash or the mutex in -NoGui mode' {
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath -NoGui 2>&1 | Out-String
+        $out | Should -Match 'Windows edition'
+    }
+}
+
+Describe 'Launcher: layout widths' {
+    It 'lead and sub-steps use the content width up to a reading width of 900, not 620' {
+        $t = [IO.File]::ReadAllText($script:LauncherPath)
+        $t.Contains('$tw = [Math]::Min($cw, (S 900))') | Should -BeTrue
+        $t.Contains('(S 620)') | Should -BeFalse
+        $t.Contains('$rw = [Math]::Min($cw, (S 760))') | Should -BeTrue -Because 'the step-3 list and button row keep their own width'
+    }
+}
+
+Describe 'Launcher: wording' {
+    It 'has no tick/ticked/unticked in any user-facing string' {
+        $strings = $script:LauncherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
+        @($strings | Where-Object { $_.Value -match '(?i)\b(un)?tick(ed)?\b' } | ForEach-Object { $_.Value }) | Should -BeNullOrEmpty
     }
 }
