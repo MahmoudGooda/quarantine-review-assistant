@@ -1,5 +1,5 @@
 ﻿# Quarantine Review Assistant - release-request intake (optional, v2.3).
-# Lists messages that have a pending release request through Exchange Online PowerShell and saves the ones the reviewer ticks
+# Lists messages that have a pending release request through Exchange Online PowerShell and saves the ones the reviewer selects
 # as password-protected ZIPs in Incoming. Read-only: it never releases, deletes or blocks anything and never opens a message.
 # Dot-sourced by Launcher.ps1 (functions only, no window) or run on its own:  ReleaseRequests.ps1 [-Incoming <folder>] [-Screenshot <folder>]
 # Windows PowerShell 5.1 compatible. ASCII only (glyphs are built from char codes).
@@ -420,7 +420,7 @@ function Update-RrSaveButton($d) {
     if (-not $d -or -not $d.Ready) { return }
     $k = $d.Ctl
     $k.BSave.Enabled = ($d.ConnectState -eq 'done') -and (-not $d.Work) -and ($d.ListState -ne 'loading') -and ($k.List.CheckedItems.Count -ge 1) -and ($k.Pw.Text.Length -ge 1)
-    if ($d.ListState -eq 'loaded') {   # keep the ticked count under the list current
+    if ($d.ListState -eq 'loaded') {   # keep the selected count under the list current
         $d.ListMsg = Get-RrListNote @($d.Rows).Count $k.List.CheckedItems.Count
         $k.LblList.Text = $d.ListMsg
     }
@@ -450,8 +450,8 @@ function Update-RrView($d) {
         if ($connected) { $d.Steps[1].Sum.Text = 'Signed in. This window signs out again when you close it.' }
         elseif ($installed) { $d.Steps[1].Sum.Text = 'Sign in with your work account. This tool only reads the release requests.' }
         else { $d.Steps[1].Sum.Text = 'Opens the Microsoft sign-in window.' }
-        $d.Steps[2].Sum.Text = $(if ($connected) { 'Nothing is ticked by default. Tick the messages to save.' } else { 'Lists the messages that have a pending release request.' })
-        $d.Steps[3].Sum.Text = 'Saves each ticked message as a password-protected ZIP.'
+        $d.Steps[2].Sum.Text = $(if ($connected) { 'Nothing is selected by default. Select the messages to save.' } else { 'Lists the messages that have a pending release request.' })
+        $d.Steps[3].Sum.Text = 'Saves each selected message as a password-protected ZIP.'
 
         # ---- hide every optional control, then show what the state needs
         Hide-RrControls @($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
@@ -607,13 +607,13 @@ function Set-RrRows($d, $rows) {
     } finally { $lv.EndUpdate() }
 }
 
-function Get-RrListNote([int]$count, [int]$ticked = 0) {
+function Get-RrListNote([int]$count, [int]$picked = 0) {
     if ($count -eq 0) { return 'No pending release requests in this period.' }
     $word = $(if ($count -eq 1) { 'request' } else { 'requests' })
-    $tickText = $(if ($ticked -eq 0) { 'Nothing is ticked yet.' } else { "$ticked ticked." })
+    $pickText = $(if ($picked -eq 0) { 'Nothing is selected yet.' } else { "$picked selected." })
     $cap = Get-RrCapMessage $count
-    if ($cap) { return "$cap $tickText" }
-    "$count pending release $word. $tickText"
+    if ($cap) { return "$cap $pickText" }
+    "$count pending release $word. $pickText"
 }
 
 function Get-RrDialogSession($d) {
@@ -818,6 +818,7 @@ function New-RrDialog {
     $form.MinimumSize = New-Object System.Drawing.Size(760, 640)
     $form.StartPosition = 'CenterScreen'
     $form.BackColor = $C.Surface
+    Set-QraWindowChrome $form -NoAppId:([bool]$NoAutoStart)   # NoAutoStart is the screenshot/test build: it must not rename this process in the taskbar
 
     $header = New-Object System.Windows.Forms.Panel
     $header.Dock = 'Top'; $header.Height = 78; $header.BackColor = $C.Header
@@ -989,9 +990,9 @@ function New-RrDialog {
     Set-Access $k.Days 'Days to look back'
     Set-Access $k.Recip 'Recipient address filter, optional'
     Set-Access $k.BRefresh 'Refresh the list of release requests'
-    Set-Access $k.List 'Release requests, tick the messages to save'
+    Set-Access $k.List 'Release requests, select the messages to save'
     Set-Access $k.Pw 'Download password'
-    Set-Access $k.BSave 'Save the ticked messages to Incoming'
+    Set-Access $k.BSave 'Save the selected messages to Incoming'
     Set-Access $k.Rej 'Details of the rejected export'
     Set-Access $k.BCopyDet 'Copy the details of the rejected export'
     Set-Access $k.BClose 'Close this window'

@@ -104,8 +104,8 @@ Instead of downloading each message by hand in the Defender portal, the launcher
 launcher. Manual download from the portal still works and stays the default.
 
 - **You choose, per message.** The list shows only Received, Sender, Recipient, Subject, Quarantine type and Expires, and every
-  checkbox starts unticked. Nothing is downloaded automatically and there is no select-all by default.
-- **Each ticked message is saved as one password-protected ZIP** in `Incoming`. The whole message goes into one ZIP and its
+  checkbox starts unselected. Nothing is downloaded automatically and there is no select-all by default.
+- **Each selected message is saved as one password-protected ZIP** in `Incoming`. The whole message goes into one ZIP and its
   attachments stay inside the encrypted ZIP. The launcher checks the ZIP signature and that every entry is encrypted before it writes
   the file, and it never writes an `.eml` or any other file type.
 - **Use the same download password in the Sandbox.** You type it once per batch in the dialog (it is not stored or shown again), then

@@ -62,7 +62,7 @@ This is the complete list. A test fails the build if a runtime file contains a U
 Calls the tool makes:
 
 - `https://www.python.org/ftp/python/3.14.8/python-3.14.8-embed-amd64.zip`: the official Python embeddable package, downloaded **once** by the launcher on the host when the reviewer clicks **Download**. The file is checked against a pinned SHA-256 in `Launcher.ps1` and nothing is installed if it does not match.
-- Optional intake (v2.3) only, and only when the reviewer opens the dialog: `login.microsoftonline.com` (the standard Microsoft sign-in) and `outlook.office365.com` (Exchange Online: message list metadata and the encrypted ZIP bytes of the messages the reviewer ticks). The module chooses the exact endpoints for your cloud.
+- Optional intake (v2.3) only, and only when the reviewer opens the dialog: `login.microsoftonline.com` (the standard Microsoft sign-in) and `outlook.office365.com` (Exchange Online: message list metadata and the encrypted ZIP bytes of the messages the reviewer selects). The module chooses the exact endpoints for your cloud.
 - Optional intake only, and only if the reviewer clicks the install button: `www.powershellgallery.com` (PowerShell Gallery, to install the `ExchangeOnlineManagement` module for the current user).
 
 Nothing else. The Sandbox has no network at all.
@@ -76,7 +76,7 @@ These are links the reviewer's browser opens. The tool itself makes no request t
 ## What the host shows during intake
 
 The intake list has six columns: **Received, Sender, Recipient, Subject, Quarantine type, Expires**. That is all. No message body and
-no attachment is opened or shown on the host. The reviewer ticks the messages to export; none is ticked by default.
+no attachment is opened or shown on the host. The reviewer selects the messages to export; none is selected by default.
 
 ## Permissions
 

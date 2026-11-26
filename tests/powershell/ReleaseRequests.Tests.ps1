@@ -168,13 +168,13 @@ Describe 'ReleaseRequests: listing' {
         $rows[0].QuarantineTypes | Should -Be 'HighConfPhish'
         $rows[0].Expires | Should -Be ([datetime]'2026-12-25')
     }
-    It 'writes the list note: empty, nothing ticked, some ticked, capped' {
+    It 'writes the list note: empty, nothing selected, some selected, capped' {
         Get-RrListNote 0 0 | Should -Be 'No pending release requests in this period.'
-        Get-RrListNote 5 0 | Should -Be '5 pending release requests. Nothing is ticked yet.'
-        Get-RrListNote 5 2 | Should -Be '5 pending release requests. 2 ticked.'
-        Get-RrListNote 1 0 | Should -Be '1 pending release request. Nothing is ticked yet.'
+        Get-RrListNote 5 0 | Should -Be '5 pending release requests. Nothing is selected yet.'
+        Get-RrListNote 5 2 | Should -Be '5 pending release requests. 2 selected.'
+        Get-RrListNote 1 0 | Should -Be '1 pending release request. Nothing is selected yet.'
         Get-RrListNote 1000 0 | Should -BeLike 'Showing the first 1000. Narrow the date range or filter by recipient.*'
-        Get-RrListNote 1000 3 | Should -Be 'Showing the first 1000. Narrow the date range or filter by recipient. 3 ticked.'
+        Get-RrListNote 1000 3 | Should -Be 'Showing the first 1000. Narrow the date range or filter by recipient. 3 selected.'
     }
     It 'shows the cap message only at 1000 rows or more' {
         Get-RrCapMessage 999 | Should -Be ''
@@ -800,5 +800,23 @@ Describe 'ReleaseRequests: source scans' {
     It 'is plain ASCII after the BOM' {
         $bytes = [IO.File]::ReadAllBytes($script:RrPath)
         @($bytes[3..($bytes.Length - 1)] | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+    }
+}
+
+Describe 'Release requests: wording and window chrome' {
+    It 'has no tick/ticked/unticked in any user-facing string' {
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:RrPath, [ref]$tokens, [ref]$errs)
+        $strings = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
+        @($strings | Where-Object { $_.Value -match '(?i)\b(un)?tick(ed)?\b' } | ForEach-Object { $_.Value }) | Should -BeNullOrEmpty
+    }
+    It 'uses select wording in the step summaries' {
+        $t = [IO.File]::ReadAllText($script:RrPath)
+        $t.Contains("'Nothing is selected by default. Select the messages to save.'") | Should -BeTrue
+        $t.Contains("'Saves each selected message as a password-protected ZIP.'") | Should -BeTrue
+    }
+    It 'gives the dialog the app icon and the taskbar identity (not for the screenshot build)' {
+        $t = [IO.File]::ReadAllText($script:RrPath)
+        $t.Contains('Set-QraWindowChrome $form -NoAppId:([bool]$NoAutoStart)') | Should -BeTrue
     }
 }

@@ -10,7 +10,7 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
 ### Added
 - **Release-request intake (optional).** A **Fetch release requests** button in step 3 of the launcher opens a dialog that lists
   quarantined messages with a pending release request (Received, Sender, Recipient, Subject, Quarantine type, Expires) through
-  read-only Exchange Online PowerShell. Every checkbox starts unticked and each ticked message is exported on its own. The default
+  read-only Exchange Online PowerShell. Every checkbox starts unselected and each selected message is exported on its own. The default
   window is 16 days (maximum 30) and the list shows up to 1000 rows.
 - **Encrypted ZIP only.** An export is written to `Incoming` as a password-protected ZIP only after its bytes pass a check: ZIP
   signature, a readable central directory, at least one entry, and the encryption flag on every entry. A rejected export writes
