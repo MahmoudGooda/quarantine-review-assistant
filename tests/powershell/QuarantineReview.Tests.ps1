@@ -560,9 +560,12 @@ $tabs.SelectedTab = $tAttach; [System.Windows.Forms.Application]::DoEvents()
 'min2=' + (S 280)
 'min1=' + (S 200)
 'minsizes=' + $attSplit.Panel1MinSize + '/' + $attSplit.Panel2MinSize
-$attSplit.SplitterDistance = (S 300); $script:AttSplitMoved = $true
+# Drag to a position the minimum pane widths allow on any screen (CI runners have small screens), away from the 45 % point.
+$lo = $attSplit.Panel1MinSize; $hi = $attSplit.Width - $attSplit.Panel2MinSize - $attSplit.SplitterWidth
+$target = $(if (($attSplit.SplitterDistance - $lo) -gt 10) { $lo } else { $hi })
+$attSplit.SplitterDistance = $target; $script:AttSplitMoved = $true
 Set-AttachmentSplit
-'afterdrag=' + $attSplit.SplitterDistance + '/' + (S 300)
+'afterdrag=' + $attSplit.SplitterDistance + '/' + $target
 $form.Dispose(); exit 0
 '@
         $idx = $text.LastIndexOf('[void]$form.ShowDialog()')
