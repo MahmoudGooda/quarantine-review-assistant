@@ -1,0 +1,70 @@
+{
+  "description": "Same structure as the public demo: six images plus a ZIP holding an executable, a deceptive link, compauth fail and a Microsoft blocked-file-type verdict.",
+  "exit_code": 0,
+  "assessment_level": "HIGH RISK",
+  "decision": {
+    "outcome": "DELETE",
+    "title": "DELETE AND BLOCK",
+    "confidence": "High",
+    "message_type": "Malware / phishing attachment",
+    "why": "2 of 4 independent checks are red."
+  },
+  "container": {
+    "password_status": "ok",
+    "encryption": "zipcrypto",
+    "messages": 1
+  },
+  "attachment_count": 7,
+  "findings": [
+    {
+      "code": "RISKY_EXT",
+      "severity": "high",
+      "where": "Message 1 > Weekly-schedule.zip > Schedule-demo.exe"
+    },
+    {
+      "code": "EXECUTABLE",
+      "severity": "high",
+      "where": "Message 1 > Weekly-schedule.zip > Schedule-demo.exe"
+    },
+    {
+      "code": "COMPAUTH_FAIL",
+      "severity": "medium",
+      "where": "Message 1"
+    },
+    {
+      "code": "EOP_VERDICT",
+      "severity": "info",
+      "where": "Message 1"
+    }
+  ],
+  "tree": [
+    {
+      "path": [
+        "Weekly-schedule.zip",
+        "Schedule-demo.exe"
+      ]
+    }
+  ],
+  "scorecard": {
+    "sender": "amber",
+    "files": "red",
+    "links": "red",
+    "ask": "green",
+    "microsoft": "blue"
+  },
+  "iocs_sha256_count": 1,
+  "finding_count": 4,
+  "link_count": 2,
+  "urls": [
+    {
+      "defanged_contains": "destination[.]invalid/demo",
+      "severity": "high",
+      "flag_contains": "link text shows \"display.invalid\" but goes elsewhere"
+    },
+    {
+      "defanged_contains": "display[.]invalid/demo",
+      "severity": "info",
+      "flag_contains": ""
+    }
+  ]
+}

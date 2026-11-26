@@ -1,0 +1,43 @@
+{
+  "description": "SPF/DKIM/DMARC fail but nothing else is wrong: verify, do not delete.",
+  "exit_code": 0,
+  "assessment_level": "SUSPICIOUS",
+  "decision": {
+    "outcome": "VERIFY",
+    "title": "KEEP QUARANTINED - VERIFY FIRST",
+    "confidence": "Medium",
+    "auth_only": true,
+    "spoof_pair": "sender.example, hosting.example"
+  },
+  "findings": [
+    {
+      "code": "DMARC_FAIL",
+      "severity": "medium",
+      "where": "Message 1"
+    },
+    {
+      "code": "SPF_FAIL",
+      "severity": "medium",
+      "where": "Message 1"
+    },
+    {
+      "code": "COMPAUTH_FAIL",
+      "severity": "medium",
+      "where": "Message 1"
+    }
+  ],
+  "max_severity": "medium",
+  "absent_codes": [
+    "BEC_PAYMENT",
+    "EXECUTABLE",
+    "RISKY_EXT",
+    "DISPLAY_SPOOF",
+    "LOOKALIKE"
+  ],
+  "scorecard": {
+    "sender": "amber",
+    "files": "green",
+    "links": "green",
+    "ask": "green"
+  }
+}

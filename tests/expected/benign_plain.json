@@ -1,0 +1,24 @@
+{
+  "description": "Plain, authenticated mail with no links or attachments.",
+  "exit_code": 0,
+  "assessment_level": "NO STRONG INDICATORS",
+  "decision": {
+    "outcome": "RELEASE",
+    "title": "RELEASE AFTER QUICK CHECKS",
+    "confidence": "High",
+    "message_type": "Ordinary message"
+  },
+  "container": {
+    "password_status": "ok",
+    "encryption": "zipcrypto",
+    "messages": 1
+  },
+  "max_severity": "info",
+  "attachment_count": 0,
+  "scorecard": {
+    "sender": "green",
+    "files": "green",
+    "links": "green",
+    "ask": "green"
+  }
+}

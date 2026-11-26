@@ -1,0 +1,3 @@
+# Test-only tools. The shipped tool itself uses the Python standard library only.
+pytest==9.2.0
+pyzipper==0.4.0

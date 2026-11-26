@@ -1,0 +1,42 @@
+{
+  "description": "Same message, outer ZIP protected with AES-256.",
+  "exit_code": 0,
+  "assessment_level": "HIGH RISK",
+  "decision": {
+    "outcome": "DELETE",
+    "title": "DELETE AND BLOCK",
+    "confidence": "High",
+    "message_type": "Malware / phishing attachment",
+    "why": "2 of 4 independent checks are red."
+  },
+  "container": {
+    "password_status": "ok",
+    "encryption": "aes",
+    "messages": 1
+  },
+  "findings": [
+    {
+      "code": "RISKY_EXT",
+      "severity": "high",
+      "where": "Message 1 > Weekly-schedule.zip > Schedule-demo.exe"
+    },
+    {
+      "code": "EXECUTABLE",
+      "severity": "high",
+      "where": "Message 1 > Weekly-schedule.zip > Schedule-demo.exe"
+    },
+    {
+      "code": "COMPAUTH_FAIL",
+      "severity": "medium",
+      "where": "Message 1"
+    },
+    {
+      "code": "EOP_VERDICT",
+      "severity": "info",
+      "where": "Message 1"
+    }
+  ],
+  "attachment_count": 7,
+  "finding_count": 4,
+  "link_count": 2
+}

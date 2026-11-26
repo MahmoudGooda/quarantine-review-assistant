@@ -1,0 +1,32 @@
+{
+  "description": "Bank-detail change with a checksum-valid test IBAN and a secrecy request; no attachment.",
+  "exit_code": 0,
+  "assessment_level": "HIGH RISK",
+  "decision": {
+    "outcome": "DELETE",
+    "title": "DELETE AND BLOCK",
+    "message_type": "Business email compromise (payment / gift-card fraud)"
+  },
+  "attachment_count": 0,
+  "ibans": [
+    "GB82 WEST 1234 5698 7654 32"
+  ],
+  "findings": [
+    {
+      "code": "BEC_PAYMENT",
+      "severity": "high",
+      "where": "Message 1"
+    },
+    {
+      "code": "SECRECY",
+      "severity": "high",
+      "where": "Message 1"
+    }
+  ],
+  "scorecard": {
+    "sender": "green",
+    "files": "green",
+    "links": "green",
+    "ask": "red"
+  }
+}

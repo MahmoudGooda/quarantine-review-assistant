@@ -1,0 +1,71 @@
+# Changelog
+
+All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/), and the version number is
+the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both READMEs (a Pester test enforces that).
+
+## [Unreleased]
+
+## [2.2.0] - 2026-11-25
+
+First release from the public repository.
+
+### Fixed
+- Uninspected nested content prevents a release recommendation. Packages containing several messages require individual review before the tool offers sender or blocking actions.
+- Attachment-password reporting records the source of a successful password. Legacy reports with password fields require reanalysis.
+- Spreadsheet-sensitive fields are escaped in the decision CSV. Each save target publishes its completed decision after the reports and audit entry succeed. The launcher checks the incoming file's SHA-256 before offering its block list.
+- The release ZIP includes the license and third-party notices. CI installs the Windows test dependencies and runs ScriptAnalyzer on each source directory. Git ignores mail files and ZIP archives inside the tests directory.
+- **A failed save was silent.** `Save-DecisionRecord` and **Save report** wrapped every target in an empty `catch {}`.
+  *Repro (v2.1.1):* tick "save reports to this PC", open `Reports\decisions-log.csv` in Excel on the host (it locks the file), then click
+  **Record decision** in the Sandbox. The write to the host folder fails, nothing says so, and the dialog lists only `C:\Work (inside Sandbox -
+  deleted on close)`. If every target fails, the dialog says "Saved to:" followed by nothing.
+  *Now:* every target is tried on its own, the dialog names each target that failed with the reason, and if nothing could be written it shows
+  an error ("NOT SAVED") and never says "Saved".
+- **Contrast (WCAG 2.1 AA, 4.5:1).** Amber question text was 3.24:1, white on the amber banner and cards was 3.02:1 to 3.59:1, and the warning
+  colour was 3.58:1 to 3.87:1. The amber banner is now `(160, 82, 0)` (5.67:1 with white), and amber text on light backgrounds and the warning
+  colour are `(150, 85, 0)` (5.27:1 or more). The `SUSPICIOUS` entry of the old `$Levels` table was never used: the banner users see is the
+  amber decision colour, and that is what changed.
+- **High-DPI displays.** Both windows are now DPI-aware, scale their layout at 125 %, 150 % and 175 %, and never open larger than the screen.
+  The review window reduces horizontal tab padding at narrower widths so all eight labels fit at 175% scaling at the minimum window size.
+- **Findings tab:** the "Where" column no longer hides the path. Columns are sized to their text, hovering a row shows the full path, and a box
+  under the list shows the selected finding's title, severity, full location, ATT&CK ID and details.
+- **Defender steps box** is as tall as its text instead of a fixed, mostly empty rectangle.
+
+### Added
+- Keyboard: `Ctrl+1` ... `Ctrl+8` switch tabs, `Ctrl+S` saves the report, a visible focus ring on buttons, and a logical tab order.
+- Accessible names on every input, button, list and status chip, and a status word for every launcher check.
+- Tests: a synthetic sample generator (ZipCrypto and AES-256 Defender-style packages), analyzer tests through the CLI, Pester tests for
+  script syntax, file encoding and version numbers, a release build script, and CI.
+- **Guided step rail in both windows.** The launcher shows five steps (Prepare this PC, Check it in Defender, Download the message, Analyze in
+  the Sandbox, Act in Defender and clean up) with a status for each; the review window is a four-step accordion (Choose the package, Enter the
+  download password, Analyze, Decide) that opens the step you are on and folds finished steps to a one-line summary. Step 1 of the launcher
+  now lists what to do (wait, fix the red item, check again).
+- **Loading states.** A readiness spinner while the launcher checks the PC, a determinate progress bar for the Python download, tracking of the
+  Sandbox launch (starting, review in progress), and in the review window a stage tracker (Reading file, Opening package, Analysing, Building
+  report) with a large spinner, an elapsed time and a **Cancel** button. The painted spinner appears only after 300 ms, so quick work never flashes (the plain fallback spinner shows at once).
+- **-Screenshot <folder>** for both scripts (with -ScreenshotDpi <n> and -ScreenshotMinSize, and -ScreenshotResult <report.json> for the
+  review window): renders every step state from built-in fake data to PNG files, headless, without reading Incoming or starting Python or
+  the Sandbox. Used for the layout checks at emulated display scales (`-ScreenshotDpi` 96, 120, 144 and 168), not on real 125 %, 150 % or 175 % displays.
+
+### Changed
+- The version number is `2.2.0` everywhere, including `inspect_eml.py`.
+- `.py` and `.md` files use LF line endings. `.cmd` and `.ps1` files keep CRLF, and the runtime `.ps1` files keep their UTF-8 BOM.
+- **Shared UI kit `app/QraUi.ps1`** (packaged with the release): DPI helpers, one set of colour tokens (every text pair is at least 4.5:1,
+  control borders and the focus ring at least 3:1), Windows 11 fonts with a Windows 10 fallback, and painted controls (rounded cards,
+  spinner, step badges, status pills, buttons with hover, pressed and focus states) written in C# and compiled once. If the compile fails,
+  the language mode is not Full Language, or `QRA_UI_FALLBACK=1` is set, plain WinForms controls are used instead (in Constrained Language Mode
+  WinForms itself cannot load, so the windows cannot start there: allow the tool folder through AppLocker/WDAC so it runs in Full Language). With high contrast on, the
+  painted controls stay but use system colours and draw no shadow or gradient.
+  Also a background-work helper (`Start-QraWork`) that keeps the window responsive.
+- **Premium restyle of both windows**: rounded cards on a light surface, a navy header with status pills, painted buttons with hover, pressed
+  and focus states, one type scale, and consistent spacing.
+
+### Removed
+- A duplicated `$optReports.Checked = $true` line in the launcher, and an empty loop in `assess()` of the analyzer (it had no side effects,
+  and the reports for all test samples are identical without it).
+
+## 2.1.1 - internal release
+
+Used internally before the repository was published. It was never released publicly; it is listed only because the 2.2.0 fixes refer to it.
+
+[Unreleased]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/MahmoudGooda/quarantine-review-assistant/releases/tag/v2.2.0

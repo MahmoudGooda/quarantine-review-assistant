@@ -1,0 +1,22 @@
+{
+  "description": "HTML attachment that builds a file in the browser (Blob + download).",
+  "exit_code": 0,
+  "assessment_level": "HIGH RISK",
+  "decision": {
+    "outcome": "DELETE",
+    "title": "DELETE AND BLOCK",
+    "message_type": "Malware / phishing attachment"
+  },
+  "findings": [
+    {
+      "code": "HTML_SMUGGLING",
+      "severity": "high",
+      "where": "Message 1 > Remittance-advice.html"
+    },
+    {
+      "code": "HTML_ATTACHMENT",
+      "severity": "medium",
+      "where": "Message 1 > Remittance-advice.html"
+    }
+  ]
+}

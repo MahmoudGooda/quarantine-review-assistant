@@ -1,0 +1,27 @@
+# ---- Created by the launcher or the Sandbox (anchored, so they can never match tools/ or tests/)
+/src/SecurityReview/Incoming/*
+!/src/SecurityReview/Incoming/PLACE_ZIP_HERE.txt
+/src/SecurityReview/Reports/
+/src/SecurityReview/Profiles/
+/src/SecurityReview/Tools/
+/src/SecurityReview/config/organization.json
+
+# ---- Mail and archives never belong in the repo (the generated test samples live in the ignored tests/.samples)
+*.eml
+*.msg
+*.zip
+/tests/.samples/
+
+# ---- Build output and local tooling
+/dist/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.vscode/
+.idea/
+Thumbs.db
+.superpowers/
+
+# ---- Internal working docs
+/docs/superpowers/

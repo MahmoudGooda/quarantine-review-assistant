@@ -1,0 +1,18 @@
+{
+  "description": "Same message, outer ZIP protected with AES-256.",
+  "exit_code": 0,
+  "assessment_level": "NO STRONG INDICATORS",
+  "decision": {
+    "outcome": "RELEASE",
+    "title": "RELEASE AFTER QUICK CHECKS",
+    "confidence": "High",
+    "message_type": "Ordinary message"
+  },
+  "container": {
+    "password_status": "ok",
+    "encryption": "aes",
+    "messages": 1
+  },
+  "max_severity": "info",
+  "attachment_count": 0
+}

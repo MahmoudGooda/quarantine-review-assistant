@@ -1,0 +1,18 @@
+* text=auto
+
+# Runtime files: the Windows launcher and Windows PowerShell 5.1 need these exact line endings.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+/src/SecurityReview/Incoming/*.txt text eol=crlf
+
+*.py  text eol=lf
+*.md  text eol=lf
+/LICENSE text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+
+*.png binary
+*.gif binary
+*.zip binary
