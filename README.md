@@ -88,6 +88,8 @@ official Python embeddable package from python.org, once, checked against a pinn
    and check its `.sha256`. Extract the `SecurityReview` folder to a **local, non-synced** drive, for example `D:\SecurityReview`.
 2. Double-click **`Start-Here.cmd`**. Step 1, **Prepare this PC**, checks the PC and offers buttons to install Windows Sandbox and to
    download the analysis runtime.
+   Optional: **Create desktop shortcut** (next to **Check again**) puts a launcher shortcut on your Desktop. If you move the folder,
+   create the shortcut again.
 3. Steps 2 and 3 of the launcher cover Defender: open the quarantined message and choose **Download message** with a password. Save
    the ZIP into `Incoming` without opening it, then click **Launch Sandbox review** (step 4, **Analyze in the Sandbox**).
 4. In the Sandbox window, choose the package, type the password and press **Enter**. Read the **Decision** tab, then in step 5,
@@ -105,7 +107,7 @@ launcher. Manual download from the portal still works and stays the default.
 
 - **One row per message, and you choose.** Exchange keeps one quarantine row per recipient copy, so a message sent to seven people is
   seven rows. The list groups them and shows one row per message with Received, Sender, Subject, Quarantine type, Copies and Expires.
-  **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`, and a message that was
+  **Copies** summarises the recipient copies by status, for example `2 pending Â· 2 released Â· 3 not requested`, and a message that was
   already released to some recipients is flagged. Every checkbox starts unselected. Nothing is downloaded automatically and there is
   no select-all by default.
   Microsoft lists quarantined messages either once per message or once per recipient (per-recipient since early 2026); the dialog groups both into one row per message.

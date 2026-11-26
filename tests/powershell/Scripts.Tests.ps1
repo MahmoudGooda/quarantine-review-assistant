@@ -82,7 +82,7 @@ Describe 'build-release.ps1' {
         $expected = @('SecurityReview/Start-Here.cmd', 'SecurityReview/Start-Review.cmd', 'SecurityReview/README.md',
             'SecurityReview/LICENSE', 'SecurityReview/THIRD_PARTY_NOTICES.md',
             'SecurityReview/app/Launcher.ps1', 'SecurityReview/app/QuarantineReview.ps1', 'SecurityReview/app/Enable-Sandbox.ps1', 'SecurityReview/app/QraUi.ps1', 'SecurityReview/app/ReleaseRequests.ps1',
-            'SecurityReview/app/inspect_eml.py', 'SecurityReview/Incoming/PLACE_ZIP_HERE.txt') | Sort-Object
+            'SecurityReview/app/inspect_eml.py', 'SecurityReview/app/assets/splash.jpg', 'SecurityReview/Incoming/PLACE_ZIP_HERE.txt') | Sort-Object
         $names | Should -Be $expected
     }
     It 'ships the repository license and third-party notices verbatim' {

@@ -75,7 +75,7 @@ These are links the reviewer's browser opens. The tool itself makes no request t
 
 ## What the host shows during intake
 
-The intake list shows one row per message (Exchange keeps one quarantine row per recipient copy, and the tool groups them). It has six columns: **Received, Sender, Subject, Quarantine type, Copies, Expires**. **Copies** summarises the recipient copies by status, for example `2 pending · 2 released · 3 not requested`. No message body and
+The intake list shows one row per message (Exchange keeps one quarantine row per recipient copy, and the tool groups them). It has six columns: **Received, Sender, Subject, Quarantine type, Copies, Expires**. **Copies** summarises the recipient copies by status, for example `2 pending Â· 2 released Â· 3 not requested`. No message body and
 no attachment is opened or shown on the host. The reviewer selects the messages to export; none is selected by default. Saving exports one copy per selected message. The release decision for all copies stays in Defender. Microsoft lists quarantined messages either once per message or once per recipient (per-recipient since early 2026); the dialog groups both into one row per message. An optional view, **Also show released and denied messages** (off by default), adds messages that were already released or denied. To count the copies, the tool runs one more read-only `Get-QuarantineMessage -MessageId` lookup per listed message.
 
 ## Permissions
@@ -94,6 +94,7 @@ no attachment is opened or shown on the host. The reviewer selects the messages 
 | Audit log | `Reports\decisions-log.csv` | One row per recorded decision: reviewer, decision, recommendation, Microsoft's verdict, input SHA-256. Formula-like fields are escaped. |
 | Python runtime | `Tools\Python\` in the tool folder | Downloaded once. |
 | Sandbox profile | `Profiles\QuarantineReview.wsb` | Rewritten at each launch. |
+| Desktop shortcut (optional) | One `Quarantine Review Assistant.lnk` on the user's Desktop, and one `QuarantineReviewAssistant.ico` in the tool folder | Written only when the user clicks **Create desktop shortcut** in step 1. The shortcut starts `Start-Here.cmd`. Delete both files to remove it. |
 
 - **Disconnect** (when the intake dialog closes) ends the Exchange Online session in that window. The Windows account stays signed in to Windows, as with any other Microsoft sign-in, so a later sign-in in the same Windows session is faster.
 - **Clean-up:** after acting in Defender, close the Sandbox and click **Delete Incoming...** in the launcher (step 5). Delete `Reports\` yourself when you no longer need the history. The tool sends nothing off the PC.

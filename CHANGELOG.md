@@ -8,10 +8,14 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
 ## [2.3.0] - Unreleased
 
 ### Added
+- **Animated start-up splash.** The launcher opens with an image splash (product picture, name, version and a calm progress bar). It runs
+  on its own thread, so it keeps moving while the window is built. If the picture is missing, a plain navy splash with the same animation is used.
+- **Create desktop shortcut** button in step 1, next to **Check again**. It writes one shortcut to your Desktop and one icon file to the tool
+  folder, only when clicked, and asks before replacing an existing shortcut.
 - **Release-request intake (optional).** A **Fetch release requests** button in step 3 of the launcher opens a dialog that lists
   quarantined messages with a pending release request through read-only Exchange Online PowerShell. Exchange keeps one row per
   recipient copy, so the list shows **one row per message** (Received, Sender, Subject, Quarantine type, Copies, Expires). **Copies**
-  summarises the recipient copies by status (for example `2 pending · 2 released · 3 not requested`) and flags a message that was
+  summarises the recipient copies by status (for example `2 pending Â· 2 released Â· 3 not requested`) and flags a message that was
   already released to some recipients. An optional **Also show released and denied messages** view is off by default. Every checkbox
   starts unselected and saving exports one copy per selected message. The default window is 16 days (maximum 30) and the query returns
   up to 1000 rows.

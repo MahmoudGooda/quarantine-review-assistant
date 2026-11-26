@@ -567,7 +567,7 @@ Describe 'Launcher: start-up (splash, single instance, bring to front)' {
     It 'shows a plain-WinForms splash before the UI kit is loaded, only for a real GUI run' {
         $t = $script:LauncherText
         $kit = $t.IndexOf("QraUi.ps1')")
-        $splash = $t.IndexOf("'Starting...'")
+        $splash = $t.IndexOf("`$spT.Text = 'Quarantine Review Assistant'")
         $splash | Should -BeGreaterThan 0
         $splash | Should -BeLessThan $kit -Because 'the splash must be up before the slow part starts'
         $t.Contains('FromArgb(17, 38, 66)') | Should -BeTrue
@@ -596,7 +596,7 @@ Describe 'Launcher: start-up (splash, single instance, bring to front)' {
         $t.Contains('ShowWindow($other.MainWindowHandle, 9)') | Should -BeTrue
         $t.Contains('SetForegroundWindow($other.MainWindowHandle)') | Should -BeTrue
         $t.Substring($t.IndexOf('$form.Add_FormClosing({'), 200) | Should -Match 'Exit-LauncherMutex'
-        $t.IndexOf('System.Threading.Mutex') | Should -BeLessThan $t.IndexOf("'Starting...'") -Because 'a second launcher must leave before it shows a splash'
+        $t.IndexOf('System.Threading.Mutex') | Should -BeLessThan $t.IndexOf('if (-not (Start-LauncherSplash))') -Because 'a second launcher must leave before it shows a splash'
     }
     It 'runs without the splash or the mutex in -NoGui mode' {
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath -NoGui 2>&1 | Out-String
@@ -617,5 +617,112 @@ Describe 'Launcher: wording' {
     It 'has no tick/ticked/unticked in any user-facing string' {
         $strings = $script:LauncherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
         @($strings | Where-Object { $_.Value -match '(?i)\b(un)?tick(ed)?\b' } | ForEach-Object { $_.Value }) | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
+    BeforeAll {
+        $script:LauncherText = [IO.File]::ReadAllText($script:LauncherPath)
+        $t = $script:LauncherText
+        $script:SplashBlockText = $t.Substring($t.IndexOf('$script:LauncherSplashBlock = {'), $t.IndexOf('function Start-LauncherSplash') - $t.IndexOf('$script:LauncherSplashBlock = {'))
+    }
+    It 'runs the splash in an STA runspace with its own message loop' {
+        $t = $script:LauncherText
+        $t.Contains('RunspaceFactory]::CreateRunspace()') | Should -BeTrue
+        $t.Contains('$rs.ApartmentState = [System.Threading.ApartmentState]::STA') | Should -BeTrue
+        $t.Contains('PSThreadOptions]::ReuseThread') | Should -BeTrue
+        $script:SplashBlockText.Contains('[System.Windows.Forms.Application]::Run($win)') | Should -BeTrue
+        $script:LauncherFunctions.ContainsKey('Start-LauncherSplash') | Should -BeTrue
+    }
+    It 'uses plain WinForms and GDI+ only in the splash (no compiled or native code)' {
+        $script:SplashBlockText | Should -Not -Match 'Add-Type\s+(-Namespace|-TypeDefinition|-MemberDefinition)'
+        $script:SplashBlockText | Should -Not -Match 'DllImport'
+        $script:SplashBlockText | Should -Match 'HighQualityBicubic'
+        $script:SplashBlockText | Should -Match "DoubleBuffered"
+        # greyscale anti-aliasing without grid fitting: closest to how Windows 11 draws its own text (ClearType grid fit looked too sharp)
+        $script:SplashBlockText | Should -Match 'TextRenderingHint\]::AntiAlias\b'
+        $script:SplashBlockText | Should -Not -Match 'ClearTypeGridFit'
+    }
+    It 'sets the close flag in Close-LauncherSplash, which the Shown handler, the trap and the single-instance exit all call' {
+        $t = $script:LauncherText
+        $script:LauncherFunctions['Close-LauncherSplash'].Extent.Text | Should -Match '\$script:SplashState\.Close = \$true'
+        $t.Substring($t.IndexOf('$form.Add_Shown({'), 200) | Should -Match 'Close-LauncherSplash'
+        $t.Substring($t.IndexOf('trap {'), 200) | Should -Match 'Close-LauncherSplash -Wait'
+        $mutexLeft = $t.Substring($t.IndexOf('if (-not $mutexMine) {'))
+        $mutexLeft = $mutexLeft.Substring(0, $mutexLeft.IndexOf('exit 0'))
+        $mutexLeft | Should -Match 'Close-LauncherSplash'
+    }
+    It 'never blocks the window thread for more than a short wait when the splash is closed' {
+        $fn = $script:LauncherFunctions['Close-LauncherSplash'].Extent.Text
+        $fn | Should -Match 'WaitOne\(\$\(if \(\$Wait\) \{ 400 \} else \{ 0 \}\)\)'
+        $fn | Should -Match 'BeginStop'
+    }
+    It 'starts the splash only for a real GUI run, after the single-instance check, and keeps the plain splash as the fallback' {
+        $t = $script:LauncherText
+        $t.Contains('$startGui = (-not $Screenshot) -and (-not $NoGui) -and ($env:USERNAME -ne ''WDAGUtilityAccount'')') | Should -BeTrue
+        $call = $t.IndexOf('if (-not (Start-LauncherSplash)) {')
+        $call | Should -BeGreaterThan $t.IndexOf('if ($startGui) {')
+        $call | Should -BeGreaterThan $t.IndexOf('System.Threading.Mutex')
+        $call | Should -BeLessThan $t.IndexOf("QraUi.ps1')")
+        $t.IndexOf('$sp = New-Object System.Windows.Forms.Form') | Should -BeGreaterThan $call -Because 'the plain splash only runs when the animated one cannot start'
+    }
+    It 'keeps the zero-handle owner for the main window' {
+        $t = $script:LauncherText
+        $t.Contains('[void]$form.ShowDialog($noOwner)') | Should -BeTrue
+    }
+    It 'step 1 has a Create desktop shortcut button beside Check again, with its own click handler and feedback' {
+        $t = $script:LauncherText
+        $t.Contains("`$bShortcut = New-QraButton 'Create desktop shortcut' 'Secondary' `$QraGlyph.Link") | Should -BeTrue
+        $t.Contains('$bShortcut.Add_Click({ Invoke-CreateDesktopShortcut })') | Should -BeTrue
+        $t.Contains("Show-QraCopied `$bShortcut 'Shortcut created'") | Should -BeTrue
+        $t.Contains("'Replace the existing desktop shortcut?'") | Should -BeTrue
+        $t.Contains("[Environment]::GetFolderPath('Desktop')") | Should -BeTrue
+        $t | Should -Match 'Start-Here\.cmd'
+    }
+    Context 'rendering the splash to a PNG (QRA_SPLASH_SHOT, a child Windows PowerShell 5.1)' {
+        BeforeAll {
+            function Invoke-SplashShot([string]$png, [string]$image) {
+                $env:QRA_SPLASH_SHOT = $png
+                if ($image) { $env:QRA_SPLASH_IMAGE = $image }
+                try {
+                    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath 2>&1
+                    [pscustomobject]@{ Exit = $LASTEXITCODE; Output = ($out | Out-String) }
+                } finally { Remove-Item Env:\QRA_SPLASH_SHOT, Env:\QRA_SPLASH_IMAGE -ErrorAction SilentlyContinue }
+            }
+            function Get-ShotPixel([string]$png, [int]$x, [int]$y) {
+                $bmp = New-Object System.Drawing.Bitmap($png)
+                try { $px = $bmp.GetPixel($x, $y); @($px.R, $px.G, $px.B, $bmp.Width, $bmp.Height) } finally { $bmp.Dispose() }
+            }
+        }
+        It 'renders the 640 x 357 splash with the picture' {
+            $png = Join-Path $TestDrive 'splash.png'
+            $r = Invoke-SplashShot $png ''
+            $r.Exit | Should -Be 0 -Because $r.Output
+            $px = Get-ShotPixel $png 200 170
+            $px[3] | Should -Be 640; $px[4] | Should -Be 357
+            ($px[0] + $px[1] + $px[2]) | Should -BeGreaterThan 300 -Because 'the shield is bright'
+        }
+        It 'falls back to a plain navy splash, same size, when the picture is missing, and still exits 0' {
+            $png = Join-Path $TestDrive 'splash-nopic.png'
+            $r = Invoke-SplashShot $png (Join-Path $TestDrive 'no-such-picture.jpg')
+            $r.Exit | Should -Be 0 -Because $r.Output
+            $px = Get-ShotPixel $png 200 170
+            $px[3] | Should -Be 640; $px[4] | Should -Be 357
+            @($px[0], $px[1], $px[2]) | Should -Be @(17, 38, 66)
+        }
+        It 'falls back the same way when the picture file is not an image' {
+            $bad = Join-Path $TestDrive 'bad.jpg'
+            Set-Content -LiteralPath $bad -Value 'not a picture'
+            $png = Join-Path $TestDrive 'splash-badpic.png'
+            $r = Invoke-SplashShot $png $bad
+            $r.Exit | Should -Be 0 -Because $r.Output
+            (Get-ShotPixel $png 200 170)[0] | Should -Be 17
+        }
+    }
+    It 'ships a splash picture of a sensible size' {
+        $jpg = Join-Path $script:Repo 'src\SecurityReview\app\assets\splash.jpg'
+        (Get-Item -LiteralPath $jpg).Length | Should -BeLessThan 200KB
+        $img = [System.Drawing.Image]::FromFile($jpg)
+        try { $img.Width | Should -Be 1280; $img.Height | Should -Be 714 } finally { $img.Dispose() }
     }
 }
