@@ -19,7 +19,7 @@ trap {
     break
 }
 
-$AppVersion = '2.2.0'
+$AppVersion = '2.3.0'
 $ReviewRoot = 'C:\Review'
 $AppDir     = $PSScriptRoot
 $Incoming   = Join-Path $ReviewRoot 'Incoming'

@@ -5,6 +5,32 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
 
 ## [Unreleased]
 
+## [2.3.0] - Unreleased
+
+### Added
+- **Release-request intake (optional).** A **Fetch release requests** button in step 3 of the launcher opens a dialog that lists
+  quarantined messages with a pending release request (Received, Sender, Recipient, Subject, Quarantine type, Expires) through
+  read-only Exchange Online PowerShell. Every checkbox starts unticked and each ticked message is exported on its own. The default
+  window is 16 days (maximum 30) and the list shows up to 1000 rows.
+- **Encrypted ZIP only.** An export is written to `Incoming` as a password-protected ZIP only after its bytes pass a check: ZIP
+  signature, a readable central directory, at least one entry, and the encryption flag on every entry. A rejected export writes
+  nothing and shows a summary that contains no entry names or content.
+- **Install button.** If the `ExchangeOnlineManagement` module is missing, a button installs it for the current user in a visible
+  Windows PowerShell 5.1 window (`Install-Module ExchangeOnlineManagement -Scope CurrentUser`). Nothing is installed without the click.
+- `docs/for-security-teams.md`: a one-page description for an approver (what runs where, the complete list of network calls,
+  permissions, retention, how to verify a release, known limits), with a Pester test that every URL in the runtime files is documented.
+
+### Security
+- The download password is typed once per batch in a masked box, held as a SecureString, passed to the Exchange Online session
+  without appearing in any script text or argument, and cleared. It is never logged or written.
+- The tool never writes an `.eml` or any file other than the `.zip`, and nothing goes to TEMP.
+- The intake is read-only: it uses no release, delete, `Set-*` or Tenant Allow/Block List cmdlet.
+- The Exchange Online session is disconnected when the dialog closes (including when the launcher closes). The `-DisableWAM`
+  switch is not used.
+
+### Changed
+- Roadmap: code signing moved from v3.0 to v2.8 (Enterprise readiness), and v3.0 is now "Playbook and training lab".
+
 ## [2.2.0] - 2026-11-25
 
 First release from the public repository.
@@ -67,5 +93,6 @@ First release from the public repository.
 
 Used internally before the repository was published. It was never released publicly; it is listed only because the 2.2.0 fixes refer to it.
 
-[Unreleased]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/MahmoudGooda/quarantine-review-assistant/releases/tag/v2.2.0
