@@ -59,7 +59,7 @@ Describe 'Review window: empty-state prompt' {
         Get-EmptyPrompt $false | Should -Be 'Choose a package and click Analyze.'
     }
     It 'asks for the password when a package is selected' {
-        Get-EmptyPrompt $true | Should -Be 'Enter the download password and click Analyze.'
+        Get-EmptyPrompt $true | Should -Be 'Enter the download password, then click Continue.'
     }
 }
 
@@ -385,7 +385,7 @@ Describe 'Review window: -Screenshot' -Tag 'Screenshot' {
                 }
             } finally { Pop-Location }
         }
-        $script:ReviewStates = 'empty', 'analysing', 'result', 'decision-recorded', 'result-findings', 'result-attachments'
+        $script:ReviewStates = 'empty', 'password', 'analysing', 'result', 'decision-recorded', 'result-findings', 'result-attachments'
         function Invoke-ReviewShots([string]$dir) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ReviewPath, '-Screenshot', $dir, '-ScreenshotResult', $script:ResultJson)
@@ -416,6 +416,128 @@ Describe 'Review window: -Screenshot' -Tag 'Screenshot' {
         try { $r = Invoke-ReviewShots $dir } finally { Remove-Item Env:\QRA_UI_FALLBACK -ErrorAction SilentlyContinue }
         $r.Exit | Should -Be 0 -Because $r.Output
         foreach ($s in $script:ReviewStates) { Test-Path -LiteralPath (Join-Path $dir "review-$s.png") | Should -BeTrue -Because $s }
+    }
+}
+
+Describe 'Review window: step 2 Continue button (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $root = Join-Path $TestDrive 'cont-root'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:Repo 'src\SecurityReview\app') -Destination (Join-Path $root 'app') -Recurse
+        $script:ContScript = Join-Path $root 'app\QuarantineReview.ps1'
+        $text = [IO.File]::ReadAllText($script:ContScript)
+        $probe = @'
+$form.ShowInTaskbar = $false; $form.Opacity = 0; $form.StartPosition = 'Manual'; $form.Location = New-Object System.Drawing.Point(-32000, -32000)
+$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+$script:AnalysisCalls = 0
+$bAnalyze.Enabled = $true   # outside a Sandbox the window disables Analyze; the probe needs it live
+function Get-ActiveLeaf { $ac = $form.ActiveControl; while ($ac -is [System.Windows.Forms.ContainerControl] -and $ac.ActiveControl) { $ac = $ac.ActiveControl }; $ac }
+function Start-Analysis { $script:AnalysisCalls++ }   # a probe: the real one would start the analyzer
+$item = New-Object System.Windows.Forms.ListViewItem('probe.zip')
+[void]$item.SubItems.Add('1 KB'); [void]$item.SubItems.Add('10:00')
+$item.Tag = 'C:\Review\Incoming\probe.zip'
+$fileList.Items.Clear(); [void]$fileList.Items.Add($item); $item.Selected = $true
+$pwdBox.Clear(); Update-ReviewStepper; [System.Windows.Forms.Application]::DoEvents()
+$o = [ordered]@{}
+$o.EmptyEnabled = $bContinue.Enabled
+$o.EmptyText = $bContinue.Text
+$o.EmptyCurrent = $script:StepState.Current
+$pwdBox.Text = 'probe-secret'
+$o.TypedEnabled = $bContinue.Enabled
+$o.TypedExpanded = $script:Expanded
+$o.TypedCurrent = $script:StepState.Current
+$bContinue.PerformClick(); [System.Windows.Forms.Application]::DoEvents()
+$o.ClickExpanded = $script:Expanded
+$o.ClickCurrent = $script:StepState.Current
+$o.ClickStep3State = [string]$script:StepState.Steps[2].State
+$o.ClickStep2State = [string]$script:StepState.Steps[1].State
+$o.ClickActiveIsAnalyze = [bool]((Get-ActiveLeaf) -eq $bAnalyze)
+$o.ClickAnalyzeVisible = $bAnalyze.Visible
+$o.ClickCalls = $script:AnalysisCalls
+$o.PwdKept = ($pwdBox.Text -eq 'probe-secret')
+# back to step 2, then Enter in the box does the same as Continue
+Open-ReviewStep 2; [void]$pwdBox.Focus(); [System.Windows.Forms.Application]::DoEvents()
+$o.ReopenedExpanded = $script:Expanded
+$ke = [System.Windows.Forms.KeyEventArgs]::new([System.Windows.Forms.Keys]::Enter)
+[System.Windows.Forms.Control].GetMethod('OnKeyDown', [Reflection.BindingFlags]'NonPublic,Instance').Invoke($pwdBox, @($ke))
+[System.Windows.Forms.Application]::DoEvents()
+$o.EnterExpanded = $script:Expanded
+$o.EnterCurrent = $script:StepState.Current
+$o.EnterActiveIsAnalyze = [bool]((Get-ActiveLeaf) -eq $bAnalyze)
+$o.EnterSuppressed = $ke.SuppressKeyPress
+$o.EnterCalls = $script:AnalysisCalls
+# the Analyze button keeps its role
+$bAnalyze.PerformClick()
+$o.AnalyzeCalls = $script:AnalysisCalls
+# an empty box: Continue is off again and Enter does nothing
+$pwdBox.Clear(); Open-ReviewStep 2; [void]$pwdBox.Focus()
+$o.ClearedEnabled = $bContinue.Enabled
+$ke2 = [System.Windows.Forms.KeyEventArgs]::new([System.Windows.Forms.Keys]::Enter)
+[System.Windows.Forms.Control].GetMethod('OnKeyDown', [Reflection.BindingFlags]'NonPublic,Instance').Invoke($pwdBox, @($ke2))
+$o.EmptyEnterExpanded = $script:Expanded
+# tab order and neighbours
+$o.TabPwd = $pwdBox.TabIndex; $o.TabShow = $showPwd.TabIndex; $o.TabContinue = $bContinue.TabIndex; $o.TabAtt = $attPwd.TabIndex
+Open-ReviewStep 2; [System.Windows.Forms.Application]::DoEvents()
+$o.ContinueBelowPwd = ($bContinue.Top -gt $pwdBox.Bottom)
+$o.ContinueAboveAtt = ($bContinue.Bottom -lt $attLbl.Top)
+$o.ContinueVisible = $bContinue.Visible
+$o.AccessName = $bContinue.AccessibleName
+($o | ConvertTo-Json -Compress)
+$form.Dispose(); exit 0
+'@
+        $idx = $text.LastIndexOf('[void]$form.ShowDialog()')
+        $idx | Should -BeGreaterThan 0
+        [IO.File]::WriteAllText($script:ContScript, ($text.Substring(0, $idx) + $probe), (New-Object Text.UTF8Encoding($true)))
+        $out = @(& powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $script:ContScript 2>&1 | ForEach-Object { "$_" })
+        $script:ContOut = $out -join "`n"
+        $json = @($out | Where-Object { $_ -like '{*' }) | Select-Object -Last 1
+        if ($json) { $script:ContR = $json | ConvertFrom-Json }
+    }
+    It 'runs the probe' {
+        $script:ContR | Should -Not -BeNullOrEmpty -Because $script:ContOut
+    }
+    It 'disables Continue while the box is empty and enables it once text is entered' {
+        $script:ContR.EmptyText | Should -Be 'Continue'
+        $script:ContR.EmptyEnabled | Should -BeFalse -Because $script:ContOut
+        $script:ContR.TypedEnabled | Should -BeTrue -Because $script:ContOut
+        $script:ContR.TypedExpanded | Should -Be 2   # still on step 2 while typing
+        $script:ContR.ClearedEnabled | Should -BeFalse
+    }
+    It 'Continue moves the stepper to Analyze and focuses the Analyze button without analyzing' {
+        $script:ContR.ClickExpanded | Should -Be 3 -Because $script:ContOut
+        $script:ContR.ClickCurrent | Should -Be 3
+        $script:ContR.ClickStep2State | Should -Be 'Done'
+        $script:ContR.ClickStep3State | Should -Be 'Current'
+        $script:ContR.ClickAnalyzeVisible | Should -BeTrue
+        $script:ContR.ClickActiveIsAnalyze | Should -BeTrue -Because $script:ContOut
+        $script:ContR.ClickCalls | Should -Be 0
+        $script:ContR.PwdKept | Should -BeTrue
+    }
+    It 'Enter in the password box does the same as Continue; only the Analyze button analyzes' {
+        $script:ContR.ReopenedExpanded | Should -Be 2
+        $script:ContR.EnterExpanded | Should -Be 3
+        $script:ContR.EnterCurrent | Should -Be 3
+        $script:ContR.EnterActiveIsAnalyze | Should -BeTrue -Because $script:ContOut
+        $script:ContR.EnterSuppressed | Should -BeTrue
+        $script:ContR.EnterCalls | Should -Be 0
+        $script:ContR.AnalyzeCalls | Should -Be 1
+        $script:ContR.EmptyEnterExpanded | Should -Be 2   # Enter with an empty box does nothing
+    }
+    It 'keeps the tab order password box, Show, Continue and places Continue under the box and above the attachment passwords' {
+        $script:ContR.TabPwd | Should -BeLessThan $script:ContR.TabShow
+        $script:ContR.TabShow | Should -BeLessThan $script:ContR.TabContinue
+        $script:ContR.TabContinue | Should -BeLessThan $script:ContR.TabAtt
+        $script:ContR.ContinueVisible | Should -BeTrue
+        $script:ContR.ContinueBelowPwd | Should -BeTrue
+        $script:ContR.ContinueAboveAtt | Should -BeTrue
+        $script:ContR.AccessName | Should -Be 'Continue'
+    }
+    It 'no longer starts the analysis from Enter in the box and has no stale hint wording' {
+        $t = [IO.File]::ReadAllText($script:ReviewPath)
+        $t.Contains("if (`$e.KeyCode -eq 'Enter') { `$e.SuppressKeyPress = `$true; Start-Analysis }") | Should -BeFalse
+        $t.Contains('press Enter.') | Should -BeFalse
+        $t.Contains('Enter the download password and click Analyze.') | Should -BeFalse
+        $t.Contains('Enter the download password, then click Continue.') | Should -BeTrue
     }
 }
 
