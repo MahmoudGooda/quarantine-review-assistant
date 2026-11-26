@@ -91,6 +91,7 @@ $form.MinimumSize = New-Object System.Drawing.Size(1100, 720)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $C.Surface
 $form.KeyPreview = $true
+Set-QraWindowChrome $form -AppId 'QuarantineReviewAssistant.Review' -NoAppId:([bool]$Screenshot)   # app icon, own taskbar button, navy title bar (Windows 11)
 
 # ---- header with environment pills (the pills are added after scaling: they size themselves from their font)
 $header = New-Object System.Windows.Forms.Panel
@@ -348,6 +349,26 @@ $tree.Dock = 'Fill'; $tree.BorderStyle = 'None'; $tree.HideSelection = $false; $
 $nodeDetails = New-ReadOnlyText $true
 $attSplit.Panel1.Controls.Add($tree); $attSplit.Panel2.Controls.Add($nodeDetails)
 $tAttach.Controls.Add($attSplit)
+# The split has no real width until the Attachments tab is shown (a hidden tab page keeps the default 150 px), so the 45 % distance is applied
+# whenever the split is laid out at a usable width, unless the user dragged the splitter.
+$script:AttSplitMoved = $false
+$script:AttSplitApplying = $false
+function Set-AttachmentSplit {
+    if ($script:AttSplitMoved -or $script:AttSplitApplying) { return }
+    $min1 = S 200; $min2 = S 280
+    $w = $attSplit.Width
+    if ($w -le ($min1 + $min2 + $attSplit.SplitterWidth)) { return }   # not laid out yet (or too narrow for both panes)
+    $script:AttSplitApplying = $true
+    try {
+        $attSplit.Panel1MinSize = $min1; $attSplit.Panel2MinSize = $min2
+        $want = [int]($w * 0.45)
+        $attSplit.SplitterDistance = [Math]::Max($min1, [Math]::Min($want, $w - $min2 - $attSplit.SplitterWidth))
+    } catch { $null = $_ } # ignore if the window is too narrow for the requested splitter distance
+    finally { $script:AttSplitApplying = $false }
+}
+$attSplit.Add_SplitterMoving({ if (-not $script:AttSplitApplying) { $script:AttSplitMoved = $true } })   # raised only while the user drags
+$attSplit.Add_SizeChanged({ Set-AttachmentSplit })
+$tabs.Add_SelectedIndexChanged({ if ($tabs.SelectedTab -eq $tAttach) { Set-AttachmentSplit } })
 
 $tLinks = New-Tab 'Links'
 $lvLinks = New-ListView @('Risk', 'Link (defanged - not clickable)', 'Why flagged', 'Found in') @(70, 460, 330, 260)
@@ -1750,7 +1771,7 @@ $form.Add_KeyDown({ param($s, $e)
 if (-not $Screenshot) { $form.Add_Shown({
     try { $split.SplitterDistance = (S 420) } catch { $null = $_ } # ignore if window is too narrow for the requested splitter distance
     Update-LeftLayout; Update-HeaderLayout
-    try { $attSplit.SplitterDistance = [Math]::Max((S 200), [int]($attSplit.Width * 0.45)) } catch { $null = $_ } # ignore if window is too narrow for the requested splitter distance
+    Set-AttachmentSplit   # a no-op while the Attachments tab is hidden: the tab's own events apply it when it appears
     Refresh-Files $null
     if ($envProblems.Count -and -not $AllowHost) { $bAnalyze.Enabled = $false; $status.Text = 'Analysis disabled: see the red warning at the top.'; $status.ForeColor = $C.Danger }
     elseif ($fileList.Items.Count) { $pwdBox.Focus(); $status.Text = 'Enter the download password and press Enter.' }
@@ -1880,6 +1901,9 @@ if ($Screenshot) {
         Save-ShotImage 'decision-recorded'
         $tabs.SelectedTab = $tFindings
         Save-ShotImage 'result-findings'
+        $tabs.SelectedTab = $tAttach
+        [System.Windows.Forms.Application]::DoEvents()
+        Save-ShotImage 'result-attachments'
     }
     $form.Dispose()
     exit 0

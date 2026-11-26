@@ -385,7 +385,7 @@ Describe 'Review window: -Screenshot' -Tag 'Screenshot' {
                 }
             } finally { Pop-Location }
         }
-        $script:ReviewStates = 'empty', 'analysing', 'result', 'decision-recorded', 'result-findings'
+        $script:ReviewStates = 'empty', 'analysing', 'result', 'decision-recorded', 'result-findings', 'result-attachments'
         function Invoke-ReviewShots([string]$dir) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ReviewPath, '-Screenshot', $dir, '-ScreenshotResult', $script:ResultJson)
@@ -416,5 +416,58 @@ Describe 'Review window: -Screenshot' -Tag 'Screenshot' {
         try { $r = Invoke-ReviewShots $dir } finally { Remove-Item Env:\QRA_UI_FALLBACK -ErrorAction SilentlyContinue }
         $r.Exit | Should -Be 0 -Because $r.Output
         foreach ($s in $script:ReviewStates) { Test-Path -LiteralPath (Join-Path $dir "review-$s.png") | Should -BeTrue -Because $s }
+    }
+}
+
+Describe 'Review window: Attachments split' {
+    It 'gives the details pane a usable width once the Attachments tab is shown, keeps 45 % and respects a dragged splitter (child process)' {
+        # Runs the real script with its final ShowDialog replaced by a probe, so the real tab and size events are exercised.
+        $root = Join-Path $TestDrive 'att-root'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:Repo 'src\SecurityReview\app') -Destination (Join-Path $root 'app') -Recurse
+        $script = Join-Path $root 'app\QuarantineReview.ps1'
+        $text = [IO.File]::ReadAllText($script)
+        $probe = @'
+$form.ShowInTaskbar = $false; $form.Opacity = 0; $form.StartPosition = 'Manual'; $form.Location = New-Object System.Drawing.Point(-32000, -32000)
+$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+$resultsStage.Visible = $false; $tabs.Visible = $true
+$tabs.SelectedTab = $tAttach; [System.Windows.Forms.Application]::DoEvents()
+'p2=' + $attSplit.Panel2.Width
+'width=' + $attSplit.Width
+'dist=' + $attSplit.SplitterDistance
+'min2=' + (S 280)
+'min1=' + (S 200)
+'minsizes=' + $attSplit.Panel1MinSize + '/' + $attSplit.Panel2MinSize
+$attSplit.SplitterDistance = (S 300); $script:AttSplitMoved = $true
+Set-AttachmentSplit
+'afterdrag=' + $attSplit.SplitterDistance + '/' + (S 300)
+$form.Dispose(); exit 0
+'@
+        $idx = $text.LastIndexOf('[void]$form.ShowDialog()')
+        $idx | Should -BeGreaterThan 0
+        [IO.File]::WriteAllText($script, ($text.Substring(0, $idx) + $probe), (New-Object Text.UTF8Encoding($true)))
+        $out = @(& powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $script 2>&1 | ForEach-Object { "$_" })
+        $all = $out -join "`n"
+        function Get-Probe([string]$key) { [int](($out | Where-Object { $_ -like "$key=*" } | Select-Object -First 1) -replace '^[^=]+=', '') }
+        $w = Get-Probe 'width'; $d = Get-Probe 'dist'
+        $w | Should -BeGreaterThan 0 -Because $all
+        (Get-Probe 'p2') | Should -BeGreaterOrEqual (Get-Probe 'min2') -Because $all
+        $d | Should -BeGreaterThan ([int]($w * 0.45) - 8) -Because $all
+        $d | Should -BeLessThan ([int]($w * 0.45) + 8) -Because $all
+        ($out | Where-Object { $_ -like 'minsizes=*' }) | Should -Be ('minsizes=' + (Get-Probe 'min1') + '/' + (Get-Probe 'min2')) -Because $all
+        ($out | Where-Object { $_ -like 'afterdrag=*' }) | Should -Match '^afterdrag=(\d+)/\1$' -Because 'a splitter the user moved is not reset'
+    }
+    It 'applies the split from the tab and size events, not only from Shown' {
+        $t = [IO.File]::ReadAllText($script:ReviewPath)
+        $t.Contains('$attSplit.Add_SizeChanged({ Set-AttachmentSplit })') | Should -BeTrue
+        $t.Contains('$tabs.Add_SelectedIndexChanged({ if ($tabs.SelectedTab -eq $tAttach) { Set-AttachmentSplit } })') | Should -BeTrue
+        $t.Contains('$attSplit.Add_SplitterMoving(') | Should -BeTrue
+    }
+}
+
+Describe 'Review window: icon and taskbar identity' {
+    It 'applies the chrome with the Review app id (not in -Screenshot)' {
+        $t = [IO.File]::ReadAllText($script:ReviewPath)
+        $t.Contains("Set-QraWindowChrome `$form -AppId 'QuarantineReviewAssistant.Review' -NoAppId:([bool]`$Screenshot)") | Should -BeTrue
     }
 }

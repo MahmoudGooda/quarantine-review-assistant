@@ -66,6 +66,32 @@ function Hide-QraConsole {
     } catch { $null = $_ } # no console window to hide
 }
 
+# ---- Window helpers (taskbar identity, title bar colour, foreground). QRA.Win2 is a NEW type name: QRA.Win may already exist in a process with another signature.
+$script:QraWin2Ready = $null
+function Initialize-QraWin2 {
+    # True when the native helpers are available. Skipped silently where Add-Type is not allowed (Constrained Language Mode).
+    if ($null -ne $script:QraWin2Ready) { return [bool]$script:QraWin2Ready }
+    $script:QraWin2Ready = $false
+    if ((Get-QraCompileDecision) -ne 'compile') { return $false }
+    try {
+        if (-not ('QRA.Win2' -as [type])) {
+            Add-Type -Namespace QRA -Name Win2 -ErrorAction Stop -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
+[DllImport("user32.dll")] public static extern bool DestroyIcon(System.IntPtr h);
+[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(System.IntPtr hwnd, int attr, ref int value, int size);
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+'@
+        }
+        $script:QraWin2Ready = $true
+    } catch { $script:QraWin2Ready = $false } # no native helpers: the window keeps its default icon grouping and title bar
+    [bool]$script:QraWin2Ready
+}
+function Enable-QraForeground {
+    # Lets any process (the Microsoft sign-in window, this window) come to the front after the console was hidden.
+    if (-not (Initialize-QraWin2)) { return }
+    try { [void][QRA.Win2]::AllowSetForegroundWindow(-1) } catch { $null = $_ } # best effort
+}
+
 # ---- Icon glyphs (identical in Segoe Fluent Icons and Segoe MDL2 Assets).
 $QraGlyph = @{}
 try {
@@ -166,6 +192,82 @@ function Get-QraContrast([System.Drawing.Color]$fg, [System.Drawing.Color]$bg) {
     }
     $l1 = & $lum $fg; $l2 = & $lum $bg
     ([Math]::Max($l1, $l2) + 0.05) / ([Math]::Min($l1, $l2) + 0.05)
+}
+
+# ---- App icon and window chrome (taskbar identity, title bar colour). No binary file: the icon is drawn at runtime.
+function New-QraAppIcon([int]$size = 32) {
+    # Rounded square in the header navy with a white shield glyph. Returns a System.Drawing.Icon that owns its own handle.
+    $size = [Math]::Max(16, $size)
+    $bmp = New-Object System.Drawing.Bitmap($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $fill = $null; $path = $null; $family = $null; $gf = $null; $white = $null; $sf = $null
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $d = [single]($size * 0.46)   # corner diameter
+        $r = New-Object System.Drawing.RectangleF(0, 0, ($size - 1), ($size - 1))
+        $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $path.AddArc($r.X, $r.Y, $d, $d, 180, 90)
+        $path.AddArc(($r.Right - $d), $r.Y, $d, $d, 270, 90)
+        $path.AddArc(($r.Right - $d), ($r.Bottom - $d), $d, $d, 0, 90)
+        $path.AddArc($r.X, ($r.Bottom - $d), $d, $d, 90, 90)
+        $path.CloseFigure()
+        $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(17, 38, 66))   # the header navy ($C.Header, also in high contrast: an icon is not themed)
+        $g.FillPath($fill, $path)
+        $iconFont = Get-IconFont 10
+        $family = $iconFont.FontFamily
+        $gf = New-Object System.Drawing.Font($family, [single]($size * 0.62), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+        $sf = New-Object System.Drawing.StringFormat([System.Drawing.StringFormat]::GenericTypographic)
+        $sf.Alignment = [System.Drawing.StringAlignment]::Center; $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $g.DrawString([string]$QraGlyph.Shield, $gf, $white, (New-Object System.Drawing.RectangleF(0, 0, $size, $size)), $sf)
+        $iconFont.Dispose()
+    } finally {
+        foreach ($res in @($sf, $white, $gf, $fill, $path)) { if ($res) { $res.Dispose() } }
+        $g.Dispose()
+    }
+    $hIcon = $bmp.GetHicon()
+    try {
+        $tmp = [System.Drawing.Icon]::FromHandle($hIcon)
+        $icon = $tmp.Clone()   # the clone owns a copy, so the original handle can be destroyed
+        $tmp.Dispose()
+    } finally {
+        if (Initialize-QraWin2) { try { [void][QRA.Win2]::DestroyIcon($hIcon) } catch { $null = $_ } } # without P/Invoke the handle is reclaimed at process exit
+        $bmp.Dispose()
+    }
+    $icon
+}
+
+$script:QraAppIcon = $null
+$script:QraAppIdSet = $false
+function Set-QraWindowChrome {
+    # Call right after creating a form (before it is shown). Sets the icon, the taskbar identity (once per process; the first call wins)
+    # and, when the handle exists, the title bar colours (Windows 11 build 22000+; ignored elsewhere and in high contrast).
+    param($form, [string]$AppId = 'QuarantineReviewAssistant.Launcher', [switch]$NoAppId)
+    try {
+        if (-not $script:QraAppIcon) { $script:QraAppIcon = New-QraAppIcon 32 }
+        $form.Icon = $script:QraAppIcon
+    } catch { $null = $_ } # keeps the default icon
+    if (-not $NoAppId -and -not $script:QraAppIdSet -and (Initialize-QraWin2)) {
+        $script:QraAppIdSet = $true
+        try { [void][QRA.Win2]::SetCurrentProcessExplicitAppUserModelID($AppId) } catch { $null = $_ } # taskbar groups with PowerShell instead
+    }
+    if ($script:QraHighContrast) { return }
+    try {
+        $form.Add_HandleCreated({ param($s, $e) Set-QraCaptionColor $s })
+        if ($form.IsHandleCreated) { Set-QraCaptionColor $form }
+    } catch { $null = $_ } # default title bar
+}
+function Set-QraCaptionColor($form) {
+    # DWMWA_CAPTION_COLOR (35) = header navy, DWMWA_TEXT_COLOR (36) = white; COLORREF is 0x00BBGGRR. Older Windows returns an error code: ignored.
+    if ($script:QraHighContrast -or -not (Initialize-QraWin2)) { return }
+    try {
+        $caption = (66 -shl 16) -bor (38 -shl 8) -bor 17
+        $text = 0x00FFFFFF
+        [void][QRA.Win2]::DwmSetWindowAttribute($form.Handle, 35, [ref]$caption, 4)
+        [void][QRA.Win2]::DwmSetWindowAttribute($form.Handle, 36, [ref]$text, 4)
+    } catch { $null = $_ } # attributes exist only on Windows 11 22000 and later
 }
 
 # ---- Painted controls (C#, compiled once per process)

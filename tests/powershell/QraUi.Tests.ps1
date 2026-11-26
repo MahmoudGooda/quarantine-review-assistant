@@ -445,3 +445,89 @@ Add-Type -AssemblyName System.Drawing
         $out | Should -Contain 'hc=True'
     }
 }
+
+Describe 'QraUi kit: app icon and window chrome' {
+    It 'draws the app icon at the requested size' {
+        foreach ($px in 16, 32, 48) {
+            $ic = New-QraAppIcon $px
+            try {
+                $ic | Should -BeOfType [System.Drawing.Icon]
+                $ic.Width | Should -Be $px
+                $ic.Height | Should -Be $px
+            } finally { $ic.Dispose() }
+        }
+    }
+    It 'paints the navy rounded square with a light glyph and a transparent corner' {
+        $ic = New-QraAppIcon 32
+        try {
+            $bmp = $ic.ToBitmap()
+            try {
+                $bmp.GetPixel(0, 0).A | Should -Be 0 -Because 'the corner is rounded'
+                $edge = $bmp.GetPixel(3, 16)
+                $edge.R | Should -Be 17; $edge.G | Should -Be 38; $edge.B | Should -Be 66
+                $light = 0
+                foreach ($x in 8..24) { foreach ($y in 8..24) { if ($bmp.GetPixel($x, $y).R -gt 200) { $light++ } } }
+                $light | Should -BeGreaterThan 10 -Because 'the white shield glyph'
+            } finally { $bmp.Dispose() }
+        } finally { $ic.Dispose() }
+    }
+    It 'Set-QraWindowChrome sets the icon and does not throw in fallback display mode (child process)' {
+        $out = Invoke-ChildPs @"
+`$env:QRA_UI_FALLBACK = '1'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$f = New-Object System.Windows.Forms.Form
+`$f.ShowInTaskbar = `$false; `$f.Opacity = 0
+`$err = ''
+try { Set-QraWindowChrome `$f -NoAppId } catch { `$err = `$_.Exception.Message }
+'err=' + `$err
+'icon=' + (`$null -ne `$f.Icon)
+'native=' + `$script:UiNative
+`$f.Show(); [System.Windows.Forms.Application]::DoEvents()
+'shown=' + `$f.Visible
+`$f.Dispose()
+"@
+        $out | Should -Contain 'err='
+        $out | Should -Contain 'icon=True'
+        $out | Should -Contain 'native=False'
+        $out | Should -Contain 'shown=True'
+    }
+    It 'Set-QraWindowChrome and Enable-QraForeground skip the native calls where Add-Type is not allowed (child process)' {
+        $out = Invoke-ChildPs @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$script:QraWin2Ready = `$null
+`$script:QraLanguageMode = 'ConstrainedLanguage'
+`$f = New-Object System.Windows.Forms.Form
+`$err = ''
+try { Set-QraWindowChrome `$f; Enable-QraForeground } catch { `$err = `$_.Exception.Message }
+'err=' + `$err
+'ready=' + [bool]`$script:QraWin2Ready
+`$f.Dispose()
+"@
+        $out | Should -Contain 'err='
+        $out | Should -Contain 'ready=False'
+    }
+    It 'sets the app id once per process and the caption colours without throwing (child process)' {
+        $out = Invoke-ChildPs @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+`$f = New-Object System.Windows.Forms.Form
+`$f.ShowInTaskbar = `$false; `$f.Opacity = 0
+Set-QraWindowChrome `$f
+'idset=' + `$script:QraAppIdSet
+`$g = New-Object System.Windows.Forms.Form
+Set-QraWindowChrome `$g -AppId 'Other.Id'
+'idstill=' + `$script:QraAppIdSet
+`$f.Show(); [System.Windows.Forms.Application]::DoEvents()
+'shown=' + `$f.Visible
+`$f.Dispose(); `$g.Dispose()
+"@
+        $out | Should -Contain 'idset=True'
+        $out | Should -Contain 'idstill=True'
+        $out | Should -Contain 'shown=True'
+    }
+}
