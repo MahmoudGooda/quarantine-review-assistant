@@ -1,4 +1,4 @@
-# Quarantine Review Assistant v2.3.0
+# Quarantine Review Assistant v2.3.1
 
 [![License: MIT](https://img.shields.io/github/license/MahmoudGooda/quarantine-review-assistant)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/MahmoudGooda/quarantine-review-assistant?display_name=tag)](https://github.com/MahmoudGooda/quarantine-review-assistant/releases)
@@ -46,7 +46,8 @@ can still give you a second, offline opinion, for example on a message you do no
 - **Audit log.** The CSV records the reviewer, final decision, tool recommendation, Microsoft's verdict and input SHA-256. The companion decision JSON also preserves the reviewer's answers. Enable host report export to keep these files after the Sandbox closes.
 - **MITRE ATT&CK tags** on findings (T1566.001/.002/.004, T1598.003, T1657, T1027.006 and others).
 - **Accessible and high-DPI.** Keyboard shortcuts (`Ctrl+1` ... `Ctrl+8`, `Ctrl+S`), named controls for screen readers, WCAG AA
-  contrast (4.5:1), support for Windows high contrast and reduced motion, and layouts that hold at 100 % to 175 % scaling.
+  contrast (4.5:1), support for Windows high contrast and reduced motion, and layouts that hold at 100 % to 175 % scaling. On a PC with screens of
+  different scaling, the launcher and its dialog stay sharp on each screen, also after being dragged from one to the other.
 
 ### What it checks
 
@@ -89,7 +90,8 @@ official Python embeddable package from python.org, once, checked against a pinn
 2. Double-click **`Start-Here.cmd`**. Step 1, **Prepare this PC**, checks the PC and offers buttons to install Windows Sandbox and to
    download the analysis runtime.
    Optional: **Create desktop shortcut** (next to **Check again**) puts a launcher shortcut on your Desktop. If you move the folder,
-   create the shortcut again.
+   create the shortcut again. Start from the shortcut for the cleanest start: a double-click on `Start-Here.cmd` shows the small `cmd`
+   window for a moment, the shortcut starts minimised and shows nothing but the splash.
 3. Steps 2 and 3 of the launcher cover Defender: open the quarantined message and choose **Download message** with a password. Save
    the ZIP into `Incoming` without opening it, then click **Launch Sandbox review** (step 4, **Analyze in the Sandbox**).
 4. In the Sandbox window, choose the package, type the password, click **Continue**, then click **Analyze**. Read the **Decision** tab, then in step 5,

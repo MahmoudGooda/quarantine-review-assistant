@@ -1,4 +1,4 @@
-# Quarantine Review Assistant v2.3.0
+# Quarantine Review Assistant v2.3.1
 
 Offline review of emails held in **Microsoft Defender / EOP quarantine**, done inside a disposable,
 network-less **Windows Sandbox**. It inventories the message, its attachments and anything nested in them
@@ -74,7 +74,7 @@ After **Analyze**, the review opens on **Decision**:
    * After a real attack, find other copies of the message and secure any account that was exposed.
 5. **Block list:** sender, domain, URLs and file hashes, ready for the Tenant Allow/Block List. Shared services such as
    google.com, web.app and sharepoint.com are never proposed for blocking; only the exact site is listed.
-6. **Record decision:** saves the decision, your answers, a note and the full report, and adds a line to
+6. **Record decision** (bottom of the left column, in view on every tab): saves the decision, your answers, a note and the full report, and adds a line to
    `Reports\decisions-log.csv` as an audit trail. **Copy block list** on the host requires a completed decision matching the SHA-256 of the single incoming package.
    **Open decisions log** opens the CSV in Notepad. Older rows may contain spreadsheet formulas. Use the text view for logs carried over from earlier versions.
 
@@ -122,7 +122,7 @@ and a **Change** link; later steps are dimmed but you can open any of them at an
    *Opening package*, *Analysing message n of m* and *Building report* with a running seconds counter, and the
    results area shows a spinner with the current stage. **Cancel** stops the analysis at any time; the message
    stays quarantined.
-4. **Decide.** Follow the **Decision** tab, record your decision, then carry it out in Defender on the host.
+4. **Decide.** Follow the **Decision** tab, record your decision in the panel below the steps, then carry it out in Defender on the host.
 
 * **Status chips** confirm *Windows Sandbox / Offline / Host files read-only*. Analysis is disabled if any of
   these is wrong.
@@ -138,7 +138,8 @@ and a **Change** link; later steps are dimmed but you can open any of them at an
 * **Keyboard:** `Ctrl+1` ... `Ctrl+8` switch tabs, `Ctrl+S` saves the report, `F5` refreshes the file list, `Enter` in the
   password box starts the analysis, `Tab` moves through the controls in reading order. Every control has an accessible
   name for screen readers, and the focused button shows a dark ring.
-* **High-DPI screens:** both windows are DPI-aware (100 % to 175 % and above) and never open larger than the screen.
+* **High-DPI screens:** both windows are DPI-aware (100 % to 175 % and above) and never open larger than the screen. The launcher and its release-request
+  dialog follow the scale of the screen they are on, also when dragged to another screen.
 * **Save report** writes `.txt` and `.json` files. By default they also go to the host `Reports` folder, so you
   can look up hashes on the host. Untick that option in the launcher to keep reports inside the Sandbox only.
 
