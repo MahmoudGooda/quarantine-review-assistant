@@ -554,7 +554,7 @@ function Invoke-RrStep($Session, [scriptblock]$Script, [hashtable]$Variables = @
     $ps.Runspace = $Session.Runspace
     [void]$ps.AddScript($Script.ToString(), $true)
     $handle = $ps.BeginInvoke()
-    $work = [pscustomobject]@{ PowerShell = $ps; Handle = $handle; Session = $Session; Started = [DateTime]::UtcNow; Disposed = $false; Result = $null }
+    $work = [pscustomobject]@{ PowerShell = $ps; Handle = $handle; Session = $Session; Started = [DateTime]::UtcNow; Disposed = $false; Result = $null; Cancelled = $false }
     $Session.Current = $work
     $work
 }
@@ -622,6 +622,68 @@ function Enable-RrForeground {
         }
         [void][QRA.Fg]::AllowSetForegroundWindow(-1)
     } catch { $null = $_ } # compiling is not allowed here: sign-in may open behind the window
+}
+
+# ---- Bringing the Microsoft sign-in window forward. The sign-in is a window of another process (Microsoft.AAD.BrokerPlugin) that can open
+# behind this dialog. The dialog finds it and brings it forward itself, right after the click (while this process still has the right to), and
+# on a click of the "Show sign-in window" link. $script:RrFrameFinder / $script:RrFrameBringer let a test replace the two native calls.
+$script:RrSignInSeconds = 30
+
+function Test-RrSignInHelper {
+    [bool]($script:RrFrameFinder -or $script:UiNative)
+}
+
+function Get-RrSignInFrames {
+    # Window handles (int64) of the sign-in windows that exist now. Never throws; empty when none or when the native helpers are missing.
+    try {
+        if ($script:RrFrameFinder) { return @(@(& $script:RrFrameFinder) | ForEach-Object { [int64]$_ }) }
+        if (-not $script:UiNative) { return @() }
+        $pids = @(Get-Process -Name 'Microsoft.AAD.BrokerPlugin' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+        if ($pids.Count -eq 0) { return @() }
+        return @(@([QraUi.Native]::FindSignInFrames([int[]]$pids)) | ForEach-Object { [int64]$_ })
+    } catch { return @() }
+}
+
+function Invoke-RrBringToFront([int64]$handle) {
+    try {
+        if ($script:RrFrameBringer) { return [bool](& $script:RrFrameBringer $handle) }
+        if (-not $script:UiNative) { return $false }
+        return [bool][QraUi.Native]::BringToFront([IntPtr]$handle)
+    } catch { return $false }
+}
+
+function Start-RrSignInWatch($d) {
+    # Remembers the sign-in windows that exist already (leftovers of earlier attempts are ignored).
+    $d.SignInOld = @{}
+    foreach ($h in @(Get-RrSignInFrames)) { $d.SignInOld[[string]$h] = $true }
+    $d.SignInSeen = @{}
+    $d.SignInLatest = [int64]0
+    $d.SignInUntil = [DateTime]::UtcNow.AddSeconds($script:RrSignInSeconds)
+}
+
+function Step-RrSignInWatch($d) {
+    # One poll tick while connecting: a NEW sign-in window is brought forward once, at once. Stops after 30 seconds.
+    if ($d.ConnectState -ne 'working' -or -not $d.SignInUntil -or [DateTime]::UtcNow -gt $d.SignInUntil) { return }
+    foreach ($h in @(Get-RrSignInFrames)) {
+        $key = [string]$h
+        if ($d.SignInOld.ContainsKey($key) -or $d.SignInSeen.ContainsKey($key)) { continue }
+        $d.SignInSeen[$key] = $true
+        $d.SignInLatest = $h
+        [void](Invoke-RrBringToFront $h)
+    }
+}
+
+function Show-RrSignIn($d) {
+    # The "Show sign-in window" link: a user click always lets this process bring a window forward.
+    $frames = @(Get-RrSignInFrames)
+    if ($frames.Count -eq 0) { return $false }
+    $fresh = @($frames | Where-Object { -not $d.SignInOld.ContainsKey([string]$_) })
+    $target = [int64]0
+    if ($d.SignInLatest -and ($frames -contains $d.SignInLatest)) { $target = $d.SignInLatest }
+    elseif ($fresh.Count -gt 0) { $target = $fresh[$fresh.Count - 1] }
+    else { $target = $frames[$frames.Count - 1] }
+    $d.SignInLatest = $target
+    Invoke-RrBringToFront $target
 }
 
 function Get-RrConnectScript {
@@ -718,7 +780,8 @@ function Update-RrSaveButton($d) {
 }
 
 function Update-RrView($d) {
-    if (-not $d -or -not $d.Ready -or $d.InLayout) { return }
+    if (-not $d -or -not $d.Ready -or $d.InLayout -or $script:QraDpiBusy) { return }
+    Use-QraFormDpi $d.Form
     $d.InLayout = $true
     $k = $d.Ctl
     $scroll = $k.Scroll
@@ -743,8 +806,8 @@ function Update-RrView($d) {
         $d.Steps[3].Sum.Text = 'Saves each selected message as a password-protected ZIP.'
 
         # ---- hide every optional control, then show what the state needs
-        Hide-RrControls @($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
-                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.LblListHint,
+        Hide-RrControls @($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.BShowSignIn, $k.LblConnectErr,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.BCancel, $k.LblCancelNote, $k.LblListHint,
                 $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet))
         Set-QraSpinner $k.SpInstall ($d.InstallState -eq 'waiting') 'Waiting for the install window to close'
         Set-QraSpinner $k.SpConnect ($d.ConnectState -eq 'working') 'Waiting for you to sign in'
@@ -795,6 +858,12 @@ function Update-RrView($d) {
                     $yb = Set-RrWrapped $k.LblConnect ($textX + (S 34)) $yy ($w - (S 34))
                     $k.SpConnect.Top = $k.LblConnect.Top + [int](($k.LblConnect.Height - $k.SpConnect.Height) / 2)
                     $yy = [Math]::Max($yb, $k.SpConnect.Bottom) + (S 6)
+                    if (Test-RrSignInHelper) {
+                        # Link button under the waiting text; the text label has an opaque background, so the link goes above it in the z-order (as the Cancel link does)
+                        Set-RrBounds $k.BShowSignIn ($textX + (S 34)) ($yb + (S 2)) ((Get-RrTextWidth $k.BShowSignIn.Text $k.BShowSignIn.Font) + (S 20)) (S 26)
+                        $k.BShowSignIn.BringToFront()
+                        $yy = [Math]::Max($yy, $k.BShowSignIn.Bottom + (S 6))
+                    }
                 } else {
                     if ($d.ConnectState -eq 'failed') { $k.LblConnectErr.Text = $d.ConnectMsg; $yy = (Set-RrWrapped $k.LblConnectErr $textX $yy $w) + (S 8) }
                     $k.BSignIn.Text = $(if ($d.ConnectState -eq 'failed') { 'Retry' } else { 'Sign in' })
@@ -820,11 +889,12 @@ function Update-RrView($d) {
                 $k.BRefresh.Enabled = ($d.ListState -ne 'loading') -and (-not $d.Work)
                 $yy += $rowH + (S 6)
                 $k.ChkHandled.Text = 'Also show released and denied messages'
-                $cw = (Get-RrTextWidth $k.ChkHandled.Text $k.ChkHandled.Font) + (S 34)
+                $indent = Get-QraCheckBoxIndent $k.ChkHandled
+                $cw = (Get-RrTextWidth $k.ChkHandled.Text $k.ChkHandled.Font) + $indent + (S 12)
                 Set-RrBounds $k.ChkHandled $textX $yy $cw (S 24)
                 $k.ChkHandled.Enabled = $true   # a change while a step runs is remembered and refreshed when that step ends
                 $yy = $k.ChkHandled.Bottom + (S 1)
-                $yy = (Set-RrWrapped $k.LblHandled ($textX + (S 22)) $yy ($w - (S 22))) + (S 8)
+                $yy = (Set-RrWrapped $k.LblHandled ($textX + $indent) $yy ($w - $indent)) + (S 8)
                 Set-RrBounds $k.List $textX $yy $w (S 160)
                 Set-RrListColumns $k.List
                 $yy = $k.List.Bottom + (S 6)
@@ -834,8 +904,14 @@ function Update-RrView($d) {
                 $k.LblList.Text = $note
                 $k.LblList.ForeColor = $(if ($d.ListState -eq 'failed') { $C.Danger } else { $C.TextMuted })
                 $yb = Set-RrWrapped $k.LblList $lx $yy ($w - ($lx - $textX))
-                if ($d.ListState -eq 'loading') { $k.SpList.Top = $k.LblList.Top + [int](($k.LblList.Height - $k.SpList.Height) / 2); $yb = [Math]::Max($yb, $k.SpList.Bottom) }
+                if ($d.ListState -eq 'loading') {
+                    $k.SpList.Top = $k.LblList.Top + [int](($k.LblList.Height - $k.SpList.Height) / 2); $yb = [Math]::Max($yb, $k.SpList.Bottom)
+                    Set-RrBounds $k.BCancel $lx $yy ((Get-RrTextWidth $k.BCancel.Text $k.BCancel.Font) + (S 20)) (S 26)   # Link button: it follows the note (Update-RrCancelLink)
+                    Update-RrCancelLink $d
+                    $yb = [Math]::Max($yb, $k.BCancel.Bottom)
+                }
                 $yy = [Math]::Max($yb, $yy + (S 20)) + (S 2)
+                if ($d.CancelNote -and $d.ListState -ne 'loading') { $yy = (Set-RrWrapped $k.LblCancelNote $textX $yy $w) + (S 2) }
                 $yy = (Set-RrWrapped $k.LblListHint $textX $yy $w) + (S 6)
             }
             if ($i -eq 3 -and $connected) {
@@ -889,6 +965,19 @@ function Get-RrTextWidth([string]$text, $font) {
     [System.Windows.Forms.TextRenderer]::MeasureText($text, $font, (New-Object System.Drawing.Size([int]::MaxValue, 0)), $fl).Width
 }
 
+function Update-RrCancelLink($d) {
+    # The Cancel link sits right after the loading note (the note changes with the progress), centred on the spinner; it never leaves the row.
+    $k = $d.Ctl
+    if (-not $k.BCancel.Visible) { return }
+    $tw = Get-RrTextWidth $k.LblList.Text $k.LblList.Font
+    $x = $k.LblList.Left + [Math]::Min($tw, $k.LblList.Width) + (S 4)
+    $x = [Math]::Max($k.LblList.Left, [Math]::Min($x, $k.LblList.Left + $k.LblList.Width - $k.BCancel.Width))
+    $k.BCancel.Left = $x
+    $k.BCancel.Top = $k.SpList.Top + [int](($k.SpList.Height - $k.BCancel.Height) / 2)
+    # The note label spans the whole row with an opaque background; on screen it would paint over the link if it were above it in the z-order.
+    $k.BCancel.BringToFront()
+}
+
 function Set-RrListColumns($lv) {
     # Columns: Received, Sender, Recipients, Subject, Quarantine type, Copies, Expires. Sender and Subject share what the others leave, so no horizontal scrollbar.
     $avail = $lv.ClientSize.Width - (S 2)
@@ -918,6 +1007,7 @@ function Update-RrSortHeaders($d) {
 
 function Set-RrRows($d, $rows, [switch]$KeepSelection) {
     # One list row per message, sorted by the dialog's current sort. KeepSelection keeps the checked messages (by Key) that are still listed.
+    Use-QraFormDpi $d.Form
     $lv = $d.Ctl.List
     $keep = @{}
     if ($KeepSelection) {
@@ -962,16 +1052,44 @@ function Invoke-RrSort($d, [int]$index) {
 
 function Invoke-RrHandledChanged($d) {
     # The 'released and denied' checkbox refreshes the list at once. While a step runs the refresh is remembered and starts when it ends.
-    if (-not $d -or -not $d.Ready -or $d.ConnectState -ne 'done') { return }
-    if ($d.Work) { $d.PendingRefresh = $true; return }
-    Start-RrList $d
+    # A change while the load that this checkbox started is still running is a cancel (and the checkbox goes back), never a second load.
+    # NoReact: the dialog itself sets the checkbox (revert, screenshots) and no load may follow.
+    if (-not $d -or -not $d.Ready -or $d.ConnectState -ne 'done' -or $d.NoReact) { return }
+    if ($d.Work) {
+        if ($d.WorkKind -eq 'list' -and $d.ListByCheckbox -and -not $d.Work.Cancelled) { [void](Stop-RrListLoad $d); return }
+        $d.PendingRefresh = $true
+        return
+    }
+    Start-RrList $d -FromCheckbox
 }
 
 function Invoke-RrPendingRefresh($d) {
     if ($d.PendingRefresh -and -not $d.Work -and $d.ConnectState -eq 'done') {
         $d.PendingRefresh = $false
-        Start-RrList $d
+        Start-RrList $d -FromCheckbox   # only the checkbox sets PendingRefresh
     }
+}
+
+function Stop-RrListLoad($d) {
+    # Cancel for a running LIST step (exports are not cancellable). The window never waits: the pipeline gets BeginStop, and the step stays in $d.Work (so no
+    # other step starts on the busy runspace) until it has ended; Invoke-RrPoll then throws its result away. The session and its Exchange connection stay usable.
+    # The rows, the selection and the sort stay exactly as they were. A load that the checkbox started puts the checkbox back, without a new load.
+    if (-not $d -or -not $d.Work -or $d.WorkKind -ne 'list' -or $d.Work.Cancelled) { return $false }
+    $work = $d.Work
+    $work.Cancelled = $true
+    try { [void]$work.PowerShell.BeginStop($null, $null) } catch { $null = $_ } # a pipeline that ended on its own needs no stop
+    $d.ListState = $d.ListPrevState
+    $d.ListMsg = $d.ListPrevMsg
+    $d.CancelNote = $true
+    $k = $d.Ctl
+    if ($d.ListByCheckbox) {
+        $d.NoReact = $true
+        try { $k.ChkHandled.Checked = [bool]$d.IncludeHandled } finally { $d.NoReact = $false }
+    }
+    $d.ListByCheckbox = $false
+    Update-RrView $d
+    try { if ($k.List.Visible) { [void]$k.List.Focus() } } catch { $null = $_ } # the Cancel link is gone: keep the keyboard focus in the dialog
+    $true
 }
 
 function Get-RrListNote($Messages, [int]$Picked = 0, [bool]$Handled = $false, [int]$RawPending = 0) {
@@ -1047,6 +1165,9 @@ function Start-RrConnect($d) {
     if ($d.Work -or $d.ConnectState -eq 'working') { return }
     $d.ConnectState = 'working'
     $d.ConnectMsg = ''
+    $k = $d.Ctl
+    $k.LblConnect.Text = $(if (Test-RrSignInHelper) { 'Waiting for you to sign in... If the sign-in window is not in front, click Show sign-in window.' } else { "Waiting for you to sign in... If you don't see the sign-in window, check the taskbar." })
+    Start-RrSignInWatch $d
     $session = Get-RrDialogSession $d
     Enable-RrForeground
     $d.Work = Invoke-RrStep $session (Get-RrConnectScript) @{}
@@ -1055,9 +1176,12 @@ function Start-RrConnect($d) {
     Update-RrView $d
 }
 
-function Start-RrList($d) {
+function Start-RrList($d, [switch]$FromCheckbox) {
     if ($d.Work -or $d.ConnectState -ne 'done') { return }
     $k = $d.Ctl
+    $d.ListPrevState = $d.ListState; $d.ListPrevMsg = $d.ListMsg   # what Cancel goes back to
+    $d.ListByCheckbox = [bool]$FromCheckbox
+    $d.CancelNote = $false
     $d.ListState = 'loading'
     $d.ListMsg = 'Loading release requests...'
     $session = Get-RrDialogSession $d
@@ -1139,15 +1263,22 @@ function Invoke-RrPoll($d) {
     $work = $d.Work
     if (-not $work) { $d.Poll.Stop(); return }
     if (-not $work.Handle.IsCompleted) {
-        if ($d.WorkKind -eq 'list' -and $d.Session) {
+        if ($d.WorkKind -eq 'connect') { Step-RrSignInWatch $d; return }
+        if ($d.WorkKind -eq 'list' -and $d.Session -and -not $work.Cancelled) {
             $progress = [string]$d.Session.State['Progress']
-            if ($progress -and $progress -ne $d.ListMsg) { $d.ListMsg = $progress; $d.Ctl.LblList.Text = $progress }
+            if ($progress -and $progress -ne $d.ListMsg) { $d.ListMsg = $progress; $d.Ctl.LblList.Text = $progress; Update-RrCancelLink $d }
         }
         return
     }
     $d.Poll.Stop()
     $d.Work = $null
     $res = Complete-RrStep $work
+    if ($work.Cancelled) {
+        # a cancelled list step has ended: its rows and its errors are not applied; the dialog is free for the next step
+        Update-RrView $d
+        Invoke-RrPendingRefresh $d
+        return
+    }
     switch ($d.WorkKind) {
         'connect' {
             if ($res.Error) {
@@ -1200,7 +1331,13 @@ function Stop-RrDialog($d) {
 }
 
 function New-RrDialog {
-    param([string]$Incoming = '', [string[]]$SessionFunctions = @(), [switch]$NoAutoStart)
+    param([string]$Incoming = '', [string[]]$SessionFunctions = @(), [switch]$NoAutoStart, $Owner = $null)
+    if ($script:QraPerMonitor) {
+        # Built for the screen it opens on: its owner's (it opens centred on it), else the one with the mouse. Screenshots and tests (NoAutoStart) keep the current scale.
+        $ownerDpi = Get-QraWindowDpi $Owner
+        if ($ownerDpi -le 0) { $ownerDpi = Get-QraFormDpi $Owner }
+        if ($ownerDpi -gt 0) { Set-QraEmulatedDpi $ownerDpi } elseif (-not $NoAutoStart) { Set-QraEmulatedDpi (Get-QraMonitorDpi) }
+    }
     $fonts = @{
         Title = (New-Font 18 'Bold' 'Display'); Sub = (New-Font 10); Row = (New-Font 11 'Bold'); Body = (New-Font 10); BodyBold = (New-Font 10 'Bold')
         Mono = (New-Font 9.5 'Regular' 'Mono'); Note = (New-Font 9.5)
@@ -1248,7 +1385,7 @@ function New-RrDialog {
     $form.ResumeLayout($false)
     # Applied after ResumeLayout, like the launcher: an earlier ambient font would scale every control twice.
     $form.Font = $fonts.Body
-    Limit-FormToScreen $form
+    Limit-FormToScreen $form $Owner
 
     # ---- everything below is created after scaling, so every number goes through S()
     $k = @{ Scroll = $scroll }
@@ -1259,6 +1396,8 @@ function New-RrDialog {
         SaveState = 'idle'; SaveProgress = ''; SaveSummary = ''; SaveProblems = ''; SaveAllOk = $false; RejectedText = ''; Rows = @(); IncludeHandled = $false; RawPending = 0
         Steps = @(); Ready = $false; InLayout = $false
         ColNames = @('Received', 'Sender', 'Recipients', 'Subject', 'Quarantine type', 'Copies', 'Expires'); SortColumn = 'Received'; SortDesc = $true; PendingRefresh = $false; Populating = $false
+        ListPrevState = 'idle'; ListPrevMsg = ''; ListByCheckbox = $false; CancelNote = $false; NoReact = $false
+        SignInOld = @{}; SignInSeen = @{}; SignInLatest = [int64]0; SignInUntil = $null
     }
     $form.Tag = $d
 
@@ -1291,6 +1430,7 @@ function New-RrDialog {
     $k.BSignIn = New-RrButton 'Sign in' 'Primary' $QraGlyph.Shield $fonts.BodyBold
     $k.SpConnect = New-QraSpinner (S 24); $k.SpConnect.Visible = $false
     $k.LblConnect = New-RrLabel "Waiting for you to sign in... If you don't see the sign-in window, check the taskbar." $fonts.BodyBold $C.Text
+    $k.BShowSignIn = New-RrButton 'Show sign-in window' 'Link' '' $fonts.Body
     $k.LblConnectErr = New-RrLabel '' $fonts.BodyBold $C.Danger
 
     # step 3: choose messages
@@ -1301,14 +1441,15 @@ function New-RrDialog {
     $k.Recip = New-Object System.Windows.Forms.TextBox
     $k.Recip.Font = $fonts.Body; $k.Recip.Visible = $false
     $k.BRefresh = New-RrButton 'Refresh list' 'Secondary' $QraGlyph.Refresh $fonts.Body
-    $k.ChkHandled = New-Object System.Windows.Forms.CheckBox
-    $k.ChkHandled.Text = 'Also show released and denied messages'; $k.ChkHandled.Font = $fonts.Body; $k.ChkHandled.ForeColor = $C.Text; $k.ChkHandled.BackColor = $C.Card
+    $k.ChkHandled = New-QraCheckBox 'Also show released and denied messages'
+    $k.ChkHandled.Font = $fonts.Body; $k.ChkHandled.ForeColor = $C.Text; $k.ChkHandled.BackColor = $C.Card
     $k.ChkHandled.AutoSize = $false; $k.ChkHandled.UseMnemonic = $false; $k.ChkHandled.Visible = $false
     $k.LblHandled = New-RrLabel 'Includes messages released by an admin without a request.' $fonts.Body $C.TextMuted
     $lv = New-Object System.Windows.Forms.ListView
     $lv.View = 'Details'; $lv.CheckBoxes = $true; $lv.FullRowSelect = $true; $lv.HideSelection = $false; $lv.MultiSelect = $false
     $lv.HeaderStyle = 'Clickable'; $lv.BorderStyle = 'FixedSingle'; $lv.Font = $fonts.Body
     $lv.BackColor = $C.Card; $lv.ForeColor = $C.Text; $lv.Visible = $false; $lv.ShowItemToolTips = $true
+    [void](Set-QraListCheckImages $lv)   # row check boxes in the same painted look, at the current scale (rebuilt on a DPI change)
     foreach ($col in @(@('Received', 128), @('Sender', 130), @('Recipients', 185), @('Subject', 160), @('Quarantine type', 108), @('Copies', 290), @('Expires', 84))) {
         [void]$lv.Columns.Add([string]$col[0], (S $col[1]))
     }
@@ -1316,6 +1457,8 @@ function New-RrDialog {
     Update-RrSortHeaders $d
     $k.SpList = New-QraSpinner (S 24); $k.SpList.Visible = $false
     $k.LblList = New-RrLabel '' $fonts.Body $C.TextMuted
+    $k.BCancel = New-RrButton 'Cancel' 'Link' '' $fonts.Body
+    $k.LblCancelNote = New-RrLabel 'Loading cancelled.' $fonts.Body $C.TextMuted
     $k.LblListHint = New-RrLabel 'One row per message. Saving exports one copy; decide for all copies in Defender.' $fonts.Body $C.TextMuted
 
     # step 4: save
@@ -1334,8 +1477,8 @@ function New-RrDialog {
     $k.Rej.Multiline = $true; $k.Rej.ReadOnly = $true; $k.Rej.ScrollBars = 'Vertical'; $k.Rej.Font = $fonts.Mono; $k.Rej.Visible = $false
     $k.BCopyDet = New-RrButton 'Copy details' 'Secondary' $QraGlyph.Copy $fonts.Body
 
-    $scroll.Controls.AddRange(@($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.LblConnectErr,
-                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.LblListHint,
+    $scroll.Controls.AddRange(@($k.I0Num + $k.I0Txt + @($k.BInstall, $k.BCopyCmd, $k.SpInstall, $k.LblWait, $k.LblInstallMsg, $k.BSignIn, $k.SpConnect, $k.LblConnect, $k.BShowSignIn, $k.LblConnectErr,
+                $k.LblDays, $k.Days, $k.LblRecip, $k.Recip, $k.BRefresh, $k.ChkHandled, $k.LblHandled, $k.List, $k.SpList, $k.LblList, $k.BCancel, $k.LblCancelNote, $k.LblListHint,
                 $k.LblPw, $k.Pw, $k.LblPwNote, $k.BSave, $k.SpSave, $k.LblSave, $k.LblSaved, $k.LblProblems, $k.LblRejHead, $k.Rej, $k.BCopyDet)))
 
     # footer: a read-only reminder on the left, Close on the right
@@ -1351,6 +1494,7 @@ function New-RrDialog {
         param($s)
         $dd = $s.FindForm().Tag
         if (-not $dd) { return }
+        Use-QraFormDpi $dd.Form
         $kk = $dd.Ctl
         $kk.BClose.SetBounds(($kk.Footer.ClientSize.Width - (S 24) - (S 110)), (S 10), (S 110), (S 36))
         $kk.FootNote.SetBounds((S 26), (S 10), ($kk.Footer.ClientSize.Width - (S 190)), (S 36))
@@ -1373,7 +1517,14 @@ function New-RrDialog {
             try { [System.Windows.Forms.Clipboard]::SetText((Get-RrInstallCommand)); Show-QraCopied $s 'Copied' } catch { $null = $_ } # the clipboard can be busy
         })
     $k.BSignIn.Add_Click({ param($s) Start-RrConnect $s.FindForm().Tag })
+    $k.BShowSignIn.Add_Click({ param($s) [void](Show-RrSignIn $s.FindForm().Tag) })
     $k.BRefresh.Add_Click({ param($s) Start-RrList $s.FindForm().Tag })
+    $k.BCancel.Add_Click({ param($s) [void](Stop-RrListLoad $s.FindForm().Tag) })
+    $form.KeyPreview = $true
+    $form.Add_KeyDown({ param($s, $e)   # Esc cancels a list load, and only then (otherwise it does nothing, as before)
+            $dd = $s.Tag
+            if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and $dd -and $dd.Ready -and $dd.ListState -eq 'loading' -and (Stop-RrListLoad $dd)) { $e.Handled = $true; $e.SuppressKeyPress = $true }
+        })
     $k.BSave.Add_Click({ param($s) Start-RrSave $s.FindForm().Tag })
     $k.BCopyDet.Add_Click({ param($s)
             $dd = $s.FindForm().Tag
@@ -1394,9 +1545,11 @@ function New-RrDialog {
     Set-Access $k.BInstall 'Install the ExchangeOnlineManagement module for my account'
     Set-Access $k.BCopyCmd 'Copy the install command'
     Set-Access $k.BSignIn 'Sign in to Exchange Online'
+    Set-Access $k.BShowSignIn 'Bring the Microsoft sign-in window to the front'
     Set-Access $k.Days 'Days to look back'
     Set-Access $k.Recip 'Recipient address filter, optional. Press Enter or Refresh list to apply'
     Set-Access $k.BRefresh 'Refresh the list of release requests'
+    Set-Access $k.BCancel 'Cancel loading the release requests'
     Set-Access $k.ChkHandled 'Also show released and denied messages'
     Set-Access $k.List 'Messages with release requests, select the messages to save. Use the column headers to sort.'
     Set-Access $k.Pw 'Download password'
@@ -1405,22 +1558,33 @@ function New-RrDialog {
     Set-Access $k.BCopyDet 'Copy the details of the rejected export'
     Set-Access $k.BClose 'Close this window'
     $ti = 0
-    foreach ($ctl in @($k.BInstall, $k.BCopyCmd, $k.BSignIn, $k.Days, $k.Recip, $k.ChkHandled, $k.BRefresh, $k.List, $k.Pw, $k.BSave, $k.Rej, $k.BCopyDet)) { $ctl.TabIndex = $ti++ }
+    foreach ($ctl in @($k.BInstall, $k.BCopyCmd, $k.BSignIn, $k.BShowSignIn, $k.Days, $k.Recip, $k.ChkHandled, $k.BRefresh, $k.BCancel, $k.List, $k.Pw, $k.BSave, $k.Rej, $k.BCopyDet)) { $ctl.TabIndex = $ti++ }
     $k.BClose.TabIndex = 0
 
     $d.Ready = $true
+    $d.PlaceFooter = $placeFooter
     & $placeFooter $footer $null
+    # Rescaled live when the window is dragged to a screen with another scale (no-op in system mode, the fallback and Constrained Language Mode).
+    [void](Register-QraDpiWindow $form -FontTables @($fonts) -Relayout {
+            param($f)
+            $dd = $f.Tag
+            & $dd.PlaceFooter $dd.Ctl.Footer $null
+            Use-QraFormDpi $f
+            [void](Set-QraListCheckImages $dd.Ctl.List)   # the row check boxes follow the new scale
+            Update-RrView $dd
+        })
     $d
 }
 
 function Show-ReleaseRequestDialog {
     param([string]$Incoming, $Owner)
-    $d = New-RrDialog -Incoming $Incoming
+    $d = New-RrDialog -Incoming $Incoming -Owner $Owner
     try {
         if ($Owner) { $d.Form.StartPosition = 'CenterParent'; [void]$d.Form.ShowDialog($Owner) } else { [void]$d.Form.ShowDialog() }
     } finally {
         Stop-RrDialog $d
         $d.Form.Dispose()
+        Use-QraFormDpi $Owner   # the owner's scale is the current one again
     }
 }
 
@@ -1479,6 +1643,14 @@ function Set-RrScreenshotState($d, [string]$State = 'results') {
     $d.SaveAllOk = $true
     $d.SaveProblems = ''
     $d.RejectedText = ''
+    if ($State -eq 'loading') {
+        # the checkbox is ticked and its load is running: the spinner, the progress note and the Cancel link
+        $d.NoReact = $true
+        try { $k.ChkHandled.Checked = $true } finally { $d.NoReact = $false }
+        $d.ListState = 'loading'; $d.ListMsg = 'Checking other copies (12 of 31)...'; $d.ListByCheckbox = $true
+        $d.SaveState = 'idle'; $d.SaveSummary = ''
+        $k.Pw.Text = ''
+    }
     Update-RrView $d
 }
 
@@ -1487,6 +1659,8 @@ if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
+    try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { $null = $_ } # GDI text like the launcher; too late if a control already exists
+    if ($RrScreenshot) { $env:QRA_DPI_MODE = 'system' }   # review pictures: one fixed system DPI, no per-monitor behaviour
     . (Join-Path $PSScriptRoot 'QraUi.ps1')
     [System.Windows.Forms.Application]::EnableVisualStyles()
     if (-not $RrIncoming) { $RrIncoming = Join-Path (Split-Path -Parent $PSScriptRoot) 'Incoming' }

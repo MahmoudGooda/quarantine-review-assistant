@@ -1457,6 +1457,123 @@ Describe 'ReleaseRequests: -Screenshot' -Tag 'Screenshot' {
     }
 }
 
+Describe 'ReleaseRequests: Show sign-in window link (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $script:SiHold = Join-Path ([IO.Path]::GetTempPath()) ('qra-rr-hold-' + [guid]::NewGuid().ToString('N'))
+        $script:SiHead = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+. '$($script:KitPath)'
+[System.Windows.Forms.Application]::EnableVisualStyles()
+. '$($script:RrPath)'
+`$holdFile = '$($script:SiHold)'
+function Show-Offscreen(`$form) {
+    `$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.StartPosition = 'Manual'
+    `$form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+}
+function Wait-Until([scriptblock]`$cond, [int]`$seconds = 40) {
+    `$end = [DateTime]::UtcNow.AddSeconds(`$seconds)
+    while (-not (& `$cond) -and [DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 25 }
+}
+function Pump([int]`$ms) { `$end = [DateTime]::UtcNow.AddMilliseconds(`$ms); while ([DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 20 } }
+"@ + "`r`n"
+        # The stub connect waits while the hold file exists (about 30 seconds at most), so the dialog stays in 'working'.
+        $script:SiStubs = @'
+function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) for ($i = 0; $i -lt 300 -and (Test-Path -LiteralPath $using:holdFile); $i++) { Start-Sleep -Milliseconds 100 } }
+function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
+function Get-QuarantineMessage { [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId) }
+'@
+    }
+    AfterAll { Remove-Item -LiteralPath $script:SiHold -Force -ErrorAction SilentlyContinue }
+    It 'shows the link above the waiting text while connecting, ignores existing windows, brings a new one forward once, and hides the link when connected' {
+        New-Item -ItemType File -Path $script:SiHold -Force | Out-Null
+        # the runspace of the dialog does not see $using:, so the hold file path is written into the stub itself
+        $stubs = $script:SiStubs.Replace('$using:holdFile', "'" + $script:SiHold + "'")
+        $r = Get-ChildJson (Invoke-ChildPs ($script:SiHead + $stubs + @'
+$script:Brought = @()
+$script:Frames = @([int64]111)
+$script:RrFrameFinder = { $script:Frames }
+$script:RrFrameBringer = { param($h) $script:Brought += [int64]$h; $true }
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-signin') -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage') -NoAutoStart
+Show-Offscreen $d.Form
+$d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
+Update-RrView $d
+$out = [ordered]@{ hiddenIdle = (-not $d.Ctl.BShowSignIn.Visible); linkType = $d.Ctl.BShowSignIn.GetType().FullName; variant = [string]$d.Ctl.BShowSignIn.Variant; linkText = $d.Ctl.BShowSignIn.Text }
+$d.Ctl.BSignIn.PerformClick()
+$out.state = $d.ConnectState
+$out.linkVisible = [bool]$d.Ctl.BShowSignIn.Visible
+$out.hint = $d.Ctl.LblConnect.Text
+$par = $d.Ctl.BShowSignIn.Parent
+$out.linkAboveLabel = ($par.Controls.GetChildIndex($d.Ctl.BShowSignIn) -lt $par.Controls.GetChildIndex($d.Ctl.LblConnect))
+$out.linkInside = ($d.Ctl.BShowSignIn.Right -le $par.ClientSize.Width)
+Pump 700
+$out.broughtLeftover = @($script:Brought).Count
+$script:Frames = @([int64]111, [int64]222)
+Pump 700
+$out.broughtNew = (@($script:Brought) -join ',')
+Pump 700
+$out.broughtOnce = @($script:Brought).Count
+$d.Ctl.BShowSignIn.PerformClick()
+$out.afterClick = (@($script:Brought) -join ',')
+Remove-Item -LiteralPath $holdFile -Force
+Wait-Until { $d.ConnectState -eq 'done' }
+Pump 300
+$out.connected = $d.ConnectState
+$out.linkHiddenAfter = (-not $d.Ctl.BShowSignIn.Visible)
+$n = @($script:Brought).Count
+$script:Frames = @([int64]111, [int64]222, [int64]333)
+Pump 700
+$out.noMoreAfterConnect = (@($script:Brought).Count -eq $n)
+$d.Form.Close()
+$out | ConvertTo-Json -Compress
+'@))
+        $r.hiddenIdle | Should -BeTrue
+        $r.linkType | Should -Be 'QraUi.ModernButton'
+        $r.variant | Should -Be 'Link'
+        $r.linkText | Should -Be 'Show sign-in window'
+        $r.state | Should -Be 'working'
+        $r.linkVisible | Should -BeTrue
+        $r.hint | Should -Be 'Waiting for you to sign in... If the sign-in window is not in front, click Show sign-in window.'
+        $r.linkAboveLabel | Should -BeTrue -Because 'the full-width waiting text must not paint over the link'
+        $r.linkInside | Should -BeTrue
+        $r.broughtLeftover | Should -Be 0 -Because 'windows that existed before Sign in are leftovers'
+        $r.broughtNew | Should -Be '222'
+        $r.broughtOnce | Should -Be 1
+        $r.afterClick | Should -Be '222,222'
+        $r.connected | Should -Be 'done'
+        $r.linkHiddenAfter | Should -BeTrue
+        $r.noMoreAfterConnect | Should -BeTrue
+    }
+    It 'in fallback mode (no compiled C#) hides the link and keeps the old hint' {
+        $r = Get-ChildJson (Invoke-ChildPs (@"
+`$env:QRA_UI_FALLBACK = '1'
+"@ + "`r`n" + $script:SiHead + $script:SiStubs.Replace('$using:holdFile', "'" + $script:SiHold + "'") + @'
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-signin') -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage') -NoAutoStart
+Show-Offscreen $d.Form
+$d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
+Update-RrView $d
+$d.Ctl.BSignIn.PerformClick()
+$out = [ordered]@{ native = [bool]$script:UiNative; state = $d.ConnectState; linkHidden = (-not $d.Ctl.BShowSignIn.Visible); hint = $d.Ctl.LblConnect.Text; frames = @(Get-RrSignInFrames).Count }
+$d.Form.Close()
+$out | ConvertTo-Json -Compress
+'@))
+        $r.native | Should -BeFalse
+        $r.state | Should -Be 'working'
+        $r.linkHidden | Should -BeTrue
+        $r.hint | Should -Be "Waiting for you to sign in... If you don't see the sign-in window, check the taskbar."
+        $r.frames | Should -Be 0
+    }
+    It 'has the hint, the link and the 30 second limit in the source, and changes nothing about the connect call' {
+        $t = [IO.File]::ReadAllText($script:RrPath)
+        $t.Contains("'Waiting for you to sign in... If the sign-in window is not in front, click Show sign-in window.'") | Should -BeTrue
+        $t.Contains("New-RrButton 'Show sign-in window' 'Link'") | Should -BeTrue
+        $t.Contains('$script:RrSignInSeconds = 30') | Should -BeTrue
+        $t.Contains('Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop') | Should -BeTrue
+    }
+}
+
 Describe 'ReleaseRequests: source scans' {
     BeforeAll { $script:RrSource = [IO.File]::ReadAllText($script:RrPath) }
     It 'is read-only: no release, delete, block-list or Set-* Exchange cmdlets' {
@@ -1515,5 +1632,355 @@ Describe 'Release requests: wording and window chrome' {
     It 'gives the dialog the app icon and the taskbar identity (not for the screenshot build)' {
         $t = [IO.File]::ReadAllText($script:RrPath)
         $t.Contains('Set-QraWindowChrome $form -NoAppId:([bool]$NoAutoStart)') | Should -BeTrue
+    }
+}
+
+Describe 'ReleaseRequests: per-monitor DPI (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $script:DpiHead = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+"@ + "`r`n"
+        $script:DpiTail = @"
+. '$($script:KitPath)'
+[System.Windows.Forms.Application]::EnableVisualStyles()
+. '$($script:RrPath)'
+function Show-Offscreen(`$form) {
+    `$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.StartPosition = 'Manual'
+    `$form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+}
+"@ + "`r`n"
+    }
+    It 'registers the dialog; a change of DPI rescales its fonts, columns and form, and Update-RrView runs again' {
+        $out = Invoke-ChildPs ($script:DpiHead + $script:DpiTail + @'
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-none') -NoAutoStart
+Set-RrScreenshotState $d 'results'   # not shown: there is no window, so Windows sends no DPI message of its own
+$base = Get-QraFormDpi $d.Form
+$lv = $d.Ctl.List
+$before = [ordered]@{ w = $d.Form.Width; h = $d.Form.Height; body = $d.Fonts.Body.Size; list = $lv.Font.Size }
+$target = [int]($base * 0.75)
+Invoke-QraDpiChange $d.Form $target (New-Object System.Drawing.Rectangle(10, 10, [int]($before.w * 0.75), [int]($before.h * 0.75)))
+$colSum = ($lv.Columns | Measure-Object -Property Width -Sum).Sum
+[ordered]@{ base = $base; stored = (Get-QraFormDpi $d.Form); err = $script:QraDpiLastError; bodyRatio = [Math]::Round($d.Fonts.Body.Size / $before.body, 3); listRatio = [Math]::Round($lv.Font.Size / $before.list, 3)
+    colsFit = ($colSum -le $lv.ClientSize.Width); colsUsed = ($colSum -gt ($lv.ClientSize.Width * 0.8)); width = $d.Form.Width; expectWidth = [int]($before.w * 0.75); rows = $lv.Items.Count } | ConvertTo-Json -Compress
+$d.Form.Dispose()
+'@)
+        $r = ($out | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json
+        $r.base | Should -BeGreaterThan 0
+        $r.stored | Should -Be ([int]($r.base * 0.75))
+        $r.err | Should -BeNullOrEmpty
+        $r.bodyRatio | Should -BeGreaterThan 0.74; $r.bodyRatio | Should -BeLessThan 0.76
+        $r.listRatio | Should -BeGreaterThan 0.74; $r.listRatio | Should -BeLessThan 0.76
+        $r.colsFit | Should -BeTrue -Because 'Set-RrListColumns ran again for the new size'
+        $r.colsUsed | Should -BeTrue
+        $r.width | Should -Be $r.expectWidth
+        $r.rows | Should -Be 3
+    }
+    It 'in system mode the dialog is not registered and nothing rescales' {
+        $out = Invoke-ChildPs ($script:DpiHead + "`$env:QRA_DPI_MODE = 'system'`r`n" + $script:DpiTail + @'
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-none') -NoAutoStart
+[ordered]@{ stored = (Get-QraFormDpi $d.Form); perMonitor = $script:QraPerMonitor; unit = [string]$d.Fonts.Body.Unit } | ConvertTo-Json -Compress
+$d.Form.Dispose()
+'@)
+        $r = ($out | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json
+        $r.stored | Should -Be 0
+        $r.perMonitor | Should -BeFalse
+        $r.unit | Should -Be 'Point'
+    }
+    It 'opens at the DPI of its owner and gives the owner''s scale back when it closes' {
+        $src = [IO.File]::ReadAllText($script:RrPath)
+        $src.Contains('New-RrDialog -Incoming $Incoming -Owner $Owner') | Should -BeTrue
+        $src | Should -Match 'Get-QraWindowDpi \$Owner'
+        $src.Contains('Limit-FormToScreen $form $Owner') | Should -BeTrue
+        $closing = $src.Substring($src.IndexOf('function Show-ReleaseRequestDialog'), 700)
+        $closing | Should -Match 'finally \{[\s\S]*Use-QraFormDpi \$Owner'
+    }
+    It 'Update-RrView, Set-RrRows and the footer layout take the dialog''s own scale first' {
+        foreach ($fn in 'Update-RrView', 'Set-RrRows') { (Get-Command $fn).ScriptBlock.ToString() | Should -Match 'Use-QraFormDpi \$d\.Form' }
+        (Get-Command Update-RrView).ScriptBlock.ToString() | Should -Match '\$script:QraDpiBusy'
+        [IO.File]::ReadAllText($script:RrPath) | Should -Match 'Use-QraFormDpi \$dd\.Form'
+    }
+}
+
+Describe 'ReleaseRequests: cancelling a list load and the painted check boxes (child Windows PowerShell 5.1)' {
+    BeforeAll {
+        $script:CancelHead = @"
+`$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -Namespace CancelTest -Name Win -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr SendMessage(System.IntPtr h, int msg, System.IntPtr w, System.IntPtr l);'
+. '$($script:KitPath)'
+[System.Windows.Forms.Application]::EnableVisualStyles()
+. '$($script:RrPath)'
+function Show-Offscreen(`$form) {
+    `$form.ShowInTaskbar = `$false; `$form.Opacity = 0; `$form.StartPosition = 'Manual'
+    `$form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    `$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+}
+function Wait-Until([scriptblock]`$cond, [int]`$seconds = 40) {
+    `$end = [DateTime]::UtcNow.AddSeconds(`$seconds)
+    while (-not (& `$cond) -and [DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 25 }
+}
+function Pump([int]`$ms) { `$end = [DateTime]::UtcNow.AddMilliseconds(`$ms); while ([DateTime]::UtcNow -lt `$end) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 20 } }
+function Out-AsciiJson(`$obj) {
+    `$j = `$obj | ConvertTo-Json -Compress -Depth 5
+    [regex]::Replace(`$j, '[^\x00-\x7F]', { param(`$m) ('\u{0:x4}' -f [int][char]`$m.Value) })
+}
+"@ + "`r`n"
+        # The stub listing cmdlet runs in the dialog's session. While $State.Slow is set it takes about 30 seconds (in short sleeps, so a stop reaches it quickly).
+        $script:CancelStubs = @'
+function Connect-ExchangeOnline { [CmdletBinding()] param([switch]$ShowBanner) }
+function Disconnect-ExchangeOnline { [CmdletBinding()] param([switch]$Confirm) }
+function Get-QuarantineMessage {
+    [CmdletBinding()] param($ReleaseStatus, $PageSize, $StartReceivedDate, $EndReceivedDate, $RecipientAddress, $MessageId)
+    $State.Calls = @($State.Calls | Where-Object { $_ }) + "status=$ReleaseStatus"
+    if ($State.Slow) { for ($i = 0; $i -lt 300; $i++) { Start-Sleep -Milliseconds 100 } }
+    function Row($n, $at, $who, $subject, $status) { [pscustomobject]@{ Identity = "g$n\a$n"; ReleaseStatus = $status; Released = $false; ReceivedTime = [datetime]("2026-11-25 $at")
+        SenderAddress = "$who@invoice-pay.example"; RecipientAddress = @("r$n@corp.example"); Subject = $subject; QuarantineTypes = 'Phish'; Expires = [datetime]'2026-12-25' } }
+    if ($ReleaseStatus -eq 'Requested') { Row 1 '08:10' 'ccc' 'one' 'REQUESTED'; Row 2 '09:00' 'aaa' 'two' 'REQUESTED'; Row 3 '10:00' 'bbb' 'three' 'REQUESTED' }
+    if ($ReleaseStatus -eq 'Denied') { Row 4 '07:00' 'ddd' 'four' 'DENIED' }
+}
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-cancel') -SessionFunctions @('Connect-ExchangeOnline', 'Disconnect-ExchangeOnline', 'Get-QuarantineMessage') -NoAutoStart
+Show-Offscreen $d.Form
+$d.Module = [pscustomobject]@{ Installed = $true; Version = '9.9.9'; InstallCommand = '' }
+Update-RrView $d
+$d.Ctl.BSignIn.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' -or $d.ListState -eq 'failed' }
+$sess = $d.Session
+function Keys { (@($d.Ctl.List.Items | ForEach-Object { $_.Tag.Key }) -join ',') }
+function Ticked { (@($d.Ctl.List.CheckedItems | ForEach-Object { $_.Tag.Key } | Sort-Object) -join ',') }
+function Requested { @($sess.State.Calls | Where-Object { $_ -eq 'status=Requested' }).Count }
+'@
+    }
+    It 'shows a Cancel link while a list loads, cancels without blocking, keeps rows and ticks, reverts the checkbox, and the next list works' {
+        $r = Get-ChildJson (Invoke-ChildPs ($script:CancelHead + $script:CancelStubs + @'
+$out = [ordered]@{ kind = $d.Ctl.ChkHandled.GetType().FullName; listKeys = (Keys); loadedState = $d.ListState; cancelHiddenIdle = (-not $d.Ctl.BCancel.Visible); cancelType = $d.Ctl.BCancel.GetType().FullName; cancelVariant = [string]$d.Ctl.BCancel.Variant }
+foreach ($it in $d.Ctl.List.Items) { if ($it.Tag.Key -eq 'g1' -or $it.Tag.Key -eq 'g2') { $it.Checked = $true } }
+$out.tickBefore = (Ticked); $out.msgBefore = $d.ListMsg
+$sess.State.Slow = $true
+$sess.State.Calls = @()
+$d.Ctl.ChkHandled.Checked = $true
+$out.loading = $d.ListState; $out.cancelShown = [bool]$d.Ctl.BCancel.Visible; $out.cancelText = $d.Ctl.BCancel.Text; $out.byCheckbox = [bool]$d.ListByCheckbox
+$out.cancelRightOfNote = ($d.Ctl.BCancel.Left -gt $d.Ctl.LblList.Left)
+$out.cancelAboveNote = ($d.Ctl.BCancel.Parent.Controls.GetChildIndex($d.Ctl.BCancel) -lt $d.Ctl.LblList.Parent.Controls.GetChildIndex($d.Ctl.LblList))   # lower index = drawn on top; the full-width note must not cover the link on screen
+# the window keeps pumping while the step sleeps
+$ticks = 0; $end = [DateTime]::UtcNow.AddMilliseconds(600); while ([DateTime]::UtcNow -lt $end) { [System.Windows.Forms.Application]::DoEvents(); $ticks++; Start-Sleep -Milliseconds 20 }
+$out.pumped = $ticks
+$work = $d.Work
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$d.Ctl.BCancel.PerformClick()
+$out.clickMs = [int]$sw.ElapsedMilliseconds
+$out.afterState = $d.ListState; $out.afterChecked = [bool]$d.Ctl.ChkHandled.Checked; $out.noteShown = [bool]$d.Ctl.LblCancelNote.Visible; $out.noteText = $d.Ctl.LblCancelNote.Text
+$out.cancelGone = (-not $d.Ctl.BCancel.Visible); $out.spinnerOff = (-not $d.Ctl.SpList.Visible)
+$out.keysAfter = (Keys); $out.tickAfter = (Ticked); $out.msgAfter = $d.ListMsg; $out.cancelledFlag = [bool]$work.Cancelled
+$out.workHeld = [bool]$d.Work     # the stopping step still owns the session until it has ended
+$out.refreshDisabledWhileStopping = (-not $d.Ctl.BRefresh.Enabled)
+Wait-Until { -not $d.Work } 30
+$out.stoppedMs = [int]$sw.ElapsedMilliseconds; $out.workCleared = (-not $d.Work); $out.sessionCurrentCleared = ($null -eq $sess.Current)
+Pump 300
+$out.keysSettled = (Keys); $out.tickSettled = (Ticked); $out.stateSettled = $d.ListState; $out.noteStill = [bool]$d.Ctl.LblCancelNote.Visible; $out.requestedOnce = (Requested); $out.pending = [bool]$d.PendingRefresh
+$out.connect = $d.ConnectState; $out.refreshEnabledAfter = [bool]$d.Ctl.BRefresh.Enabled
+# the session and the connection are still usable: a following list step works (and its result is applied)
+$sess.State.Slow = $false
+$sess.State.Calls = @()
+$d.Ctl.ChkHandled.Checked = $true
+Wait-Until { $d.ListState -eq 'loaded' }
+$out.nextState = $d.ListState; $out.nextKeys = (Keys); $out.nextTicked = (Ticked); $out.nextChecked = [bool]$d.Ctl.ChkHandled.Checked; $out.nextNote = [bool]$d.Ctl.LblCancelNote.Visible; $out.nextHandled = [bool]$d.IncludeHandled
+$d.Ctl.BRefresh.PerformClick()
+Wait-Until { $d.ListState -eq 'loaded' -and -not $d.Work }
+$out.refreshKeys = (Keys); $out.refreshState = $d.ListState
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]$out)
+'@))
+        $r.kind | Should -Be 'QraUi.CheckBox'
+        $r.listKeys | Should -Be 'g3,g2,g1'
+        $r.cancelHiddenIdle | Should -BeTrue
+        $r.cancelType | Should -Be 'QraUi.ModernButton'
+        $r.cancelVariant | Should -Be 'Link'
+        $r.tickBefore | Should -Be 'g1,g2'
+        $r.loading | Should -Be 'loading'
+        $r.cancelShown | Should -BeTrue
+        $r.cancelText | Should -Be 'Cancel'
+        $r.byCheckbox | Should -BeTrue
+        $r.cancelRightOfNote | Should -BeTrue
+        $r.cancelAboveNote | Should -BeTrue -Because 'the opaque full-width note label painted over the link on a real screen (DrawToBitmap hid this)'
+        $r.pumped | Should -BeGreaterThan 10 -Because 'the UI thread is free while the list step runs'
+        $r.clickMs | Should -BeLessThan 1500 -Because 'Cancel does not wait for the pipeline'
+        $r.afterState | Should -Be 'loaded' -Because 'back to the state before the load'
+        $r.afterChecked | Should -BeFalse -Because 'the checkbox goes back to its previous state'
+        $r.noteShown | Should -BeTrue
+        $r.noteText | Should -Be 'Loading cancelled.'
+        $r.cancelGone | Should -BeTrue
+        $r.spinnerOff | Should -BeTrue
+        $r.keysAfter | Should -Be 'g3,g2,g1'
+        $r.tickAfter | Should -Be 'g1,g2'
+        $r.msgAfter | Should -Be $r.msgBefore
+        $r.cancelledFlag | Should -BeTrue
+        $r.workHeld | Should -BeTrue
+        $r.refreshDisabledWhileStopping | Should -BeTrue
+        $r.workCleared | Should -BeTrue
+        $r.stoppedMs | Should -BeLessThan 15000
+        $r.sessionCurrentCleared | Should -BeTrue
+        $r.keysSettled | Should -Be 'g3,g2,g1' -Because 'the cancelled step applies no rows'
+        $r.tickSettled | Should -Be 'g1,g2'
+        $r.stateSettled | Should -Be 'loaded'
+        $r.noteStill | Should -BeTrue
+        $r.requestedOnce | Should -Be 1
+        $r.pending | Should -BeFalse
+        $r.connect | Should -Be 'done'
+        $r.refreshEnabledAfter | Should -BeTrue
+        $r.nextState | Should -Be 'loaded'
+        $r.nextKeys | Should -Be 'g3,g2,g1,g4'
+        $r.nextTicked | Should -Be 'g1,g2'
+        $r.nextChecked | Should -BeTrue
+        $r.nextHandled | Should -BeTrue
+        $r.nextNote | Should -BeFalse -Because 'the note goes away with the next load'
+        $r.refreshKeys | Should -Be 'g3,g2,g1,g4'
+        $r.refreshState | Should -Be 'loaded'
+    }
+    It 'toggling the checkbox again while its own load runs cancels and reverts it, and queues no second load' {
+        $r = Get-ChildJson (Invoke-ChildPs ($script:CancelHead + $script:CancelStubs + @'
+$sess.State.Slow = $true
+$sess.State.Calls = @()
+$out = [ordered]@{ keysBefore = (Keys) }
+$d.Ctl.ChkHandled.Checked = $true
+$out.loading = $d.ListState
+$work = $d.Work
+Pump 400
+$d.Ctl.ChkHandled.Checked = $false       # the same checkbox again
+$out.afterState = $d.ListState; $out.afterChecked = [bool]$d.Ctl.ChkHandled.Checked; $out.cancelled = [bool]$work.Cancelled; $out.pending = [bool]$d.PendingRefresh; $out.note = [bool]$d.Ctl.LblCancelNote.Visible
+Wait-Until { -not $d.Work } 30
+Pump 1200
+$out.workCleared = (-not $d.Work); $out.requested = @($sess.State.Calls | Where-Object { $_ -eq 'status=Requested' }).Count; $out.allCalls = (@($sess.State.Calls) -join ',')
+$out.stateEnd = $d.ListState; $out.keysEnd = (Keys); $out.checkedEnd = [bool]$d.Ctl.ChkHandled.Checked; $out.pendingEnd = [bool]$d.PendingRefresh
+# a third toggle starts a normal load again
+$sess.State.Slow = $false
+$d.Ctl.ChkHandled.Checked = $true
+Wait-Until { $d.ListState -eq 'loaded' }
+$out.thirdKeys = (Keys)
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]$out)
+'@))
+        $r.keysBefore | Should -Be 'g3,g2,g1'
+        $r.loading | Should -Be 'loading'
+        $r.cancelled | Should -BeTrue
+        $r.afterState | Should -Be 'loaded'
+        $r.afterChecked | Should -BeFalse
+        $r.pending | Should -BeFalse -Because 'a toggle of the checkbox''s own load is a cancel, not a queued refresh'
+        $r.note | Should -BeTrue
+        $r.workCleared | Should -BeTrue
+        $r.requested | Should -Be 1 -Because 'exactly the first load ran; no second load was queued'
+        $r.stateEnd | Should -Be 'loaded'
+        $r.keysEnd | Should -Be 'g3,g2,g1'
+        $r.checkedEnd | Should -BeFalse
+        $r.pendingEnd | Should -BeFalse
+        $r.thirdKeys | Should -Be 'g3,g2,g1,g4'
+    }
+    It 'Esc cancels a list load (only then); a Refresh-button load is cancelled without touching the checkbox' {
+        $r = Get-ChildJson (Invoke-ChildPs ($script:CancelHead + $script:CancelStubs + @'
+$form = $d.Form
+$onKey = [System.Windows.Forms.Control].GetMethod('OnKeyDown', [Reflection.BindingFlags]'NonPublic,Instance')
+function Press-Esc { $ke = [System.Windows.Forms.KeyEventArgs]::new([System.Windows.Forms.Keys]::Escape); [void]$onKey.Invoke($form, @($ke)); $ke }
+$out = [ordered]@{ keyPreview = [bool]$form.KeyPreview }
+$idle = Press-Esc
+$out.idleHandled = [bool]$idle.Handled; $out.idleState = $d.ListState; $out.idleNote = [bool]$d.Ctl.LblCancelNote.Visible
+$sess.State.Slow = $true
+$d.Ctl.BRefresh.PerformClick()
+$out.loading = $d.ListState; $out.byCheckbox = [bool]$d.ListByCheckbox
+Pump 300
+$esc = Press-Esc
+$out.escHandled = [bool]$esc.Handled; $out.escState = $d.ListState; $out.escNote = [bool]$d.Ctl.LblCancelNote.Visible; $out.escChecked = [bool]$d.Ctl.ChkHandled.Checked
+Wait-Until { -not $d.Work } 30
+$out.keys = (Keys)
+$second = Press-Esc
+$out.secondHandled = [bool]$second.Handled
+# a real key message reaches the form handler too
+$sess.State.Slow = $true
+$d.Ctl.BRefresh.PerformClick(); Pump 300
+[void][CancelTest.Win]::SendMessage($form.Handle, 0x100, [IntPtr]0x1B, [IntPtr]0x00010001)
+[System.Windows.Forms.Application]::DoEvents()
+$out.messageCancelled = ($d.ListState -eq 'loaded')
+Wait-Until { -not $d.Work } 30
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]$out)
+'@))
+        $r.keyPreview | Should -BeTrue
+        $r.idleHandled | Should -BeFalse -Because 'Esc does nothing when no list is loading'
+        $r.idleState | Should -Be 'loaded'
+        $r.idleNote | Should -BeFalse
+        $r.loading | Should -Be 'loading'
+        $r.byCheckbox | Should -BeFalse
+        $r.escHandled | Should -BeTrue
+        $r.escState | Should -Be 'loaded'
+        $r.escNote | Should -BeTrue
+        $r.escChecked | Should -BeFalse
+        $r.keys | Should -Be 'g3,g2,g1'
+        $r.secondHandled | Should -BeFalse
+        $r.messageCancelled | Should -BeTrue
+    }
+    It 'an export is not cancellable: the link stays hidden, Esc and Stop-RrListLoad do nothing, and the checkbox still queues a refresh (PendingRefresh)' {
+        $r = Get-ChildJson (Invoke-ChildPs ($script:CancelHead + $script:CancelStubs + @'
+$sess.State.Calls = @()
+# a stand-in for a running export step (the real one is covered by the sorting test)
+$fake = Invoke-RrStep $sess { Start-Sleep -Seconds 4; 'x' } @{}
+$d.Batch = @{ Items = @(); Index = 0; Results = @(); Password = (New-Object System.Security.SecureString) }
+$d.Work = $fake; $d.WorkKind = 'export'; $d.SaveState = 'saving'; $d.SaveProgress = 'Saving 1 of 1...'; $d.Poll.Start()
+Update-RrView $d
+$out = [ordered]@{ cancelHidden = (-not $d.Ctl.BCancel.Visible) }
+$out.stopReturned = [bool](Stop-RrListLoad $d); $out.cancelledFlag = [bool]$fake.Cancelled
+$onKey = [System.Windows.Forms.Control].GetMethod('OnKeyDown', [Reflection.BindingFlags]'NonPublic,Instance')
+$ke = [System.Windows.Forms.KeyEventArgs]::new([System.Windows.Forms.Keys]::Escape); [void]$onKey.Invoke($d.Form, @($ke)); $out.escHandled = [bool]$ke.Handled
+$d.Ctl.ChkHandled.Checked = $true
+$out.pendingFlag = [bool]$d.PendingRefresh; $out.requestedWhileBusy = @($sess.State.Calls | Where-Object { $_ -eq 'status=Requested' }).Count; $out.stillExport = $d.WorkKind
+Wait-Until { $d.ListState -eq 'loaded' -and -not $d.PendingRefresh -and -not $d.Work } 40
+$out.pendingAfter = [bool]$d.PendingRefresh; $out.requestedAfter = @($sess.State.Calls | Where-Object { $_ -eq 'status=Requested' }).Count; $out.keysAfter = (Keys); $out.handledAfter = [bool]$d.IncludeHandled
+$out.checkedAfter = [bool]$d.Ctl.ChkHandled.Checked
+$d.Form.Close()
+Out-AsciiJson ([pscustomobject]$out)
+'@))
+        $r.cancelHidden | Should -BeTrue
+        $r.stopReturned | Should -BeFalse
+        $r.cancelledFlag | Should -BeFalse
+        $r.escHandled | Should -BeFalse
+        $r.pendingFlag | Should -BeTrue
+        $r.requestedWhileBusy | Should -Be 0
+        $r.stillExport | Should -Be 'export'
+        $r.pendingAfter | Should -BeFalse
+        $r.requestedAfter | Should -Be 1
+        $r.keysAfter | Should -Be 'g3,g2,g1,g4'
+        $r.handledAfter | Should -BeTrue
+        $r.checkedAfter | Should -BeTrue
+    }
+    It 'the dialog uses the painted check box and row check images, and rebuilds the row images when it is rescaled' {
+        $r = Get-ChildJson (Invoke-ChildPs ($script:CancelHead + @'
+Set-QraEmulatedDpi 96
+$d = New-RrDialog -Incoming (Join-Path $env:TEMP 'qra-rr-none') -NoAutoStart
+Set-RrScreenshotState $d 'results'
+$lv = $d.Ctl.List
+$base = Get-QraFormDpi $d.Form
+Invoke-QraDpiChange $d.Form 96 $null
+$img1 = $lv.StateImageList
+$ck = $d.Ctl.ChkHandled
+$b0 = [ordered]@{ box = $ck.BoxSize; images = $img1.Images.Count; size = $img1.ImageSize.Width; compat = $lv.UseCompatibleStateImageBehavior; ticked = $lv.CheckedItems.Count }
+Invoke-QraDpiChange $d.Form 144 $null
+$img2 = $lv.StateImageList
+[ordered]@{ err = $script:QraDpiLastError; type = $ck.GetType().FullName; base = $base; before = $b0; box144 = $ck.BoxSize; size144 = $img2.ImageSize.Width; images144 = $img2.Images.Count
+    rebuilt = -not [object]::ReferenceEquals($img1, $img2); ticked144 = $lv.CheckedItems.Count; rows = $lv.Items.Count; layoutWidth = $ck.Width } | ConvertTo-Json -Compress -Depth 4
+$d.Form.Dispose()
+'@))
+        $r.err | Should -BeNullOrEmpty
+        $r.type | Should -Be 'QraUi.CheckBox'
+        $r.before.images | Should -Be 2
+        $r.before.compat | Should -BeFalse
+        $r.before.ticked | Should -Be 2
+        $r.before.size | Should -Be ([int]$r.before.box) -Because 'the row check boxes are drawn at the same size as the stand-alone one at 16 px'
+        $r.box144 | Should -Be 24
+        $r.size144 | Should -Be 24
+        $r.images144 | Should -Be 2
+        $r.rebuilt | Should -BeTrue
+        $r.ticked144 | Should -Be 2
+        $r.rows | Should -Be 3
     }
 }
