@@ -75,6 +75,12 @@ Describe 'Review window: source conventions' {
         $script:ReviewFunctions.ContainsKey('New-Font') | Should -BeFalse
         $script:ReviewFunctions.ContainsKey('Set-FocusRing') | Should -BeFalse
     }
+    It 'stays system-aware: it opts out of the per-monitor mode before it loads the kit' {
+        $i = $script:Text.IndexOf("`$env:QRA_DPI_MODE = 'system'")
+        $i | Should -BeGreaterThan 0
+        $i | Should -BeLessThan $script:Text.IndexOf("(Join-Path `$PSScriptRoot 'QraUi.ps1')")
+        $script:Text | Should -Not -Match 'Register-QraDpiWindow|Invoke-QraDpiChange|Use-QraFormDpi' -Because 'the review window has no live rescale'
+    }
     It 'defines the helpers Task 5 builds on' {
         foreach ($n in 'ConvertTo-AnalysisStage', 'Stop-Analysis', 'Set-ResultsMode') { $script:ReviewFunctions.ContainsKey($n) | Should -BeTrue }
     }
@@ -590,9 +596,69 @@ $form.Dispose(); exit 0
     }
 }
 
+Describe 'Review window: record panel pinned in the left pane (child process)' {
+    BeforeAll {
+        $root = Join-Path $TestDrive 'rec-root'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:Repo 'src\SecurityReview\app') -Destination (Join-Path $root 'app') -Recurse
+        $file = Join-Path $root 'app\QuarantineReview.ps1'
+        $text = [IO.File]::ReadAllText($file)
+        $probe = @'
+$form.ShowInTaskbar = $false; $form.Opacity = 0; $form.StartPosition = 'Manual'; $form.Location = New-Object System.Drawing.Point(-32000, -32000)
+$form.Size = $form.MinimumSize
+$form.Show(); [System.Windows.Forms.Application]::DoEvents()
+$o = [ordered]@{}
+$o.InLeftPane = ($decRecordPanel.Parent -eq $split.Panel1)
+$o.VisibleBefore = $decRecordPanel.Visible
+$script:Result = [pscustomobject]@{ complete = $true; decision = [pscustomobject]@{ outcome = 'VERIFY'; color = 'amber'; title = 'Verify'; summary = 'Check first'; steps = [pscustomobject]@{ VERIFY = @('Verify sender') } } }
+Show-Decision $script:Result
+Set-ResultsMode 'Result'
+[System.Windows.Forms.Application]::DoEvents()
+$o.VisibleAfter = $decRecordPanel.Visible
+$o.BottomInside = ($decRecordPanel.Bottom -le $split.Panel1.ClientSize.Height)
+$o.StepsAbove = ($leftCard.Bottom -le $decRecordPanel.Top)
+$o.Outside = @($decRecordPanel.Controls | Where-Object { $_.Left -lt 0 -or $_.Top -lt 0 -or $_.Right -gt $decRecordPanel.ClientSize.Width -or $_.Bottom -gt $decRecordPanel.ClientSize.Height } | ForEach-Object { $_.GetType().Name + ':' + $_.Text }) -join ','
+$tabs.SelectedTab = $tFindings; [System.Windows.Forms.Application]::DoEvents()
+$o.VisibleOnOtherTab = $decRecordPanel.Visible
+Clear-Results; [System.Windows.Forms.Application]::DoEvents()
+$o.VisibleCleared = $decRecordPanel.Visible
+($o | ConvertTo-Json -Compress)
+$form.Dispose(); exit 0
+'@
+        $idx = $text.LastIndexOf('[void]$form.ShowDialog()')
+        [IO.File]::WriteAllText($file, ($text.Substring(0, $idx) + $probe), (New-Object Text.UTF8Encoding($true)))
+        $out = @(& powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File $file 2>&1 | ForEach-Object { "$_" })
+        $script:RecOut = $out -join "`n"
+        $json = @($out | Where-Object { $_ -like '{*' }) | Select-Object -Last 1
+        if ($json) { $script:RecR = $json | ConvertFrom-Json }
+    }
+    It 'sits in the left pane, under the steps, fully on screen at the minimum window size' {
+        $script:RecR.InLeftPane | Should -BeTrue -Because $script:RecOut
+        $script:RecR.BottomInside | Should -BeTrue -Because $script:RecOut
+        $script:RecR.StepsAbove | Should -BeTrue -Because $script:RecOut
+        $script:RecR.Outside | Should -BeNullOrEmpty -Because $script:RecOut
+    }
+    It 'shows only while there is a result, whichever tab is open' {
+        $script:RecR.VisibleBefore | Should -BeFalse -Because $script:RecOut
+        $script:RecR.VisibleAfter | Should -BeTrue -Because $script:RecOut
+        $script:RecR.VisibleOnOtherTab | Should -BeTrue -Because $script:RecOut
+        $script:RecR.VisibleCleared | Should -BeFalse -Because $script:RecOut
+    }
+}
+
 Describe 'Review window: icon and taskbar identity' {
     It 'applies the chrome with the Review app id (not in -Screenshot)' {
         $t = [IO.File]::ReadAllText($script:ReviewPath)
         $t.Contains("Set-QraWindowChrome `$form -AppId 'QuarantineReviewAssistant.Review' -NoAppId:([bool]`$Screenshot)") | Should -BeTrue
+    }
+}
+
+Describe 'Review window: GDI text rendering for standard controls' {
+    It 'switches labels and buttons to GDI text before the first control exists' {
+        $t = [IO.File]::ReadAllText($script:ReviewPath)
+        $call = $t.IndexOf('SetCompatibleTextRenderingDefault($false)')
+        $call | Should -BeGreaterThan 0
+        $call | Should -BeLessThan $t.IndexOf('New-Object System.Windows.Forms.') -Because 'it is only allowed before the first control exists'
+        $call | Should -BeGreaterThan $t.IndexOf('Add-Type -AssemblyName System.Windows.Forms')
     }
 }

@@ -101,3 +101,29 @@ Describe 'build-release.ps1' {
         } finally { $zip.Dispose() }
     }
 }
+
+Describe 'Start-Here.cmd' {
+    BeforeAll {
+        $script:CmdPath = Join-Path $script:Src 'Start-Here.cmd'
+        $script:CmdText = [System.IO.File]::ReadAllText($script:CmdPath)
+        $script:StartLine = 'start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0app\Launcher.ps1"'
+    }
+    It 'starts the launcher with the exact minimised start line' {
+        @($script:CmdText -split '\r?\n' | Where-Object { $_ -eq $script:StartLine }).Count | Should -Be 1
+    }
+    It 'never hides the window with -WindowStyle Hidden (a classic malware indicator)' {
+        $script:CmdText | Should -Not -Match '(?i)-WindowStyle'
+        $script:CmdText | Should -Not -Match '(?i)\bhidden\b' -Because 'the comment lines do not promise a hidden window either'
+    }
+    It 'keeps its comment lines accurate: they describe /min, not a hidden window' {
+        $script:CmdText | Should -Match 'start /min'
+        $script:CmdText | Should -Match 'minimised'
+    }
+}
+
+Describe 'Runtime files: no dynamic P/Invoke or assembly emission' {
+    # Reflection.Emit P/Invoke is the PSReflect/PowerSploit pattern: AMSI, Defender and EDR products flag it, which a security tool must never trigger. Use Add-Type.
+    It '<Name> contains none of DefinePInvokeMethod, DefineDynamicAssembly, AssemblyBuilder, TypeBuilder, Reflection.Emit' -ForEach (Get-ChildItem -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'src') -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.cmd', '.py' } | ForEach-Object { @{ Name = $_.Name; Path = $_.FullName } }) {
+        [System.IO.File]::ReadAllText($Path) | Should -Not -Match 'DefinePInvokeMethod|DefineDynamicAssembly|AssemblyBuilder|TypeBuilder|Reflection\.Emit'
+    }
+}

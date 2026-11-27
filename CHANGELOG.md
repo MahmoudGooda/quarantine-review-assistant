@@ -5,6 +5,31 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-11-27
+
+### Added
+- **Cancel a release-request load.** While the list loads, a **Cancel** link (or Esc) stops it without waiting: the rows and the selection stay as they were, **Also show released and denied messages** goes back to its previous state, and the Exchange session stays ready for the next list or export (exports cannot be cancelled).
+
+### Changed
+- **The decision record is always in view in the Sandbox.** **Record your decision** moved from the end of the Decision tab to the bottom of
+  the left column, so it no longer needs scrolling and stays there on every tab. It appears once there is a result to record.
+- **Step 5 shows each recorded decision as a card.** One card per message with the decision as a coloured badge (red for delete or block, green for release, amber for keep quarantined), its confidence and time, the subject, the sender and file name, and the tool and Microsoft verdicts. A message without a decision gets a muted "Not reviewed yet" card, a long list scrolls above the buttons, and the intro and the clean-up step use the plural when there are several messages.
+
+### Fixed
+- **The Microsoft sign-in window now comes to the front.** In the release-requests dialog the sign-in window could open behind other windows. The dialog now brings it forward itself as soon as it appears, and a **Show sign-in window** link next to the waiting text does it on demand.
+- **Check boxes are in proportion on scaled screens.** The launcher options and the release-request dialog use a Windows 11 style check box, and the message list uses matching row check boxes, drawn at the scale of the screen the window is on (the standard ones stayed small next to the text at 125 %).
+- **Sharp text on PCs with screens of different scaling.** The launcher and the release-request dialog followed one scale for the whole PC, so
+  Windows stretched them (soft text) on a screen with another scale. They now follow the screen they are on: they open at the scale of the screen
+  with the mouse (the dialog at the scale of the launcher) and rescale as soon as they are dragged to another screen. The start-up splash is
+  sized for that screen too and drawn at its real size. The Sandbox review window is unchanged.
+- **The launcher reads the display scale from the screen.** Before, the start-up splash could leave the graphics library with a stale 96 dpi,
+  so the layout was computed at 100 % on a scaled PC.
+- **No PowerShell window when the launcher starts.** `Start-Here.cmd` now starts PowerShell minimised (`start "" /min`), so no PowerShell
+  window appears before the splash. A double-click on a `.cmd` file still shows the small `cmd` window for a moment; the desktop shortcut
+  (created by **Create desktop shortcut**) starts minimised and shows nothing.
+- **Several messages in Incoming.** Reviewing more than one saved message no longer ends on "The Sandbox closed before a decision reached this PC". The launcher now checks every package in Incoming against every recorded decision (by the SHA256 of the file), shows "1 of 2 messages reviewed" with a **Continue with N decision(s)** button while some are still open, and lists every decision in step 5. **Copy block list** then holds the combined, de-duplicated list of all reviewed messages. A closed Sandbox is reported as failed only when that run left no new decision.
+- **The Sandbox review window uses the same crisp GDI text as the launcher** (labels, check boxes and buttons).
+
 ## [2.3.0] - 2026-11-27
 
 ### Added
@@ -106,6 +131,7 @@ First release from the public repository.
 
 Used internally before the repository was published. It was never released publicly; it is listed only because the 2.2.0 fixes refer to it.
 
-[Unreleased]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/MahmoudGooda/quarantine-review-assistant/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/MahmoudGooda/quarantine-review-assistant/releases/tag/v2.2.0

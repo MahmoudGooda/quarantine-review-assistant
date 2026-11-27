@@ -15,26 +15,70 @@ $script:UiNative = $false
 # Rule (verified): controls that are in the form tree when ResumeLayout() runs are scaled by AutoScaleMode = Dpi,
 # so they are written in plain 96-dpi pixels and must NOT be wrapped in S(). Everything else is scaled with S():
 # list-view column widths, TabControl.Padding, TreeView.ItemHeight, and any control created or added after that point.
-if ((Get-QraCompileDecision) -eq 'compile') {
+# Per-monitor mode (default, painted kit loaded): the process is per-monitor aware, a window is built at the DPI of the screen it opens on
+# (Set-QraEmulatedDpi) and is rescaled live when it is dragged to another screen (Register-QraDpiWindow / Invoke-QraDpiChange).
+# Fonts are then created in PIXELS (see New-Font): a point font is measured at the system DPI but drawn at the DPI of the window.
+# QRA_DPI_MODE=system keeps the old system-aware behaviour (the Sandbox review window sets it). Constrained Language Mode and the
+# plain fallback keep it as well: system-aware where code may be compiled, otherwise untouched, and never a live rescale.
+$script:QraDpiMode = $(if ($env:QRA_DPI_MODE -eq 'system') { 'system' } else { 'permonitor' })
+$script:QraAwareness = 'None'     # what Enable-QraDpiAwareness reached: PerMonitorV2, PerMonitor, System or None
+$script:QraPerMonitor = $false    # true when the process is per-monitor aware and the painted kit is loaded (set once, after the compile below)
+$script:QraDpiForms = @{}         # form -> @{ Dpi; Relayout; Tables; Watcher; Busy }
+$script:QraDpiLastError = ''      # the last error of a live rescale (it is swallowed: the window keeps working)
+$script:QraDpiBusy = 0            # > 0 while Invoke-QraDpiChange runs: layout code must not run then
+function Set-QraProcessDpiV2 { try { [bool][QraUi.Native]::SetProcessV2() } catch { $false } }          # PER_MONITOR_AWARE_V2 (Windows 10 1703+)
+function Set-QraProcessDpiShcore { try { [bool][QraUi.Native]::SetProcessShcore() } catch { $false } }  # per monitor (Windows 8.1+)
+function Set-QraProcessDpiSystem {
+    # The legacy call: system DPI aware. A new type name is used because QRA.Dpi may exist in a process with another signature.
     try {
         if (-not ('QRA.Dpi' -as [type])) {
             Add-Type -Namespace QRA -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -ErrorAction Stop
         }
-        [void][QRA.Dpi]::SetProcessDPIAware()
-    } catch { $null = $_ } # DPI awareness may already be set or unavailable
+        [bool][QRA.Dpi]::SetProcessDPIAware()
+    } catch { $false } # DPI awareness may already be set or unavailable
+}
+function Get-QraAwarenessLevel {
+    # 0 unaware, 1 system, 2 per monitor, -1 unknown. Read back from Windows: the truth, whatever the calls above returned.
+    try { [int][QraUi.Native]::AwarenessLevel() } catch { -1 }
+}
+function Enable-QraDpiAwareness {
+    # Ordered fallback: PerMonitorV2, then per monitor (shcore), then system aware. Returns the step that worked: PerMonitorV2, PerMonitor, System or None.
+    # Where compiling is not allowed (Constrained Language Mode) nothing is touched. The system-only mode and the plain fallback go straight to System.
+    param([string]$Mode = $script:QraDpiMode)
+    if ((Get-QraCompileDecision) -ne 'compile') { return 'None' }
+    if ($Mode -ne 'system' -and $script:UiNative) {
+        if (Set-QraProcessDpiV2) { return 'PerMonitorV2' }
+        if (Set-QraProcessDpiShcore) { return 'PerMonitor' }
+    }
+    [void](Set-QraProcessDpiSystem)
+    'System'
+}
+function Reset-QraScreenCache {
+    # Screen.AllScreens is cached for the process: drop what was read before the awareness changed (virtualised bounds).
+    try { [System.Windows.Forms.Screen].GetField('screens', [System.Reflection.BindingFlags]'NonPublic,Static').SetValue($null, $null) } catch { $null = $_ } # the cache simply stays
 }
 $script:DpiScale = 1.0
 $script:FontScale = 1.0
 $script:DesignDpi = [float]96
 $script:DeviceDpi = 96.0
-try { $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:DeviceDpi = [double]$g0.DpiX; $script:DpiScale = [Math]::Max(1.0, $g0.DpiX / 96); $g0.Dispose() } catch { $null = $_ } # defaults to 96 DPI (scale 1.0)
 function S([double]$px) { [int][Math]::Round($px * $script:DpiScale) }
 function SPad([int]$l, [int]$t, [int]$r, [int]$b) { New-Object System.Windows.Forms.Padding((S $l), (S $t), (S $r), (S $b)) }
 function SSize([int]$w, [int]$h) { New-Object System.Drawing.Size((S $w), (S $h)) }
 function SPoint([int]$x, [int]$y) { New-Object System.Drawing.Point((S $x), (S $y)) }
-function Limit-FormToScreen($f) {
-    # Never open larger than the usable screen (a 175 % display makes a 1320x860 design taller than 1080p).
-    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+function Limit-FormToScreen($f, $Owner = $null) {
+    # Never open larger than the usable screen (a 175 % display makes a 1320x860 design taller than 1080p). The screen is the form's own:
+    # where its window is, else the owner's, else the one with the mouse (where CenterScreen opens it), else the one it overlaps.
+    $scr = $null
+    if ($script:QraPerMonitor) {
+        try {
+            if ($f.IsHandleCreated) { $scr = [System.Windows.Forms.Screen]::FromControl($f) }
+            elseif ($Owner -and $Owner.IsHandleCreated) { $scr = [System.Windows.Forms.Screen]::FromControl($Owner) }
+            elseif ([string]$f.StartPosition -eq 'CenterScreen') { $scr = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position) }
+            else { $scr = [System.Windows.Forms.Screen]::FromRectangle($f.Bounds) }
+        } catch { $scr = $null } # falls back to the primary screen
+    }
+    if (-not $scr) { $scr = [System.Windows.Forms.Screen]::PrimaryScreen }
+    $wa = $scr.WorkingArea
     $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min($f.MinimumSize.Width, $wa.Width), [Math]::Min($f.MinimumSize.Height, $wa.Height))
     $f.Size = New-Object System.Drawing.Size([Math]::Min($f.Width, $wa.Width), [Math]::Min($f.Height, $wa.Height))
 }
@@ -55,14 +99,214 @@ function Set-QraEmulatedDpi([int]$dpi) {
     $script:FontScale = $dpi / $script:DeviceDpi
     $script:DesignDpi = [float](96 * $script:DeviceDpi / $dpi)
 }
+
+# ---- Per-monitor DPI: one stored DPI per window, a watcher for WM_DPICHANGED, and the live rescale.
+function Get-QraWindowDpi($Form) {
+    # The DPI Windows reports for a window; 0 when unknown (no handle yet, or Windows older than 10 1607).
+    try { if ($Form -and $Form.IsHandleCreated) { return [int][QraUi.Native]::WindowDpi($Form.Handle) } } catch { $null = $_ } # unknown
+    0
+}
+function Get-QraMonitorDpi($Point = $null) {
+    # The DPI of the screen that holds $Point (default: the mouse). Where the process is not per-monitor aware: the one DPI it has (DeviceDpi).
+    $fallback = [int][Math]::Round($script:DeviceDpi)
+    if (-not $script:QraPerMonitor) { return $fallback }
+    try {
+        if ($null -eq $Point) { $Point = [System.Windows.Forms.Cursor]::Position }
+        $dpi = [int][QraUi.Native]::MonitorDpi([int]$Point.X, [int]$Point.Y)
+        if ($dpi -ge 48 -and $dpi -le 960) { return $dpi }
+    } catch { $null = $_ } # falls back to the one DPI
+    $fallback
+}
+function Use-QraFormDpi($Form) {
+    # Makes the scale globals (S, New-Font, Initialize-QraForm) those of $Form. Call it first in every layout routine of a window, so that a window
+    # on another screen never lays out with the scale of this one. A window that is not registered (system mode, fallback) leaves the globals alone.
+    if ($null -eq $Form) { return }
+    $st = $script:QraDpiForms[$Form]
+    if ($st) { Set-QraEmulatedDpi ([int]$st.Dpi) }
+}
+function Get-QraFormDpi($Form) {
+    # The DPI a registered window is currently scaled for; 0 when it is not registered.
+    if ($null -eq $Form) { return 0 }
+    $st = $script:QraDpiForms[$Form]
+    if ($st) { [int]$st.Dpi } else { 0 }
+}
+function Add-QraFontTable($Form, [hashtable]$Table) {
+    # A cached table of fonts (key -> Font) that must be rescaled together with the window, so that controls created later match.
+    if ($null -eq $Form -or $null -eq $Table) { return }
+    $st = $script:QraDpiForms[$Form]
+    if ($st -and -not @($st.Tables).Where({ [object]::ReferenceEquals($_, $Table) })) { $st.Tables = @($st.Tables) + @($Table) }
+}
+function Unregister-QraDpiWindow($Form) {
+    if ($null -ne $Form) { $script:QraDpiForms.Remove($Form) }
+}
+function Register-QraDpiWindow {
+    # Makes $Form follow the screen it is on: its DPI is stored (default: the current scale), WM_DPICHANGED rescales it (Invoke-QraDpiChange) and
+    # $Relayout runs once afterwards (called with the form as its only argument). A no-op (returns $false) unless the process is per-monitor aware
+    # and the painted kit is loaded: the window then stays system-scaled, as before.
+    param($Form, [scriptblock]$Relayout = $null, [int]$Dpi = 0, [hashtable[]]$FontTables = @())
+    if (-not $script:QraPerMonitor -or -not $script:UiNative -or -not $Form) { return $false }
+    if ($Dpi -le 0) { $Dpi = [int][Math]::Round($script:DpiScale * 96) }
+    $st = @{ Dpi = $Dpi; Relayout = $Relayout; Tables = @($FontTables); Watcher = $null; Busy = $false; Missed = $false; Changes = 0; LastError = '' }
+    try {
+        $watcher = New-Object QraUi.DpiWatcher($Form)
+        $watcher.add_DpiChanged({ param($s, $e) try { Invoke-QraDpiChange $s.Target $e.Dpi $e.Bounds } catch { $script:QraDpiLastError = $_.Exception.Message + ' ' + $_.InvocationInfo.PositionMessage } }) # never let an error reach the message loop
+        $st.Watcher = $watcher
+    } catch { return $false }
+    $script:QraDpiForms[$Form] = $st
+    $Form.Add_Shown({ param($s, $e) Resolve-QraDpiDrift $s })
+    $Form.Add_Disposed({ param($s, $e) Unregister-QraDpiWindow $s })
+    $true
+}
+function Resolve-QraDpiDrift($Form) {
+    # The window opened on another screen than the one it was built for (a start position quirk, a screen that went away): rescale once from where it really is.
+    try {
+        $st = $script:QraDpiForms[$Form]
+        if (-not $st) { return }
+        $now = Get-QraWindowDpi $Form
+        if ($now -gt 0 -and $now -ne $st.Dpi) { Invoke-QraDpiChange $Form $now $null }
+    } catch { $null = $_ } # cosmetic: the window keeps its scale
+}
+function Get-QraControlList($Root) {
+    # The control and everything below it, parents before children.
+    $all = New-Object System.Collections.ArrayList
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($Root)
+    while ($queue.Count -gt 0) {
+        $c = $queue.Dequeue()
+        [void]$all.Add($c)
+        foreach ($kid in $c.Controls) { $queue.Enqueue($kid) }
+    }
+    $all.ToArray()
+}
+$script:QraFontProps = @{}
+function Test-QraFontExplicit($Control) {
+    # True when the control has its own Font; false when it inherits (ambient) the Font of its parent.
+    try {
+        $type = $Control.GetType()
+        $prop = $script:QraFontProps[$type]
+        if (-not $prop) { $prop = [System.ComponentModel.TypeDescriptor]::GetProperties($type)['Font']; $script:QraFontProps[$type] = $prop }
+        [bool]$prop.ShouldSerializeValue($Control)
+    } catch { $true }
+}
+function ConvertTo-QraScaledFont($Font, [double]$Ratio, [hashtable]$Map) {
+    # One new font per distinct source font (family, size, style, unit), so a font shared by many controls is scaled once and stays shared.
+    if ($null -eq $Font) { return $null }
+    $key = '{0}|{1}|{2}|{3}' -f $Font.Name, $Font.Size, [int]$Font.Style, [int]$Font.Unit
+    if (-not $Map.ContainsKey($key)) {
+        $Map[$key] = New-Object System.Drawing.Font($Font.FontFamily, [single]($Font.Size * $Ratio), $Font.Style, $Font.Unit, $Font.GdiCharSet)
+    }
+    $Map[$key]
+}
+function Update-QraFonts {
+    # Two passes: first every control's CURRENT font is recorded, then the fonts are assigned. A control that inherits its font follows its parent and is
+    # not touched, so an ambient font is scaled once, not once for the parent and again for each child. Cached font tables get the same new fonts.
+    param($Form, [double]$Ratio, [hashtable[]]$Tables = @(), [hashtable]$Map = $null)
+    if ($null -eq $Map) { $Map = @{} }
+    $all = @(Get-QraControlList $Form)
+    $orig = @{}
+    foreach ($c in $all) { $orig[$c] = $c.Font }
+    foreach ($c in $all) {
+        if (-not [object]::ReferenceEquals($c, $Form) -and -not (Test-QraFontExplicit $c)) { continue }
+        $c.Font = ConvertTo-QraScaledFont $orig[$c] $Ratio $Map
+    }
+    foreach ($t in $Tables) {
+        foreach ($key in @($t.Keys)) {
+            if ($t[$key] -is [System.Drawing.Font]) { $t[$key] = ConvertTo-QraScaledFont $t[$key] $Ratio $Map }
+        }
+    }
+}
+function Update-QraControlMetrics {
+    # What Form.Scale cannot reach: the radius, stroke, focus ring, shadow and arc thickness of the painted controls, their icon fonts, the
+    # list-view column widths, the tree-view item height and the tab padding.
+    param($Form, [double]$Ratio, [hashtable]$Map)
+    foreach ($c in @(Get-QraControlList $Form)) {
+        switch ($c.GetType().FullName) {
+            'QraUi.RoundPanel' {
+                $c.Radius = [int][Math]::Round($c.Radius * $Ratio); $c.ShadowSize = [int][Math]::Round($c.ShadowSize * $Ratio)
+                $c.Stroke = [float][Math]::Max(1, [Math]::Round($c.Stroke * $Ratio))
+            }
+            'QraUi.ModernButton' {
+                $c.Radius = [int][Math]::Round($c.Radius * $Ratio); $c.Stroke = [float][Math]::Max(1, [Math]::Round($c.Stroke * $Ratio))
+                $c.FocusRingWidth = [float][Math]::Max(1, [Math]::Round($c.FocusRingWidth * $Ratio))
+                if ($c.IconFont) { $c.IconFont = ConvertTo-QraScaledFont $c.IconFont $Ratio $Map }
+            }
+            'QraUi.Pill' {
+                $c.Stroke = [float][Math]::Max(1, [Math]::Round($c.Stroke * $Ratio))
+                if ($c.IconFont) { $c.IconFont = ConvertTo-QraScaledFont $c.IconFont $Ratio $Map }
+            }
+            'QraUi.Spinner' {
+                $c.Thickness = [float]($c.Thickness * $Ratio)
+                if ($c.IconFont) { $c.IconFont = ConvertTo-QraScaledFont $c.IconFont $Ratio $Map }
+            }
+            'QraUi.StepBadge' { if ($c.IconFont) { $c.IconFont = ConvertTo-QraScaledFont $c.IconFont $Ratio $Map } }
+            'QraUi.CheckBox' {
+                $c.BoxSize = [int][Math]::Max(8, [Math]::Round($c.BoxSize * $Ratio)); $c.Gap = [int][Math]::Round($c.Gap * $Ratio)
+                $c.Radius = [int][Math]::Round($c.Radius * $Ratio); $c.Stroke = [float][Math]::Max(1, [Math]::Round($c.Stroke * $Ratio))
+                $c.FocusRingWidth = [float][Math]::Max(1, [Math]::Round($c.FocusRingWidth * $Ratio))
+            }
+            'System.Windows.Forms.ListView' { foreach ($col in $c.Columns) { $col.Width = [int][Math]::Round($col.Width * $Ratio) } }
+            'System.Windows.Forms.TreeView' { $c.ItemHeight = [int][Math]::Max(1, [Math]::Round($c.ItemHeight * $Ratio)) }
+            'System.Windows.Forms.TabControl' { $c.Padding = New-Object System.Drawing.Point([int][Math]::Round($c.Padding.X * $Ratio), [int][Math]::Round($c.Padding.Y * $Ratio)) }
+        }
+    }
+}
+function Invoke-QraDpiChange {
+    # WM_DPICHANGED for a registered window: scale everything by new/old (once), take the rectangle Windows suggests, run the window's relayout once.
+    # $Rect may be $null (no suggestion: the size is only scaled). Safe to call twice with the same DPI: the second call does nothing.
+    param($Form, [int]$NewDpi, $Rect = $null)
+    if ($null -eq $Form -or $NewDpi -le 0) { return }
+    $st = $script:QraDpiForms[$Form]
+    if (-not $st -or $Form.IsDisposed) { return }
+    if ($st.Busy) { $st.Missed = $true; return }   # a message that arrives while this window is being rescaled: checked again below
+    $rounds = 0
+    while ($rounds -lt 3) {
+        $rounds++
+        if ($NewDpi -eq $st.Dpi) { return }
+        $ratio = $NewDpi / [double]$st.Dpi
+        $st.Busy = $true; $script:QraDpiBusy++
+        try {
+            Set-QraEmulatedDpi $NewDpi
+            $st.Dpi = $NewDpi
+            $Form.SuspendLayout()
+            try {
+                $map = @{}
+                Update-QraFonts $Form $ratio $st.Tables $map
+                $Form.Scale((New-Object System.Drawing.SizeF([single]$ratio, [single]$ratio)))
+                Update-QraControlMetrics $Form $ratio $map
+                if ($Rect -and $Rect.Width -gt 0 -and $Rect.Height -gt 0 -and [string]$Form.WindowState -eq 'Normal') {
+                    $Form.SetBounds([int]$Rect.X, [int]$Rect.Y, [int]$Rect.Width, [int]$Rect.Height)
+                }
+            } finally { $Form.ResumeLayout($true) }
+            $st.Changes = [int]$st.Changes + 1
+        } finally { $script:QraDpiBusy--; $st.Busy = $false }
+        if ($st.Relayout) {
+            try { & $st.Relayout $Form } catch { $st.LastError = $_.Exception.Message }
+        }
+        # A message arrived while this ran (the window crossed a screen edge again): follow where it really is, without a rectangle, until the stored DPI matches.
+        if (-not $st.Missed) { return }
+        $st.Missed = $false
+        $actual = Get-QraWindowDpi $Form
+        if ($actual -le 0 -or $actual -eq $st.Dpi) { return }
+        $NewDpi = $actual; $Rect = $null
+    }
+}
 function Hide-QraConsole {
     # Hides the console window of the launcher. Skipped silently where Add-Type is not allowed (Constrained Language Mode).
+    # Start-Here.cmd starts PowerShell minimized (no console on screen). A minimized console must be restored first,
+    # off-screen and without activation, before it is hidden: the Exchange Online sign-in window attaches to the console,
+    # and Windows hides every window whose owner is minimized, so the sign-in would never appear.
     if ((Get-QraCompileDecision) -ne 'compile') { return }
     try {
-        if (-not ('QRA.Win' -as [type])) {
-            Add-Type -Namespace QRA -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n);' -ErrorAction Stop
+        if (-not ('QRA.ConsoleWin' -as [type])) {
+            Add-Type -Namespace QRA -Name ConsoleWin -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr h, int n); [DllImport("user32.dll")] public static extern bool IsIconic(System.IntPtr h); [DllImport("user32.dll")] public static extern bool SetWindowPos(System.IntPtr h, System.IntPtr after, int x, int y, int cx, int cy, uint flags);' -ErrorAction Stop
         }
-        [void][QRA.Win]::ShowWindow([QRA.Win]::GetConsoleWindow(), 0)
+        $console = [QRA.ConsoleWin]::GetConsoleWindow()
+        if ($console -eq [IntPtr]::Zero) { return }
+        if ([QRA.ConsoleWin]::IsIconic($console)) {
+            [void][QRA.ConsoleWin]::SetWindowPos($console, [IntPtr]::Zero, -32000, -32000, 0, 0, 0x0015)   # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            [void][QRA.ConsoleWin]::ShowWindow($console, 4)   # SW_SHOWNOACTIVATE: restore from minimized, off-screen
+        }
+        [void][QRA.ConsoleWin]::ShowWindow($console, 0)   # SW_HIDE
     } catch { $null = $_ } # no console window to hide
 }
 
@@ -169,13 +413,19 @@ function New-Font([float]$size = 9.5, [string]$style = 'Regular', [ValidateSet('
     elseif ($env:QRA_UI_WIN10FONTS -eq '1') { $family = 'Segoe UI' }
     elseif ($role -eq 'Display') { $family = Resolve-QraFamily @('Segoe UI Variable Display', 'Segoe UI') }
     else { $family = Resolve-QraFamily @('Segoe UI Variable Text', 'Segoe UI') }
+    New-QraFontObject $family $size $style
+}
+function New-QraFontObject([string]$family, [double]$size, [string]$style) {
+    # Per-monitor mode: PIXEL fonts (points x 96/72 x scale), so measuring and drawing agree whatever screen the window is on.
+    # Otherwise points scaled by FontScale, as before.
+    if ($script:QraPerMonitor) { return (New-Object System.Drawing.Font($family, [float]($size * 96.0 / 72.0 * $script:DpiScale), [System.Drawing.FontStyle]$style, [System.Drawing.GraphicsUnit]::Pixel)) }
     New-Object System.Drawing.Font($family, [float]($size * $script:FontScale), [System.Drawing.FontStyle]$style)
 }
 function Get-IconFont([float]$size = 10) {
     if ($env:QRA_UI_WIN10FONTS -eq '1') { $family = 'Segoe MDL2 Assets' }
     else { $family = Resolve-QraFamily @('Segoe Fluent Icons', 'Segoe MDL2 Assets') }
     if ($script:UiNative) { try { [QraUi.Theme]::IconFamilyName = $family } catch { $null = $_ } } # optional theme icon override
-    New-Object System.Drawing.Font($family, [float]($size * $script:FontScale))
+    New-QraFontObject $family $size 'Regular'
 }
 function Get-QraStatusColor([ValidateSet('OK', 'WARN', 'FAIL', 'INFO')][string]$status) {
     switch ($status) { 'OK' { $C.Success } 'WARN' { $C.Warning } 'FAIL' { $C.Danger } default { $C.Info } }
@@ -342,6 +592,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace QraUi
@@ -989,6 +1240,398 @@ namespace QraUi
             TextRenderer.DrawText(g, Text, Font, tr, text, flags | TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
         }
     }
+
+    // Glyph of the check box, shared by the QraUi.CheckBox control and the list-view state images, so that both look alike and scale alike.
+    public static class CheckGlyph
+    {
+        static Color Shade(Color c, int level, float step)
+        {
+            if (Theme.HighContrast || level <= 0) return c;
+            return Theme.Lightness(c, -step * Math.Min(level, 2));
+        }
+
+        // level: 0 normal, 1 hover, 2 pressed. The box is the exact pixel rectangle; the stroke runs inside it.
+        public static void Draw(Graphics g, Rectangle box, CheckState state, int level, bool enabled, float radius, float stroke)
+        {
+            SmoothingMode oldMode = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            try
+            {
+                float st = Math.Max(1f, stroke);
+                RectangleF r = new RectangleF(box.X + st / 2f, box.Y + st / 2f, box.Width - st, box.Height - st);
+                bool on = state != CheckState.Unchecked;
+                Color fill, edge;
+                if (on)
+                {
+                    fill = enabled ? Shade(Theme.Primary, level, 0.06f) : Theme.Disabled;
+                    edge = fill;
+                }
+                else
+                {
+                    fill = enabled ? Shade(Theme.Card, level, 0.04f) : Theme.Card;
+                    edge = enabled ? Theme.ControlBorder : Theme.Disabled;
+                }
+                using (GraphicsPath gp = Theme.RoundRect(r, radius))
+                {
+                    using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, gp);
+                    using (Pen p = new Pen(edge, st)) g.DrawPath(p, gp);
+                }
+                if (on)
+                {
+                    float s = box.Width;
+                    using (Pen mark = new Pen(Theme.OnPrimary, Math.Max(1.5f, s * 0.105f)))
+                    {
+                        mark.StartCap = LineCap.Round;
+                        mark.EndCap = LineCap.Round;
+                        mark.LineJoin = LineJoin.Round;
+                        if (state == CheckState.Checked)
+                        {
+                            g.DrawLines(mark, new PointF[] {
+                                new PointF(box.X + s * 0.26f, box.Y + s * 0.53f),
+                                new PointF(box.X + s * 0.43f, box.Y + s * 0.70f),
+                                new PointF(box.X + s * 0.75f, box.Y + s * 0.32f) });
+                        }
+                        else
+                        {
+                            g.DrawLine(mark, box.X + s * 0.28f, box.Y + s * 0.5f, box.X + s * 0.72f, box.Y + s * 0.5f);
+                        }
+                    }
+                }
+            }
+            finally { g.SmoothingMode = oldMode; }
+        }
+
+        // Two images for a list view's StateImageList: 0 = unchecked, 1 = checked, square, with an alpha channel.
+        public static ImageList CreateStateImages(int size, float radius, float stroke)
+        {
+            ImageList il = new ImageList();
+            il.ColorDepth = ColorDepth.Depth32Bit;
+            il.ImageSize = new Size(size, size);
+            IntPtr handle = il.Handle;   // creates the native list first: Add then copies each bitmap at once (before that it only keeps a reference to a bitmap that is disposed below)
+            for (int i = 0; i < 2; i++)
+            {
+                using (Bitmap bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Transparent);
+                    Draw(g, new Rectangle(0, 0, size, size), i == 0 ? CheckState.Unchecked : CheckState.Checked, 0, true, radius, stroke);
+                    il.Images.Add(bmp);
+                }
+            }
+            return il;
+        }
+    }
+
+    // A painted, Windows 11 style check box. It keeps everything of System.Windows.Forms.CheckBox (Checked, CheckedChanged, Space, focus, accessibility)
+    // and only draws itself: the box has a size in pixels that the caller scales (BoxSize), the text is GDI text like the rest of the kit.
+    public class CheckBox : System.Windows.Forms.CheckBox
+    {
+        int boxSize = 16;
+        int gap = 8;
+        int radius = 4;
+        float stroke = 1f;
+        float focusRing = 2f;
+        bool inside, down, keyDown;
+
+        public CheckBox()
+        {
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        }
+        public int BoxSize { get { return boxSize; } set { boxSize = Math.Max(8, value); Invalidate(); PerformLayout(); } }
+        public int Gap { get { return gap; } set { gap = Math.Max(0, value); Invalidate(); PerformLayout(); } }
+        public int Radius { get { return radius; } set { radius = Math.Max(0, value); Invalidate(); } }
+        public float Stroke { get { return stroke; } set { stroke = Math.Max(1f, value); Invalidate(); } }
+        public float FocusRingWidth { get { return focusRing; } set { focusRing = Math.Max(1f, value); Invalidate(); } }
+        // The width the box and the gap take before the text starts.
+        public int TextIndent { get { return boxSize + gap; } }
+
+        protected override Size DefaultSize { get { return new Size(160, 24); } }
+        TextFormatFlags Flags()
+        {
+            TextFormatFlags f = TextFormatFlags.NoPadding | TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.WordBreak;
+            if (!UseMnemonic) f |= TextFormatFlags.NoPrefix;
+            else if (!ShowKeyboardCues) f |= TextFormatFlags.HidePrefix;
+            return f;
+        }
+        public override Size GetPreferredSize(Size proposedSize)
+        {
+            int avail = (proposedSize.Width > 0 && proposedSize.Width < 32000) ? Math.Max(1, proposedSize.Width - TextIndent - Padding.Horizontal) : int.MaxValue;
+            Size ts = string.IsNullOrEmpty(Text) ? Size.Empty : TextRenderer.MeasureText(Text, Font, new Size(avail, 0), Flags());
+            int lineH = TextRenderer.MeasureText("Ag", Font, new Size(int.MaxValue, 0), TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Height;
+            return new Size(TextIndent + ts.Width + Padding.Horizontal + 2, Math.Max(boxSize, Math.Max(ts.Height, lineH)) + Padding.Vertical + 4);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { inside = true; base.OnMouseEnter(e); Invalidate(); }
+        protected override void OnMouseLeave(EventArgs e) { inside = false; down = false; base.OnMouseLeave(e); Invalidate(); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) down = true; base.OnMouseDown(e); Invalidate(); }
+        protected override void OnMouseUp(MouseEventArgs e) { down = false; base.OnMouseUp(e); Invalidate(); }
+        protected override void OnKeyDown(KeyEventArgs e) { if (e.KeyCode == Keys.Space) keyDown = true; base.OnKeyDown(e); Invalidate(); }
+        protected override void OnKeyUp(KeyEventArgs e) { keyDown = false; base.OnKeyUp(e); Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { keyDown = false; down = false; base.OnLostFocus(e); Invalidate(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+        protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
+        protected override void OnForeColorChanged(EventArgs e) { base.OnForeColorChanged(e); Invalidate(); }
+        protected override void OnCheckStateChanged(EventArgs e) { base.OnCheckStateChanged(e); Invalidate(); }
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Color back = BackColor.A == 255 ? BackColor : (Parent != null ? Parent.BackColor : Theme.Card);
+            g.Clear(back);
+            bool on = Enabled;
+            int indent = TextIndent;
+            int avail = Math.Max(1, ClientSize.Width - indent);
+            TextFormatFlags flags = Flags();
+            Size ts = string.IsNullOrEmpty(Text) ? Size.Empty : TextRenderer.MeasureText(g, Text, Font, new Size(avail, 0), flags);
+            int lineH = TextRenderer.MeasureText(g, "Ag", Font, new Size(int.MaxValue, 0), TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Height;
+            int textH = Math.Max(ts.Height, lineH);
+            int top = Math.Max(0, (ClientSize.Height - textH) / 2);
+            int boxTop = Math.Max(0, top + (lineH - boxSize) / 2);
+            int level = (down || keyDown) ? 2 : (inside ? 1 : 0);
+            CheckGlyph.Draw(g, new Rectangle(0, boxTop, boxSize, boxSize), CheckState, on ? level : 0, on, radius, stroke);
+            if (ts.Width > 0)
+            {
+                TextRenderer.DrawText(g, Text, Font, new Rectangle(indent, top, avail, textH), on ? ForeColor : Theme.Disabled, flags);
+            }
+            if (Focused && ShowFocusCues)
+            {
+                int w = Math.Min(ClientSize.Width, indent + ts.Width + (int)Math.Ceiling(focusRing) * 2);
+                RectangleF fr = new RectangleF(focusRing / 2f, focusRing / 2f, w - focusRing, ClientSize.Height - focusRing);
+                using (GraphicsPath fp = Theme.RoundRect(fr, radius + 1))
+                using (Pen ring = new Pen(Theme.Focus, focusRing))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.DrawPath(ring, fp);
+                }
+            }
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct NativeRect { public int Left, Top, Right, Bottom; }
+
+    // Thin wrappers over the DPI calls. Each one returns a plain value and never throws (a missing entry point on an older Windows gives false / 0 / -1).
+    public static class Native
+    {
+        [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+        [DllImport("user32.dll")] static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")] static extern int GetAwarenessFromDpiAwarenessContext(IntPtr value);
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(NativePoint pt, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+        [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+        [DllImport("gdi32.dll")] static extern int GetDeviceCaps(IntPtr dc, int index);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct NativePoint { public int X; public int Y; }
+
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is -4.
+        public static bool SetProcessV2()
+        {
+            try { return SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (Exception) { return false; }
+        }
+        // PROCESS_PER_MONITOR_DPI_AWARE is 2; S_OK is 0.
+        public static bool SetProcessShcore()
+        {
+            try { return SetProcessDpiAwareness(2) == 0; } catch (Exception) { return false; }
+        }
+        // 0 unaware, 1 system aware, 2 per monitor aware, -1 unknown.
+        public static int AwarenessLevel()
+        {
+            try { return GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()); } catch (Exception) { return -1; }
+        }
+        // LOGPIXELSX of the screen DC: the DPI WinForms compares AutoScaleDimensions with. 0 when unknown.
+        public static int DeviceDpi()
+        {
+            try
+            {
+                IntPtr dc = GetDC(IntPtr.Zero);
+                if (dc == IntPtr.Zero) return 0;
+                try { return GetDeviceCaps(dc, 88); } finally { ReleaseDC(IntPtr.Zero, dc); }
+            }
+            catch (Exception) { return 0; }
+        }
+        // ---- Bringing a foreign sign-in window forward (the Exchange Online sign-in is a WAM window that can open behind the dialog).
+        delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder sb, int max);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int cmd);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+        static string ClassOf(IntPtr hwnd)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
+            return GetClassName(hwnd, sb, sb.Capacity) > 0 ? sb.ToString() : "";
+        }
+        static uint PidOf(IntPtr hwnd)
+        {
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            return pid;
+        }
+
+        // The top-level windows that hold a sign-in: an ApplicationFrameWindow with a Windows.UI.Core.CoreWindow child of one of the broker processes,
+        // and (fallback) any visible top-level window that belongs to a broker process. Empty on any failure.
+        public static IntPtr[] FindSignInFrames(int[] brokerPids)
+        {
+            List<IntPtr> found = new List<IntPtr>();
+            try
+            {
+                if (brokerPids == null || brokerPids.Length == 0) return found.ToArray();
+                HashSet<uint> pids = new HashSet<uint>();
+                foreach (int p in brokerPids) pids.Add((uint)p);
+                EnumProc top = delegate(IntPtr hwnd, IntPtr lp)
+                {
+                    try
+                    {
+                        if (!IsWindowVisible(hwnd)) return true;
+                        if (pids.Contains(PidOf(hwnd))) { found.Add(hwnd); return true; }
+                        if (ClassOf(hwnd) != "ApplicationFrameWindow") return true;
+                        bool hit = false;
+                        EnumProc child = delegate(IntPtr ch, IntPtr lp2)
+                        {
+                            if (pids.Contains(PidOf(ch)) && ClassOf(ch) == "Windows.UI.Core.CoreWindow") { hit = true; return false; }
+                            return true;
+                        };
+                        EnumChildWindows(hwnd, child, IntPtr.Zero);
+                        if (hit) found.Add(hwnd);
+                    }
+                    catch (Exception) { }
+                    return true;
+                };
+                EnumWindows(top, IntPtr.Zero);
+            }
+            catch (Exception) { }
+            return found.ToArray();
+        }
+
+        // Restores the window when minimized, then makes it the foreground window; when Windows refuses, borrows the input queue of the
+        // current foreground window (the documented AttachThreadInput fallback). True when the window is the foreground window afterwards.
+        public static bool BringToFront(IntPtr hwnd)
+        {
+            try
+            {
+                if (hwnd == IntPtr.Zero) return false;
+                if (IsIconic(hwnd)) ShowWindow(hwnd, 9);   // SW_RESTORE
+                if (SetForegroundWindow(hwnd)) return true;
+                IntPtr fg = GetForegroundWindow();
+                uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, out _unusedPid);
+                uint me = GetCurrentThreadId();
+                bool attached = false;
+                try
+                {
+                    if (fgThread != 0 && fgThread != me) attached = AttachThreadInput(me, fgThread, true);
+                    BringWindowToTop(hwnd);
+                    SetForegroundWindow(hwnd);
+                }
+                finally { if (attached) AttachThreadInput(me, fgThread, false); }
+                return GetForegroundWindow() == hwnd;
+            }
+            catch (Exception) { return false; }
+        }
+        [ThreadStatic] static uint _unusedPid;
+
+        public static int WindowDpi(IntPtr hwnd)
+        {
+            try { return (int)GetDpiForWindow(hwnd); } catch (Exception) { return 0; }
+        }
+        // The effective DPI of the monitor that holds (x, y), or the nearest one; 0 when unknown.
+        public static int MonitorDpi(int x, int y)
+        {
+            try
+            {
+                NativePoint p = new NativePoint();
+                p.X = x; p.Y = y;
+                IntPtr mon = MonitorFromPoint(p, 2);   // MONITOR_DEFAULTTONEAREST
+                uint dx, dy;
+                if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0, out dx, out dy) == 0) return (int)dx;   // MDT_EFFECTIVE_DPI
+            }
+            catch (Exception) { }
+            return 0;
+        }
+        // Delivers a WM_DPICHANGED to a window, as Windows does when it is dragged to another monitor (tests).
+        public static void SendDpiChanged(IntPtr hwnd, int dpi, int left, int top, int right, int bottom)
+        {
+            NativeRect rc = new NativeRect();
+            rc.Left = left; rc.Top = top; rc.Right = right; rc.Bottom = bottom;
+            IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeRect)));
+            try
+            {
+                Marshal.StructureToPtr(rc, mem, false);
+                SendMessage(hwnd, 0x02E0, new IntPtr(dpi | (dpi << 16)), mem);
+            }
+            finally { Marshal.FreeHGlobal(mem); }
+        }
+    }
+
+    public class DpiChangedEventArgs : EventArgs
+    {
+        readonly int dpi;
+        readonly Rectangle bounds;
+        public DpiChangedEventArgs(int dpi, Rectangle bounds) { this.dpi = dpi; this.bounds = bounds; }
+        public int Dpi { get { return dpi; } }
+        public Rectangle Bounds { get { return bounds; } }
+    }
+
+    // Listens to WM_DPICHANGED of one form (the form does nothing with it by itself): LOWORD(wParam) is the new DPI, lParam the rectangle Windows suggests.
+    // It follows the form's handle, so it keeps working when the handle is recreated.
+    public class DpiWatcher : NativeWindow
+    {
+        readonly Form target;
+        int count;
+        public event EventHandler<DpiChangedEventArgs> DpiChanged;
+
+        public DpiWatcher(Form form)
+        {
+            target = form;
+            form.HandleCreated += delegate { Attach(); };
+            form.HandleDestroyed += delegate { if (Handle != IntPtr.Zero) ReleaseHandle(); };
+            if (form.IsHandleCreated) Attach();
+        }
+        public Form Target { get { return target; } }
+        public int Count { get { return count; } }
+
+        void Attach()
+        {
+            if (Handle == target.Handle) return;
+            if (Handle != IntPtr.Zero) ReleaseHandle();
+            AssignHandle(target.Handle);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x02E0)
+            {
+                int dpi = (int)((long)m.WParam & 0xFFFF);
+                Rectangle r = Rectangle.Empty;
+                if (m.LParam != IntPtr.Zero)
+                {
+                    NativeRect rc = (NativeRect)Marshal.PtrToStructure(m.LParam, typeof(NativeRect));
+                    r = Rectangle.FromLTRB(rc.Left, rc.Top, rc.Right, rc.Bottom);
+                }
+                count++;
+                EventHandler<DpiChangedEventArgs> handler = DpiChanged;
+                if (handler != null)
+                {
+                    try { handler(this, new DpiChangedEventArgs(dpi, r)); } catch (Exception) { }
+                }
+            }
+            base.WndProc(ref m);
+        }
+    }
 }
 '@
 
@@ -1016,6 +1659,17 @@ if ((Get-QraCompileDecision) -ne 'compile') {
         $script:QraDisplayReason = 'compile failed'
     }
 }
+
+# ---- Declare the DPI awareness now (the native helpers are compiled; no window of this thread exists yet), then read the DPI Windows reports.
+$script:QraAwareness = Enable-QraDpiAwareness
+if ($script:QraAwareness -ne 'None') { Reset-QraScreenCache }
+$script:QraPerMonitor = ($script:QraDpiMode -ne 'system') -and $script:UiNative -and ((Get-QraAwarenessLevel) -eq 2)
+# The DPI is read from the screen DC itself, as WinForms does for AutoScaleMode = Dpi. Graphics.FromHwnd(0).DpiX is GDI+'s copy, taken the first time any
+# thread used GDI+: the launcher's splash thread does that before this process is DPI aware, so it would still say 96 on a 125 % PC.
+$nativeDpi = 0
+if ($script:UiNative) { try { $nativeDpi = [int][QraUi.Native]::DeviceDpi() } catch { $nativeDpi = 0 } } # falls back to GDI+ below
+if ($nativeDpi -ge 96) { $script:DeviceDpi = [double]$nativeDpi; $script:DpiScale = [Math]::Max(1.0, $nativeDpi / 96.0) }
+else { try { $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $script:DeviceDpi = [double]$g0.DpiX; $script:DpiScale = [Math]::Max(1.0, $g0.DpiX / 96); $g0.Dispose() } catch { $null = $_ } } # defaults to 96 DPI (scale 1.0)
 
 # ---- Control factories (native C# type when $script:UiNative, else a plain WinForms control with today's look)
 function New-QraCard {
@@ -1112,6 +1766,42 @@ function New-QraButton([string]$text, [ValidateSet('Primary', 'Secondary', 'Link
         elseif ($variant -eq 'Link') { $b.ForeColor = $C.Primary }
     }
     $b
+}
+
+function New-QraCheckBox([string]$text = '', [int]$box = 16) {
+    # A painted Windows 11 style check box (QraUi.CheckBox: a box of $box px at 100 %, scaled with the window). Without the painted kit: the plain WinForms CheckBox.
+    # It is still a CheckBox: Checked, CheckedChanged, Enabled, ForeColor and the Space key work the same. Callers set Font, BackColor, bounds and TabIndex.
+    if ($script:UiNative) {
+        $cb = New-Object QraUi.CheckBox
+        $cb.Text = $text
+        $cb.BoxSize = S $box
+        $cb.Gap = S 8
+        $cb.Radius = S 4
+        $cb.Stroke = [float](S 1)
+        $cb.FocusRingWidth = [float](S 2)
+        return $cb
+    }
+    $cb = New-Object System.Windows.Forms.CheckBox
+    $cb.Text = $text
+    $cb
+}
+function Get-QraCheckBoxIndent($CheckBox) {
+    # The width a check box takes before its text (the box and the gap); the plain CheckBox needs about 24 px at 100 %.
+    if ($CheckBox -and $CheckBox.GetType().FullName -eq 'QraUi.CheckBox') { return [int]$CheckBox.TextIndent }
+    S 24
+}
+function Set-QraListCheckImages($ListView) {
+    # The row check boxes of a list view (CheckBoxes = $true) get the same painted look: a StateImageList with two images (unchecked, checked) at 16 px
+    # of the current scale. Call it again after a DPI change; it does nothing when the images already have the right size, and nothing without the painted kit.
+    if (-not $script:UiNative -or $null -eq $ListView) { return $false }
+    $size = [int](S 16)
+    # Without this the list view ignores the state images for its row check boxes; it can only be set before the window handle exists (call this right after creating the list view).
+    if (-not $ListView.IsHandleCreated -and $ListView.UseCompatibleStateImageBehavior) { $ListView.UseCompatibleStateImageBehavior = $false }
+    $old = $ListView.StateImageList
+    if ($old -and $old.ImageSize.Width -eq $size) { return $true }
+    $ListView.StateImageList = [QraUi.CheckGlyph]::CreateStateImages($size, [float](S 4), [float](S 1))
+    if ($old) { try { $old.Dispose() } catch { $null = $_ } } # the list view has the new images by now
+    $true
 }
 
 # ---- State setters

@@ -30,10 +30,11 @@ It never:
 **How PowerShell is started.** `Start-Here.cmd` contains this line:
 
 ```
-start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0app\Launcher.ps1"
+start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0app\Launcher.ps1"
 ```
 
-`-ExecutionPolicy Bypass` applies to that one PowerShell process only (process scope). It does not change any machine or user
+`/min` starts PowerShell minimised, so its console never appears on screen (the launcher then hides it from the taskbar too). The window
+style is not set to hidden. `-ExecutionPolicy Bypass` applies to that one PowerShell process only (process scope). It does not change any machine or user
 policy, and it ends when the launcher closes. `Start-Review.cmd` is a fallback that runs only inside the Sandbox, and it starts
 `QuarantineReview.ps1` the same way (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File`). The Sandbox profile starts the
 review window with that same command plus `-WindowStyle Hidden`.

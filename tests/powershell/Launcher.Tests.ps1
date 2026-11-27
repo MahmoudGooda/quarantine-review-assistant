@@ -296,9 +296,55 @@ Describe 'Launcher: stale decision and the block list' {
     }
 }
 
+Describe 'Launcher: decision cards (step 5)' {
+    BeforeAll {
+        Import-LauncherFunction 'Get-DecisionTone', 'Get-DecisionCards', 'Get-DecisionHeading', 'Get-Step5Wording'
+        function New-Dec([string]$final, [string]$subject = 'Invoice') { [pscustomobject]@{ final_decision = $final; confidence = 'High'; recorded_local = '2026-11-25 10:58'; sender = 's@x.example'; subject = $subject; tool_recommendation = 'Likely malicious'; microsoft_verdict = 'Phish' } }
+    }
+    It 'maps every decision the Sandbox records to a tone' {
+        Get-DecisionTone 'Delete and block' | Should -Be 'Danger'
+        Get-DecisionTone 'Delete (unwanted, no block)' | Should -Be 'Danger'
+        Get-DecisionTone 'Release (false positive, submitted to Microsoft)' | Should -Be 'Success'
+        Get-DecisionTone 'Release to user (bulk / marketing)' | Should -Be 'Success'
+        Get-DecisionTone 'Keep quarantined (pending verification)' | Should -Be 'Warning'
+        Get-DecisionTone 'Something new' | Should -Be 'Info'
+        Get-DecisionTone '' | Should -Be 'Info'
+        Get-DecisionTone $null | Should -Be 'Info'
+    }
+    It 'builds one card per reviewed package plus a slim card for each package without a decision' {
+        $cards = @(Get-DecisionCards @([pscustomobject]@{ FileName = 'b.zip'; Decision = (New-Dec 'Release') }, [pscustomobject]@{ FileName = 'a.zip'; Decision = (New-Dec 'Delete and block') }) @('a.zip', 'b.zip', 'c.eml') $null $false)
+        $cards.Count | Should -Be 3
+        $cards[0].File | Should -Be 'a.zip'; $cards[0].Tone | Should -Be 'Danger'; $cards[0].Confidence | Should -Be 'High confidence'
+        $cards[0].Tool | Should -Match '^Tool: Likely malicious .+ Microsoft: Phish$'
+        $cards[0].Accessible | Should -Match 'Delete and block.*Subject: Invoice.*From: s@x\.example'
+        $cards[1].Tone | Should -Be 'Success'
+        $cards[2].Kind | Should -Be 'Pending'; $cards[2].File | Should -Be 'c.eml'; $cards[2].Tool | Should -Be 'Launch the Sandbox again to review it.'
+        Get-DecisionHeading $cards | Should -Be '2 of 3 messages reviewed'
+    }
+    It 'headings are singular or plural, and a stale decision is a previous-decision card without heading' {
+        Get-DecisionHeading @(Get-DecisionCards @([pscustomobject]@{ FileName = 'a.zip'; Decision = (New-Dec 'Release') }) @('a.zip') $null $false) | Should -Be 'Decision recorded'
+        Get-DecisionHeading @(Get-DecisionCards @([pscustomobject]@{ FileName = 'a.zip'; Decision = (New-Dec 'Release') }, [pscustomobject]@{ FileName = 'b.zip'; Decision = (New-Dec 'Release') }) @('a.zip', 'b.zip') $null $false) | Should -Be '2 decisions recorded'
+        $old = @(Get-DecisionCards @() @() (New-Dec 'Delete and block') $true)
+        $old.Count | Should -Be 1; $old[0].Kind | Should -Be 'Previous'
+        $old[0].Accessible | Should -Match '^Previous decision, not for the current download'
+        Get-DecisionHeading $old | Should -Be ''
+        @(Get-DecisionCards @() @() $null $false).Count | Should -Be 0
+    }
+    It 'keeps a subject on one line and survives missing fields' {
+        $c = @(Get-DecisionCards @() @() ([pscustomobject]@{ final_decision = ''; subject = "two`r`nlines" }) $false)[0]
+        $c.Subject | Should -Be 'two lines'; $c.From | Should -Be 'From (no sender)'; $c.Tool | Should -Be ''; $c.Decision | Should -Be 'Decision recorded'
+    }
+    It 'step 5 wording follows the number of packages' {
+        (Get-Step5Wording $false).Lead | Should -Be 'Your recorded decision appears below with a ready-to-paste block list.'
+        (Get-Step5Wording $false).Delete | Should -Be 'Delete the downloaded ZIP from Incoming.'
+        (Get-Step5Wording $true).Lead | Should -Be 'Your recorded decisions appear below with a ready-to-paste block list.'
+        (Get-Step5Wording $true).Delete | Should -Be 'Delete the downloaded ZIPs from Incoming.'
+    }
+}
+
 Describe 'Launcher: verify the package before copying' {
     BeforeAll {
-        Import-LauncherFunction 'Get-IncomingPackages', 'Get-IncomingPackageKey', 'Read-LastDecision', 'Get-DecisionInputHash', 'Get-VerifiedBlockList', 'Get-BlockListText'
+        Import-LauncherFunction 'Get-IncomingPackages', 'Get-IncomingPackageKey', 'Get-IncomingFileKey', 'Read-LastDecision', 'Read-DecisionMap', 'Get-DecisionInputHash', 'Get-VerifiedBlockList', 'Get-BlockListText', 'Get-CombinedBlockListText'
     }
     BeforeEach {
         $inbox = Join-Path $TestDrive 'Incoming'
@@ -318,7 +364,7 @@ Describe 'Launcher: verify the package before copying' {
         Get-VerifiedBlockList $inbox $reportsDir $decision | Should -Match 'sender@example.test'
     }
     It 'hashes off the UI thread, reuses a verified hash, and invalidates it on a same-size rewrite' {
-        Import-LauncherFunction 'Start-IncomingWatcher', 'Update-IncomingHash', 'Clear-IncomingHash', 'Get-LauncherFacts', 'Get-SandboxProcess'
+        Import-LauncherFunction 'Start-IncomingWatcher', 'Update-IncomingHash', 'Clear-IncomingHash', 'Get-LauncherFacts', 'Get-SandboxProcess', 'Get-ReviewedPackages', 'Test-RunProducedDecision', 'Get-IncomingPackagePaths'
         $Incoming = $inbox
         $form = New-Object Windows.Forms.Form
         [void]$form.Handle
@@ -326,6 +372,7 @@ Describe 'Launcher: verify the package before copying' {
         $optReports = @{ Checked = $true }
         $script:IncomingFiles = @(Get-IncomingPackages $inbox)
         $script:LastDecision = Read-LastDecision $reportsDir
+        $script:DecisionMap = Read-DecisionMap $reportsDir
         try {
             Update-IncomingHash
             $script:HashWork | Should -Not -BeNullOrEmpty
@@ -339,7 +386,7 @@ Describe 'Launcher: verify the package before copying' {
             [IO.File]::WriteAllText($pkg, 'sample two')
             [IO.File]::SetLastWriteTimeUtc($pkg, $stamp)
             $deadline = [DateTime]::UtcNow.AddSeconds(5)
-            while ($script:IncomingHash -and [DateTime]::UtcNow -lt $deadline) {
+            while ($script:IncomingHashKey -and [DateTime]::UtcNow -lt $deadline) {
                 [Windows.Forms.Application]::DoEvents()
                 Start-Sleep -Milliseconds 20
             }
@@ -358,11 +405,13 @@ Describe 'Launcher: verify the package before copying' {
         [IO.File]::SetLastWriteTimeUtc($record, $stamp.AddMinutes(1))
         Get-VerifiedBlockList $inbox $reportsDir $decision | Should -BeNullOrEmpty
     }
-    It 'rejects an ambiguous or missing download' {
+    It 'verifies against the package it belongs to when other packages are present, and rejects a missing download' {
         $other = Join-Path $inbox 'other.eml'
         [IO.File]::WriteAllText($other, 'other')
-        Get-VerifiedBlockList $inbox $reportsDir $decision | Should -BeNullOrEmpty
-        Remove-Item -LiteralPath $pkg, $other
+        Get-VerifiedBlockList $inbox $reportsDir $decision | Should -Match 'sender@example.test'
+        Remove-Item -LiteralPath $pkg
+        Get-VerifiedBlockList $inbox $reportsDir $decision | Should -BeNullOrEmpty -Because 'the other package is not the one the decision is for'
+        Remove-Item -LiteralPath $other
         Get-VerifiedBlockList $inbox $reportsDir $decision | Should -BeNullOrEmpty
     }
     It 'keeps legacy, partial and malformed records out of the current workflow' {
@@ -385,6 +434,344 @@ Describe 'Launcher: verify the package before copying' {
         Get-VerifiedBlockList $inbox $reportsDir $displayed | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Launcher: several packages in Incoming' {
+    BeforeAll {
+        Import-LauncherFunction 'Get-LauncherStepState', 'Format-WaitSeconds'
+        Import-LauncherFunction 'Get-IncomingPackages', 'Get-IncomingFileKey', 'Get-IncomingPackageKey', 'Get-IncomingPackagePaths', 'Read-DecisionMap', 'Get-DecisionInputHash',
+            'Get-DecisionSnapshot', 'Test-RunProducedDecision', 'Get-ReviewedPackages', 'Get-BlockListText', 'Get-CombinedBlockListText', 'Get-VerifiedBlockList',
+            'Get-ReviewedDecisionsText', 'Get-LastDecisionText'
+        function New-Facts([hashtable]$over = @{}) {
+            $f = @{
+                ChecksRunning = $false; BlockingCount = 0; WarnCount = 0; DefenderChecked = $true
+                IncomingCount = 2; ReviewedCount = 0; DecisionCurrent = $false; PartialContinued = $false; DecisionText = ''
+                SandboxRunning = $false; LaunchState = 'None'; ExportOn = $true
+                DecisionAcknowledged = $false; CleanedUp = $false
+            }
+            foreach ($k in $over.Keys) { $f[$k] = $over[$k] }
+            $f
+        }
+        function New-Package([string]$dir, [string]$name, [string]$content) {
+            $path = Join-Path $dir $name
+            [IO.File]::WriteAllText($path, $content)
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        function New-DecisionFile([string]$dir, [string]$name, [string]$hash, [string]$decision = 'Delete and block', [hashtable]$extra = @{}) {
+            $rec = [ordered]@{ final_decision = $decision; record_complete = $true; input_sha256 = $hash; recorded_local = '2026-11-25 10:58'; confidence = 'High' }
+            foreach ($k in $extra.Keys) { $rec[$k] = $extra[$k] }
+            $path = Join-Path $dir $name
+            $rec | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path
+            $path
+        }
+    }
+
+    Context 'step 4 with two files' {
+        It 'nothing reviewed: step 4 waits for the first review' {
+            $s = Get-LauncherStepState (New-Facts)
+            $s.Steps[3].State | Should -Be 'Current'
+            $s.Steps[3].Summary | Should -Be ''
+            $s.Current | Should -Be 4
+        }
+        It 'one of two reviewed, Sandbox closed: partial, stays on step 4' {
+            $s = Get-LauncherStepState (New-Facts @{ ReviewedCount = 1; DecisionCurrent = $true; DecisionText = 'Delete and block' })
+            $s.Steps[3].State | Should -Be 'Current'
+            $s.Steps[3].Summary | Should -Be '1 of 2 messages reviewed'
+            $s.Current | Should -Be 4
+        }
+        It 'one of two reviewed, a failed later run: still partial, the warning is in the launch hint, not the summary' {
+            $s = Get-LauncherStepState (New-Facts @{ ReviewedCount = 1; DecisionCurrent = $true; LaunchState = 'Vanished' })
+            $s.Steps[3].Summary | Should -Be '1 of 2 messages reviewed'
+        }
+        It 'one of two reviewed, Sandbox running: review in progress' {
+            $s = Get-LauncherStepState (New-Facts @{ ReviewedCount = 1; DecisionCurrent = $true; SandboxRunning = $true })
+            $s.Steps[3].State | Should -Be 'Working'
+            $s.Steps[3].Summary | Should -Be 'Review in progress'
+        }
+        It 'none reviewed, Sandbox running or starting' {
+            (Get-LauncherStepState (New-Facts @{ SandboxRunning = $true })).Steps[3].Summary | Should -Be 'Review in progress'
+            (Get-LauncherStepState (New-Facts @{ LaunchState = 'Starting' })).Steps[3].Summary | Should -Be 'Starting Windows Sandbox...'
+        }
+        It 'two of two reviewed: done, step 5 says how many decisions' {
+            $s = Get-LauncherStepState (New-Facts @{ ReviewedCount = 2; DecisionCurrent = $true })
+            $s.Steps[3].State | Should -Be 'Done'
+            $s.Steps[3].Summary | Should -Be 'Decisions recorded for 2 messages'
+            $s.Current | Should -Be 5
+            $s.Steps[4].Summary | Should -Be '2 decisions recorded'
+        }
+        It 'two of two reviewed while the Sandbox is still open: done' {
+            (Get-LauncherStepState (New-Facts @{ ReviewedCount = 2; DecisionCurrent = $true; SandboxRunning = $true })).Steps[3].State | Should -Be 'Done'
+        }
+        It 'continuing with one of two moves to step 5 with that decision' {
+            $s = Get-LauncherStepState (New-Facts @{ ReviewedCount = 1; DecisionCurrent = $true; DecisionText = 'Delete and block'; PartialContinued = $true })
+            $s.Steps[3].State | Should -Be 'Done'
+            $s.Steps[3].Summary | Should -Be '1 of 2 messages reviewed'
+            $s.Current | Should -Be 5
+            $s.Steps[4].Summary | Should -Be 'Decision: Delete and block'
+        }
+        It 'a Sandbox started after continuing takes the step back' {
+            (Get-LauncherStepState (New-Facts @{ ReviewedCount = 1; DecisionCurrent = $true; PartialContinued = $true; SandboxRunning = $true })).Current | Should -Be 4
+        }
+        It 'export off and acknowledged still works with several files' {
+            $s = Get-LauncherStepState (New-Facts @{ ExportOn = $false; DecisionAcknowledged = $true })
+            $s.Steps[3].Summary | Should -Be 'Decision recorded in the Sandbox'
+            $s.Steps[4].Summary | Should -Match 'report export was off'
+        }
+    }
+
+    Context 'single package regression' {
+        It 'one file, one decision: unchanged texts' {
+            $s = Get-LauncherStepState (New-Facts @{ IncomingCount = 1; ReviewedCount = 1; DecisionCurrent = $true; DecisionText = 'Release' })
+            $s.Steps[3].Summary | Should -Be 'Decision recorded'
+            $s.Steps[4].Summary | Should -Be 'Decision: Release'
+            $s.Current | Should -Be 5
+        }
+        It 'one file, no decision, failed run: the warning stays in the summary' {
+            $s = Get-LauncherStepState (New-Facts @{ IncomingCount = 1; LaunchState = 'Vanished' })
+            $s.Steps[3].Summary | Should -Match 'closed before a decision'
+            $s.Current | Should -Be 4
+        }
+        It 'facts without ReviewedCount still work (DecisionCurrent alone means one reviewed)' {
+            $f = New-Facts @{ IncomingCount = 1; DecisionCurrent = $true }
+            $f.Remove('ReviewedCount')
+            (Get-LauncherStepState $f).Steps[3].State | Should -Be 'Done'
+        }
+    }
+
+    Context 'the decision map' {
+        BeforeEach {
+            $inbox = Join-Path $TestDrive 'MapIncoming'; $reportsDir = Join-Path $TestDrive 'MapReports'
+            Remove-Item -LiteralPath $inbox, $reportsDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $inbox, $reportsDir -Force | Out-Null
+        }
+        It 'maps each input hash to its newest record; invalid records are ignored' {
+            $hA = New-Package $inbox 'a.zip' 'aaa'; $hB = New-Package $inbox 'b.eml' 'bbb'
+            $old = New-DecisionFile $reportsDir 'Decision-1.json' $hA 'Release'
+            $new = New-DecisionFile $reportsDir 'Decision-2.json' $hA 'Delete and block'
+            [IO.File]::SetLastWriteTimeUtc($old, [DateTime]::UtcNow.AddMinutes(-10)); [IO.File]::SetLastWriteTimeUtc($new, [DateTime]::UtcNow.AddMinutes(-5))
+            New-DecisionFile $reportsDir 'Decision-3.json' $hB 'Keep' | Out-Null
+            # ignored: incomplete, a hash that is not 64 hex digits, malformed JSON, and a report file
+            $bad = New-DecisionFile $reportsDir 'Decision-4.json' ('c' * 64) 'Release' @{ record_complete = $false }
+            New-DecisionFile $reportsDir 'Decision-5.json' 'not-a-hash' 'Release' | Out-Null
+            '{' | Set-Content -LiteralPath (Join-Path $reportsDir 'Decision-6.json')
+            New-DecisionFile $reportsDir 'Decision-7-report.json' ('d' * 64) 'Release' | Out-Null
+            $map = Read-DecisionMap $reportsDir
+            $map.Count | Should -Be 2
+            $map[$hA].final_decision | Should -Be 'Delete and block' -Because 'the newest record for a hash wins'
+            $map[$hB].final_decision | Should -Be 'Keep'
+            $map.ContainsKey(('c' * 64)) | Should -BeFalse
+            $map.ContainsKey(('d' * 64)) | Should -BeFalse
+        }
+        It 'an empty or missing Reports folder is an empty map' {
+            (Read-DecisionMap $reportsDir).Count | Should -Be 0
+            (Read-DecisionMap (Join-Path $TestDrive 'nope')).Count | Should -Be 0
+        }
+        It 'the cache re-reads a record only when the file changes' {
+            $h = New-Package $inbox 'a.zip' 'aaa'
+            $f = New-DecisionFile $reportsDir 'Decision-1.json' $h 'Release'
+            $cache = @{}
+            (Read-DecisionMap $reportsDir $cache)[$h].final_decision | Should -Be 'Release'
+            $cache.Count | Should -Be 1
+            Remove-Item -LiteralPath $f
+            (Read-DecisionMap $reportsDir $cache).Count | Should -Be 0
+            $cache.Count | Should -Be 0
+        }
+        It 'a package is reviewed only when its hash has a record; a stale record never counts' {
+            $hA = New-Package $inbox 'a.zip' 'aaa'; $hB = New-Package $inbox 'b.zip' 'bbb'
+            New-DecisionFile $reportsDir 'Decision-1.json' $hA | Out-Null
+            New-DecisionFile $reportsDir 'Decision-2.json' ('e' * 64) | Out-Null     # for a download that is gone
+            $files = @(Get-IncomingPackages $inbox)
+            $hashes = @{}; foreach ($f in $files) { $hashes[$f.FullName] = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash }   # upper case, as Get-FileHash returns it
+            $map = Read-DecisionMap $reportsDir
+            $r = @(Get-ReviewedPackages $files $hashes $map)
+            $r.Count | Should -Be 1
+            $r[0].FileName | Should -Be 'a.zip'
+            @(Get-ReviewedPackages $files $null $map).Count | Should -Be 0 -Because 'no hashes yet'
+            @(Get-ReviewedPackages $files $hashes @{}).Count | Should -Be 0
+        }
+        It 'two copies of the same package are both reviewed by one record' {
+            $h = New-Package $inbox 'a.zip' 'same'; New-Package $inbox 'a (2).zip' 'same' | Out-Null
+            New-DecisionFile $reportsDir 'Decision-1.json' $h | Out-Null
+            $files = @(Get-IncomingPackages $inbox)
+            $hashes = @{}; foreach ($f in $files) { $hashes[$f.FullName] = $h }
+            @(Get-ReviewedPackages $files $hashes (Read-DecisionMap $reportsDir)).Count | Should -Be 2
+        }
+        It 'the package key covers every .zip/.eml and skips other files' {
+            New-Package $inbox 'a.zip' 'aaa' | Out-Null; New-Package $inbox 'b.eml' 'bbb' | Out-Null; New-Package $inbox 'notes.txt' 'x' | Out-Null
+            $files = @(Get-IncomingPackages $inbox)
+            @(Get-IncomingPackagePaths $files).Count | Should -Be 2
+            (Get-IncomingPackageKey $files) -split ';' | Should -HaveCount 2
+            Get-IncomingPackageKey @() | Should -BeNullOrEmpty
+            Get-IncomingPackageKey @($files | Where-Object { $_.Name -eq 'notes.txt' }) | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'a run that produced no new decision' {
+        It 'compares the decisions at launch with now' {
+            $recA = [pscustomobject]@{ qra_source = 'Decision-1.json|10|1' }
+            $map = @{ ('a' * 64) = $recA }
+            $snap = Get-DecisionSnapshot $map
+            $snap[('a' * 64)] | Should -Be 'Decision-1.json|10|1'
+            Test-RunProducedDecision $map $snap @(('a' * 64), ('b' * 64)) | Should -BeFalse -Because 'only the old decision for file A exists'
+            $map2 = @{ ('a' * 64) = $recA; ('b' * 64) = [pscustomobject]@{ qra_source = 'Decision-2.json|10|2' } }
+            Test-RunProducedDecision $map2 $snap @(('a' * 64), ('b' * 64)) | Should -BeTrue
+            $map3 = @{ ('a' * 64) = [pscustomobject]@{ qra_source = 'Decision-3.json|10|3' } }
+            Test-RunProducedDecision $map3 $snap @(('a' * 64)) | Should -BeTrue -Because 'a re-recorded decision for the same file is new'
+        }
+        It 'ignores a new record for a package that is not in Incoming, and counts it while the hashes are unknown' {
+            $snap = @{}
+            $map = @{ ('c' * 64) = [pscustomobject]@{ qra_source = 'Decision-9.json|1|1' } }
+            Test-RunProducedDecision $map $snap @(('a' * 64)) | Should -BeFalse
+            Test-RunProducedDecision $map $snap $null | Should -BeTrue
+            Test-RunProducedDecision @{} $snap $null | Should -BeFalse
+        }
+        It 'Get-LauncherFacts says Vanished only when the run left nothing new, and None once a decision lands' {
+            Import-LauncherFunction 'Get-LauncherFacts', 'Get-SandboxProcess', 'Get-DecisionInputHash'
+            Mock Get-SandboxProcess { @() }
+            $optReports = @{ Checked = $true }
+            $inbox = Join-Path $TestDrive 'RunIncoming'; New-Item -ItemType Directory -Path $inbox -Force | Out-Null
+            $hA = New-Package $inbox 'a.zip' 'aaa'; $hB = New-Package $inbox 'b.zip' 'bbb'
+            $script:IncomingFiles = @(Get-IncomingPackages $inbox)
+            $script:IncomingHashes = @{}; foreach ($f in $script:IncomingFiles) { $script:IncomingHashes[$f.FullName] = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash }
+            $script:IncomingHashKey = Get-IncomingPackageKey $script:IncomingFiles
+            $oldA = [pscustomobject]@{ record_complete = $true; input_sha256 = $hA; final_decision = 'Release'; qra_source = 'Decision-1.json|1|1' }
+            $script:DecisionMap = @{ $hA = $oldA }
+            $script:LaunchSnapshot = Get-DecisionSnapshot $script:DecisionMap
+            $script:SandboxSeen = $true; $script:RunEnded = $false; $script:LaunchState = 'None'
+            $script:ReadinessWork = $null; $script:Busy = $null; $script:Checks = @()
+            $script:CleanedUp = $false; $script:Step4Seen = $false; $script:DecisionAcknowledged = $false; $script:ContinuedSig = $null
+            $f1 = Get-LauncherFacts
+            $f1.LaunchState | Should -Be 'Vanished' -Because 'the older decision for A must not hide a failed run'
+            $f1.ReviewedCount | Should -Be 1
+            $f1.IncomingCount | Should -Be 2
+            $script:DecisionMap[$hB] = [pscustomobject]@{ record_complete = $true; input_sha256 = $hB; final_decision = 'Keep'; qra_source = 'Decision-2.json|1|2' }
+            $f2 = Get-LauncherFacts
+            $f2.LaunchState | Should -Be 'None'
+            $f2.ReviewedCount | Should -Be 2
+            @($f2.Reviewed).Count | Should -Be 2
+            $script:RunEnded = $false; $script:LaunchState = 'None'; $script:DecisionMap = @{}; $script:IncomingHashes = @{}; $script:IncomingHashKey = $null
+        }
+    }
+
+    Context 'the combined block list' {
+        BeforeAll {
+            $script:RecA = [pscustomobject]@{ final_decision = 'Delete and block'; recorded_local = '2026-11-25 10:58'
+                iocs = [pscustomobject]@{ sender = 'b@y.example'; sender_domain = 'y.example'; domains = @('shared.example', 'y.example'); urls = @('hxxp://x[.]example/p'); sha256 = @('BBBB name.exe') } }
+            $script:RecB = [pscustomobject]@{ final_decision = 'Delete and block'; recorded_local = '2026-11-25 11:06'
+                iocs = [pscustomobject]@{ sender = 'a@x.example'; sender_domain = 'x.example'; domains = @('shared.example', 'x.example'); urls = @('http://x.example/p', 'http://z.example/'); sha256 = @('bbbb other.exe', 'AAAA') } }
+        }
+        It 'one record gives exactly the single block list' {
+            Get-CombinedBlockListText @($script:RecA) | Should -BeExactly (Get-BlockListText $script:RecA)
+        }
+        It 'is the union of both, each value once, sorted, whatever the record order' {
+            $one = Get-CombinedBlockListText @($script:RecA, $script:RecB)
+            $two = Get-CombinedBlockListText @($script:RecB, $script:RecA)
+            $one | Should -BeExactly $two
+            $lines = $one -split "`r`n"
+            @($lines | Where-Object { $_ -eq 'shared.example' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -eq 'http://x.example/p' }).Count | Should -Be 1
+            @($lines | Where-Object { $_ -like 'bbbb*' }).Count | Should -Be 1
+            $lines[0] | Should -Match '2 decisions, newest recorded 2026-11-25 11:06'
+            $lines.IndexOf('a@x.example') | Should -BeLessThan $lines.IndexOf('b@y.example')
+            $lines.IndexOf('# Sender') | Should -BeLessThan $lines.IndexOf('# Link domains (URLs tab)')
+            $lines | Should -Contain 'x.example'
+            $lines | Should -Contain 'aaaa'
+        }
+        It 'a release decision with a spoof pair contributes only that pair' {
+            $rel = [pscustomobject]@{ final_decision = 'Release'; recorded_local = '2026-11-25 11:10'; spoof_pair = 'spoofed@x.example, sender.example'; iocs = [pscustomobject]@{ sender = 'never@x.example' } }
+            $text = Get-CombinedBlockListText @($script:RecA, $rel)
+            $text | Should -Match 'SPOOF ALLOW PAIR'
+            $text | Should -Match 'spoofed@x.example, sender.example'
+            $text | Should -Not -Match 'never@x.example'
+            $text | Should -Match 'b@y.example'
+        }
+    }
+
+    Context 'verifying several decisions before copying' {
+        BeforeEach {
+            $inbox = Join-Path $TestDrive 'VerIncoming'; $reportsDir = Join-Path $TestDrive 'VerReports'
+            Remove-Item -LiteralPath $inbox, $reportsDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $inbox, $reportsDir -Force | Out-Null
+            $hA = New-Package $inbox 'a.zip' 'aaa'; $hB = New-Package $inbox 'b.eml' 'bbb'
+            $recA = New-DecisionFile $reportsDir 'Decision-1.json' $hA 'Delete and block' @{ iocs = @{ sender = 'a@x.example' } }
+            $recB = New-DecisionFile $reportsDir 'Decision-2.json' $hB 'Delete and block' @{ iocs = @{ sender = 'b@y.example' } }
+            $shown = @((Read-DecisionMap $reportsDir).Values)
+        }
+        It 'copies the union of both verified decisions' {
+            $text = Get-VerifiedBlockList $inbox $reportsDir $shown
+            $text | Should -Match 'a@x.example'
+            $text | Should -Match 'b@y.example'
+        }
+        It 'one decision changed on disk blocks the copy' {
+            New-DecisionFile $reportsDir 'Decision-2.json' $hB 'Delete and block' @{ iocs = @{ sender = 'changed@y.example' } } | Out-Null
+            Get-VerifiedBlockList $inbox $reportsDir $shown | Should -BeNullOrEmpty
+        }
+        It 'one package replaced blocks the copy' {
+            [IO.File]::WriteAllText((Join-Path $inbox 'b.eml'), 'something else')
+            Get-VerifiedBlockList $inbox $reportsDir $shown | Should -BeNullOrEmpty
+        }
+        It 'one package removed blocks the copy' {
+            Remove-Item -LiteralPath (Join-Path $inbox 'a.zip')
+            Get-VerifiedBlockList $inbox $reportsDir $shown | Should -BeNullOrEmpty
+        }
+        It 'one record removed blocks the copy' {
+            Remove-Item -LiteralPath $recA
+            Get-VerifiedBlockList $inbox $reportsDir $shown | Should -BeNullOrEmpty
+        }
+        It 'a legacy or incomplete record among them blocks the copy' {
+            $bad = @($shown | ForEach-Object { $_ })
+            $bad[0] = [pscustomobject]@{ final_decision = 'Delete and block'; iocs = @{ sender = 'a@x.example' } }
+            Get-VerifiedBlockList $inbox $reportsDir $bad | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'the last-decision box' {
+        It 'lists every package: reviewed with details, unreviewed as not reviewed yet' {
+            $d = [pscustomobject]@{ final_decision = 'Delete and block'; confidence = 'High'; recorded_local = '2026-11-25 10:58'; sender = 's@x.example'; subject = 'Invoice'; tool_recommendation = 'Likely malicious'; microsoft_verdict = 'Phish' }
+            $text = Get-ReviewedDecisionsText @([pscustomobject]@{ FileName = 'a.zip'; Decision = $d }) @('a.zip', 'b.eml')
+            $text | Should -Match '1 of 2 messages reviewed'
+            $text | Should -Match 'a\.zip - Delete and block - High - 2026-11-25 10:58'
+            $text | Should -Match 'Sender: s@x.example \| Subject: Invoice'
+            $text | Should -Match 'b\.eml - not reviewed yet'
+            $all = Get-ReviewedDecisionsText @([pscustomobject]@{ FileName = 'a.zip'; Decision = $d }, [pscustomobject]@{ FileName = 'b.eml'; Decision = $d }) @('a.zip', 'b.eml')
+            $all | Should -Match '^2 decisions recorded'
+            $all | Should -Not -Match 'not reviewed yet'
+        }
+    }
+
+    Context 'the hashing worker' {
+        It 'hashes every package in Incoming in one background job' {
+            Import-LauncherFunction 'Start-IncomingWatcher', 'Update-IncomingHash', 'Clear-IncomingHash', 'Get-SandboxProcess'
+            $inbox = Join-Path $TestDrive 'WorkIncoming'; $reportsDir = Join-Path $TestDrive 'WorkReports'
+            New-Item -ItemType Directory -Path $inbox, $reportsDir -Force | Out-Null
+            $hA = New-Package $inbox 'a.zip' 'aaa'; $hB = New-Package $inbox 'b.eml' 'bbb'; New-Package $inbox 'notes.txt' 'skipped' | Out-Null
+            New-DecisionFile $reportsDir 'Decision-1.json' $hA | Out-Null
+            $Incoming = $inbox
+            $form = New-Object Windows.Forms.Form
+            [void]$form.Handle
+            function Set-LastDecisionView {}
+            $script:IncomingFiles = @(Get-IncomingPackages $inbox)
+            $script:DecisionMap = Read-DecisionMap $reportsDir
+            $script:IncomingHashes = @{}; $script:IncomingHashKey = $null; $script:HashWork = $null; $script:HashWorkKey = $null
+            try {
+                Update-IncomingHash
+                $script:HashWork | Should -Not -BeNullOrEmpty
+                $deadline = [DateTime]::UtcNow.AddSeconds(20)
+                while (-not (Test-QraWork $script:HashWork) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+                Update-IncomingHash
+                $script:IncomingHashes.Count | Should -Be 2 -Because 'the .txt file is not a package'
+                $script:IncomingHashes[(Join-Path $inbox 'a.zip')] | Should -Be $hA.ToUpperInvariant()
+                $script:IncomingHashes[(Join-Path $inbox 'b.eml')] | Should -Be $hB.ToUpperInvariant()
+                $script:IncomingHashKey | Should -Be (Get-IncomingPackageKey $script:IncomingFiles)
+            } finally {
+                if ($script:IncomingWatcher) { $script:IncomingWatcher.Dispose(); $script:IncomingWatcher = $null }
+                if ($script:HashWork) { Stop-QraWork $script:HashWork; $script:HashWork = $null }
+                Clear-IncomingHash
+                $form.Dispose()
+            }
+        }
+    }
+}
+
 
 Describe 'Launcher: decisions log' {
     It 'opens a CSV path with spaces as text in Notepad' {
@@ -528,13 +915,27 @@ Describe 'Launcher: sandbox profile settings' {
 
 Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
     BeforeAll {
-        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'all-done', 'release-requests'
-        function Invoke-LauncherShots([string]$dir, [string]$extra = '') {
+        $script:ShotStates = 'checks-running', 'not-ready', 'ready', 'watching-incoming', 'sandbox-starting', 'review-in-progress', 'export-off', 'decision-recorded', 'two-files-one-reviewed', 'two-files-reviewed', 'stale-decision', 'many-decisions', 'all-done', 'release-requests'
+        # The child is started directly (not through the pipeline) and waited for with an explicit limit: a render in a loaded full-suite run
+        # takes much longer than alone, and Pester's Stop error preference would turn any line on stderr into a thrown error under 5.1.
+        function Invoke-LauncherShots([string]$dir, [string]$extra = '', [string]$script = $script:LauncherPath, [int]$timeoutSec = 300) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
-            $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:LauncherPath, '-Screenshot', $dir)
-            if ($extra) { $psArgs += $extra.Split(' ') }
-            $out = & powershell.exe @psArgs 2>&1
-            [pscustomobject]@{ Exit = $LASTEXITCODE; Output = ($out | Out-String) }
+            $argText = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Screenshot "{1}"' -f $script, $dir
+            if ($extra) { $argText += ' ' + $extra }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = (Join-Path $PSHOME 'powershell.exe'); if (-not (Test-Path -LiteralPath $psi.FileName)) { $psi.FileName = 'powershell.exe' }
+            $psi.Arguments = $argText; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync(); $errTask = $proc.StandardError.ReadToEndAsync()
+            $timedOut = -not $proc.WaitForExit($timeoutSec * 1000)
+            if ($timedOut) { try { $proc.Kill() } catch { $null = $_ }; [void]$proc.WaitForExit(10000) }
+            else { $proc.WaitForExit() }   # flushes the redirected streams
+            $text = "stdout:`n$($outTask.Result)`nstderr:`n$($errTask.Result)"
+            $exit = if ($timedOut) { -1 } else { $proc.ExitCode }
+            $proc.Dispose()
+            if ($timedOut) { $text = "TIMED OUT after $timeoutSec s (the render was killed)`n$text" }
+            [pscustomobject]@{ Exit = $exit; Output = $text; TimedOut = $timedOut }
         }
     }
     It 'screenshot mode writes every state' {
@@ -548,8 +949,8 @@ Describe 'Launcher: -Screenshot' -Tag 'Screenshot' {
         $root = Join-Path $TestDrive 'tool-root'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
         Copy-Item -LiteralPath (Join-Path $script:Repo 'src\SecurityReview\app') -Destination (Join-Path $root 'app') -Recurse
-        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'app\Launcher.ps1') -Screenshot (Join-Path $TestDrive 'shots-noio') 2>&1
-        $LASTEXITCODE | Should -Be 0 -Because ($out | Out-String)
+        $r = Invoke-LauncherShots (Join-Path $TestDrive 'shots-noio') '' (Join-Path $root 'app\Launcher.ps1')
+        $r.Exit | Should -Be 0 -Because $r.Output
         Test-Path -LiteralPath (Join-Path $root 'Incoming') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $root 'Reports') | Should -BeFalse
     }
@@ -635,7 +1036,8 @@ Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
         $script:LauncherFunctions.ContainsKey('Start-LauncherSplash') | Should -BeTrue
     }
     It 'uses plain WinForms and GDI+ only in the splash (no compiled or native code)' {
-        $script:SplashBlockText | Should -Not -Match 'Add-Type\s+(-Namespace|-TypeDefinition|-MemberDefinition)'
+        $script:SplashBlockText | Should -Not -Match 'Add-Type\s+(-TypeDefinition)'
+        ([regex]::Matches($script:SplashBlockText, 'Add-Type\s+-Namespace\s+\w+')).Value | Should -Be @('Add-Type -Namespace QraSplash') -Because 'the only native code in the splash is the small guarded QraSplash.Native compile'
         $script:SplashBlockText | Should -Not -Match 'DllImport'
         $script:SplashBlockText | Should -Match 'HighQualityBicubic'
         $script:SplashBlockText | Should -Match "DoubleBuffered"
@@ -681,13 +1083,31 @@ Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
     }
     Context 'rendering the splash to a PNG (QRA_SPLASH_SHOT, a child Windows PowerShell 5.1)' {
         BeforeAll {
-            function Invoke-SplashShot([string]$png, [string]$image) {
+            function Invoke-SplashShot([string]$png, [string]$image, [int]$dpi = 0) {
                 $env:QRA_SPLASH_SHOT = $png
                 if ($image) { $env:QRA_SPLASH_IMAGE = $image }
+                if ($dpi) { $env:QRA_SPLASH_DPI = [string]$dpi }
                 try {
                     $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:LauncherPath 2>&1
                     [pscustomobject]@{ Exit = $LASTEXITCODE; Output = ($out | Out-String) }
-                } finally { Remove-Item Env:\QRA_SPLASH_SHOT, Env:\QRA_SPLASH_IMAGE -ErrorAction SilentlyContinue }
+                } finally { Remove-Item Env:\QRA_SPLASH_SHOT, Env:\QRA_SPLASH_IMAGE, Env:\QRA_SPLASH_DPI -ErrorAction SilentlyContinue }
+            }
+            # Bounding box (width, height) of the near-white text pixels of the title, in the right-hand part of the splash.
+            function Get-SplashTitleInk([string]$png) {
+                $bmp = New-Object System.Drawing.Bitmap($png)
+                try {
+                    $x0 = [int]($bmp.Width * 0.585); $y0 = [int]($bmp.Height * 0.30); $y1 = [int]($bmp.Height * 0.52)
+                    $minX = 99999; $maxX = -1; $minY = 99999; $maxY = -1
+                    for ($y = $y0; $y -lt $y1; $y++) {
+                        for ($x = $x0; $x -lt ($bmp.Width - 4); $x++) {
+                            $px = $bmp.GetPixel($x, $y)
+                            if ($px.R -ge 225 -and $px.G -ge 225 -and $px.B -ge 225) {
+                                if ($x -lt $minX) { $minX = $x }; if ($x -gt $maxX) { $maxX = $x }; if ($y -lt $minY) { $minY = $y }; if ($y -gt $maxY) { $maxY = $y }
+                            }
+                        }
+                    }
+                    [pscustomobject]@{ W = ($maxX - $minX + 1); H = ($maxY - $minY + 1); Width = $bmp.Width; Height = $bmp.Height }
+                } finally { $bmp.Dispose() }
             }
             function Get-ShotPixel([string]$png, [int]$x, [int]$y) {
                 $bmp = New-Object System.Drawing.Bitmap($png)
@@ -701,6 +1121,22 @@ Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
             $px = Get-ShotPixel $png 200 170
             $px[3] | Should -Be 640; $px[4] | Should -Be 357
             ($px[0] + $px[1] + $px[2]) | Should -BeGreaterThan 300 -Because 'the shield is bright'
+        }
+        It 'renders at an emulated 120 and 144 dpi (125 % and 150 %): the window is 640 x 357 scaled, the text is drawn at the real (scaled) size' {
+            $p96 = Join-Path $TestDrive 'splash-96.png'; $p120 = Join-Path $TestDrive 'splash-120.png'; $p150 = Join-Path $TestDrive 'splash-150.png'
+            foreach ($job in @(@($p96, 0), @($p120, 120), @($p150, 144))) {
+                $r = Invoke-SplashShot $job[0] '' $job[1]
+                $r.Exit | Should -Be 0 -Because $r.Output
+            }
+            $i96 = Get-SplashTitleInk $p96; $i120 = Get-SplashTitleInk $p120; $i150 = Get-SplashTitleInk $p150
+            $i96.Width | Should -Be 640; $i96.Height | Should -Be 357
+            $i120.Width | Should -Be 800; $i120.Height | Should -Be 446
+            $i150.Width | Should -Be 960; $i150.Height | Should -Be 536   # 144 dpi = 150 %
+            $i96.H | Should -BeGreaterThan 15 -Because 'the title is found'
+            ($i120.W / $i96.W) | Should -BeGreaterThan 1.18; ($i120.W / $i96.W) | Should -BeLessThan 1.32
+            ($i120.H / $i96.H) | Should -BeGreaterThan 1.15; ($i120.H / $i96.H) | Should -BeLessThan 1.35
+            ($i150.W / $i96.W) | Should -BeGreaterThan 1.40; ($i150.W / $i96.W) | Should -BeLessThan 1.62
+            ($i150.H / $i96.H) | Should -BeGreaterThan 1.35; ($i150.H / $i96.H) | Should -BeLessThan 1.65
         }
         It 'falls back to a plain navy splash, same size, when the picture is missing, and still exits 0' {
             $png = Join-Path $TestDrive 'splash-nopic.png'
@@ -724,5 +1160,65 @@ Describe 'Launcher: animated splash (own thread) and desktop shortcut wiring' {
         (Get-Item -LiteralPath $jpg).Length | Should -BeLessThan 200KB
         $img = [System.Drawing.Image]::FromFile($jpg)
         try { $img.Width | Should -Be 1280; $img.Height | Should -Be 714 } finally { $img.Dispose() }
+    }
+}
+
+Describe 'Launcher: per-monitor DPI wiring' {
+    BeforeAll { $script:PmText = [IO.File]::ReadAllText($script:LauncherPath) }
+    It 'review pictures (-Screenshot) keep one fixed system DPI, set before the kit is loaded' {
+        $t = $script:PmText
+        $t.Contains("if (`$Screenshot) { `$env:QRA_DPI_MODE = 'system' }") | Should -BeTrue
+        $t.IndexOf("`$env:QRA_DPI_MODE = 'system'") | Should -BeLessThan $t.IndexOf("(Join-Path `$PSScriptRoot 'QraUi.ps1')")
+    }
+    It 'builds the window for the screen with the mouse unless a scale is emulated' {
+        $t = $script:PmText
+        $t.Contains('if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }') | Should -BeTrue
+        $t.Contains('elseif ($script:QraPerMonitor) { Set-QraEmulatedDpi (Get-QraMonitorDpi) }') | Should -BeTrue
+    }
+    It '<Name> starts with the form''s own scale (Use-QraFormDpi $form)' -ForEach @(
+        @{ Name = 'Update-HeaderLayout' }, @{ Name = 'Update-RailLayout' }, @{ Name = 'Update-StepContent' }, @{ Name = 'Update-StepLayout' }, @{ Name = 'Render-Checks' }, @{ Name = 'Fit-CheckRow' }
+    ) {
+        $body = $script:LauncherFunctions[$Name].Extent.Text
+        $body | Should -Match 'Use-QraFormDpi \$form'
+        # the first statement, after the signature (and after Update-StepLayout's guard line)
+        $first = ($body -split '\r?\n' | Select-Object -Skip 1 | Where-Object { $_.Trim() -and $_ -notmatch '^\s*if \(-not \$script:LayoutReady' } | Select-Object -First 1)
+        $first | Should -Match 'Use-QraFormDpi \$form'
+    }
+    It 'the layout does not run while a rescale is in progress' {
+        $script:LauncherFunctions['Update-StepLayout'].Extent.Text | Should -Match '\$script:QraDpiBusy'
+    }
+    It 'registers the window with its font table and one relayout, and the check-row fonts with it' {
+        $t = $script:PmText
+        $t | Should -Match 'Register-QraDpiWindow \$form -FontTables @\(\$Fonts\) -Relayout'
+        $t | Should -Match 'Add-QraFontTable \$form \$script:RowFonts'
+        $t.Contains('Bold = [bool]$part[1]') | Should -BeTrue -Because 'the inline bold segments get their fonts back after a rescale'
+    }
+    It 'the splash thread becomes per-monitor aware before it creates any form, reads the mouse monitor and sizes by it' {
+        $t = $script:PmText
+        $block = $t.Substring($t.IndexOf('$script:LauncherSplashBlock = {'), $t.IndexOf('function Start-LauncherSplash') - $t.IndexOf('$script:LauncherSplashBlock = {'))
+        $block.IndexOf('SetThreadPerMonitorV2') | Should -BeGreaterThan 0
+        $block.IndexOf('SetThreadPerMonitorV2') | Should -BeLessThan $block.IndexOf('New-Object System.Windows.Forms.Form')
+        $block.IndexOf('SetThreadPerMonitorV2') | Should -BeLessThan $block.IndexOf('Add-Type -AssemblyName System.Drawing')
+        $block | Should -Match 'MonitorDpi'
+        $block | Should -Match '& \$px 640'
+        $block | Should -Not -Match 'DllImport'
+        $block | Should -Match 'Add-Type -Namespace QraSplash -Name Native -MemberDefinition'
+        $block | Should -Match 'catch \{ \$nt = \$false \}' -Because 'a refused compile must leave the splash DPI-unaware, never stop the start'
+        $t | Should -Match 'GetDpiForMonitor' 
+    }
+}
+
+Describe 'Launcher: GDI text rendering for standard controls' {
+    It 'switches labels and buttons to GDI text before any control or the splash exists' {
+        # .NET Framework defaults to GDI+ text (UseCompatibleTextRendering), which drew plain labels thin and grey next to the kit's own GDI text.
+        $t = [IO.File]::ReadAllText($script:LauncherPath)
+        $call = $t.IndexOf('SetCompatibleTextRenderingDefault($false)')
+        $call | Should -BeGreaterThan 0
+        $call | Should -BeLessThan $t.IndexOf('New-Object System.Windows.Forms.') -Because 'it is only allowed before the first control exists'
+        $call | Should -BeLessThan $t.IndexOf('$script:LauncherSplashBlock') -Because 'the splash thread creates controls too'
+    }
+    It 'makes a plain Label use GDI text in a fresh Windows PowerShell 5.1 process' {
+        $probe = 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false); (New-Object System.Windows.Forms.Label).UseCompatibleTextRendering'
+        (& powershell.exe -NoProfile -Command $probe | Select-Object -Last 1) | Should -Be 'False'
     }
 }
