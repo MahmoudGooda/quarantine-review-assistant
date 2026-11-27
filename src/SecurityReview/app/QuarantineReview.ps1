@@ -5,8 +5,12 @@ param([switch]$AllowHost, [string]$Screenshot, [int]$ScreenshotDpi = 0, [switch]
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# Labels, check boxes and buttons draw their text with GDI (crisp ClearType) like the kit's painted text, not the .NET Framework GDI+ default.
+# Only allowed before the first control exists, so it runs first.
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { $null = $_ } # too late if a control already exists: keep the default
 
 # Shared UI kit: DPI helpers (S, SPad, SSize, SPoint), design tokens ($C), fonts, painted controls (with plain fallbacks).
+$env:QRA_DPI_MODE = 'system'   # this window keeps the system-aware scaling; only the host launcher and its dialog follow each screen
 . (Join-Path $PSScriptRoot 'QraUi.ps1')
 # -ScreenshotDpi: emulate another display scale. Must run before any window exists.
 if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }
@@ -19,7 +23,7 @@ trap {
     break
 }
 
-$AppVersion = '2.3.0'
+$AppVersion = '2.3.1'
 $ReviewRoot = 'C:\Review'
 $AppDir     = $PSScriptRoot
 $Incoming   = Join-Path $ReviewRoot 'Incoming'
@@ -312,25 +316,26 @@ $decCheckResult.Margin = (SPad 0 8 0 4)
 $decSteps = New-Object System.Windows.Forms.TextBox
 $decSteps.Multiline = $true; $decSteps.ReadOnly = $true; $decSteps.BorderStyle = 'None'; $decSteps.BackColor = $C.Surface
 $decSteps.Font = New-Font 10; $decSteps.ScrollBars = 'None'
-# NOTE: the controls of the record panel are not in the form tree at ResumeLayout, so they are scaled with S().
-$decRecordPanel = New-Object System.Windows.Forms.Panel
-$decRecordPanel.Height = (S 112); $decRecordPanel.BackColor = $C.Surface
+# The record panel is pinned to the bottom of the left pane (not part of this tab), so it stays in view however far the results are scrolled.
+# NOTE: it joins the form tree after ResumeLayout (so AutoScale never touches it) and Fit-RecordPanel sets every bound with S().
+$decRecordPanel = New-QraCard
+$decRecordPanel.Dock = 'Bottom'; $decRecordPanel.Visible = $false
+$decRecTitle = New-Object System.Windows.Forms.Label
+$decRecTitle.Text = 'Record your decision'; $decRecTitle.Font = New-Font 11 'Bold'
 $decChoiceLbl = New-Object System.Windows.Forms.Label
-$decChoiceLbl.Text = 'Final decision'; $decChoiceLbl.Location = (SPoint 10 12); $decChoiceLbl.AutoSize = $true
+$decChoiceLbl.Text = 'Final decision'
 $decChoice = New-Object System.Windows.Forms.ComboBox
-$decChoice.DropDownStyle = 'DropDownList'; $decChoice.Location = (SPoint 110 8); $decChoice.Width = (S 300)
+$decChoice.DropDownStyle = 'DropDownList'
 [void]$decChoice.Items.AddRange(@('Delete and block', 'Release (false positive, submitted to Microsoft)', 'Release to user (bulk / marketing)', 'Delete (unwanted, no block)', 'Keep quarantined (pending verification)'))
 $decRevLbl = New-Object System.Windows.Forms.Label
-$decRevLbl.Text = 'Reviewer'; $decRevLbl.Location = (SPoint 424 12); $decRevLbl.AutoSize = $true
+$decRevLbl.Text = 'Reviewer'
 $decReviewer = New-Object System.Windows.Forms.TextBox
-$decReviewer.Location = (SPoint 490 8); $decReviewer.Width = (S 160)
 $decNoteLbl = New-Object System.Windows.Forms.Label
-$decNoteLbl.Text = 'Note'; $decNoteLbl.Location = (SPoint 10 46); $decNoteLbl.AutoSize = $true
+$decNoteLbl.Text = 'Note'
 $decNote = New-Object System.Windows.Forms.TextBox
-$decNote.Location = (SPoint 110 42); $decNote.Width = (S 540)
 $bRecord = New-QraButton 'Record decision' 'Primary' $QraGlyph.Check
-$bRecord.Location = (SPoint 110 74); $bRecord.Size = (SSize 170 32)
-$decRecordPanel.Controls.AddRange(@($decChoiceLbl, $decChoice, $decRevLbl, $decReviewer, $decNoteLbl, $decNote, $bRecord))
+foreach ($lbl in @($decRecTitle, $decChoiceLbl, $decRevLbl, $decNoteLbl)) { $lbl.AutoSize = $true; $lbl.BackColor = $C.Card; $lbl.ForeColor = $C.Text }
+$decRecordPanel.Controls.AddRange(@($decRecTitle, $decChoiceLbl, $decChoice, $decRevLbl, $decReviewer, $decNoteLbl, $decNote, $bRecord))
 
 $tSummary = New-Tab 'Summary'
 $lvSummary = New-ListView @('Item', 'Value') @(190, 760)
@@ -492,7 +497,6 @@ function Set-DecWidths {
         }
     }
     Fit-StepsBox
-    Fit-RecordPanel
     $decPanel.ResumeLayout()
 }
 
@@ -639,16 +643,21 @@ function Update-HeaderLayout {
     $actions.Height = [Math]::Max((S 52), $saveInfo.Top + $saveInfo.Height + (S 12))
 }
 
-# Record panel: when the window is narrower than the design (high DPI on a small screen) the boxes shrink instead of running off the edge.
+# Record panel: label above box, boxes as wide as the left pane, and the panel as tall as its content.
 function Fit-RecordPanel {
-    $w = $decRecordPanel.ClientSize.Width; $pad = S 10
-    $comboW = if ($w -ge (S 660)) { S 300 } else { [Math]::Max((S 170), [int](($w - (S 110) - $pad) * 0.46)) }
-    $decChoice.Width = $comboW
-    $decRevLbl.Left = $decChoice.Left + $comboW + (S 14)
-    $decReviewer.Left = $decRevLbl.Left + (S 66)
-    $decReviewer.Width = [Math]::Max((S 90), [Math]::Min((S 160), $w - $decReviewer.Left - $pad))
-    $decNote.Width = [Math]::Max((S 200), [Math]::Min((S 540), $w - $decNote.Left - $pad))
+    $ins = if ($script:UiNative) { [int]$decRecordPanel.ShadowSize } else { 0 }
+    # width from the pane, not from the panel: setting Height from the panel's own resize (inside the dock pass) leaves its Top stale
+    $x = $ins + (S 14); $w = [Math]::Max((S 160), $split.Panel1.ClientSize.Width - $split.Panel1.Padding.Horizontal - 2 * $x)
+    $y = $ins + (S 10)
+    $decRecTitle.Location = New-Object System.Drawing.Point($x, $y); $y += $decRecTitle.PreferredHeight + (S 8)
+    foreach ($pair in @(@($decChoiceLbl, $decChoice), @($decRevLbl, $decReviewer), @($decNoteLbl, $decNote))) {
+        $pair[0].Location = New-Object System.Drawing.Point($x, $y); $y += $pair[0].PreferredHeight + (S 2)
+        $pair[1].SetBounds($x, $y, $w, $pair[1].Height); $y += $pair[1].Height + (S 6)
+    }
+    $bRecord.SetBounds($x, ($y + (S 4)), $w, (S 32))
+    $decRecordPanel.Height = $bRecord.Bottom + (S 10) + $ins
 }
+$split.Panel1.Add_SizeChanged({ if ($script:LayoutReady) { Fit-RecordPanel } })
 function Fit-Chips {
     $need = $chips.Padding.Horizontal
     foreach ($chip in $chips.Controls) { $need += $chip.PreferredSize.Width + $chip.Margin.Horizontal }
@@ -812,7 +821,10 @@ function Show-Decision($r) {
     $decPanel.SuspendLayout()
     $decPanel.Controls.Clear()
     $script:CheckRows = @()
+    $decRecordPanel.Visible = [bool]$d
     if (-not $d) { $decPanel.ResumeLayout(); return }
+    $decNote.Text = ''
+    Fit-RecordPanel
     $col = $DecColors[[string]$d.color]; if (-not $col) { $col = $DecColors.grey }
 
     # --- recommendation card
@@ -902,10 +914,6 @@ function Show-Decision($r) {
         [void]$decPanel.Controls.Add((New-WrapLabel 'Tenant Allow/Block List > Spoofed senders > Add > Allow, External. Allows only this sender from this sending infrastructure.' 9 'Regular' $C.TextMuted))
     }
 
-    # --- record
-    New-Section 'Record your decision'
-    [void]$decPanel.Controls.Add($decRecordPanel)
-    $decNote.Text = ''
     [void]$decPanel.Controls.Add((New-WrapLabel ([string]$d.disclaimer) 8.5 'Italic' $C.TextMuted))
     $decPanel.ResumeLayout()
     Set-DecWidths
@@ -1177,6 +1185,7 @@ function Clear-Results {
     $vAdvice.Text = ''; Set-VerdictPills $null
     $tFindings.Text = 'Findings'; $tAttach.Text = 'Attachments'; $tLinks.Text = 'Links'
     $decPanel.Controls.Clear(); $script:CheckRows = @()
+    $decRecordPanel.Visible = $false
     $bSave.Enabled = $false
     Reset-StageTracker
     Set-ResultsMode 'Empty'
@@ -1301,7 +1310,7 @@ function Show-Result($r) {
         'INCOMPLETE' { "$($Sym.WARN) The review did not finish. Fix the error shown (often the password) and analyze again. Until then: keep quarantined." }
         default { 'No strong indicators - still verify the sender and context before releasing. Static checks cannot see everything (e.g. QR images, zero-days).' }
     }
-    if ($dd) { $decision.Text = [string]$dd.title + ': ' + [string]$dd.summary + ' Follow the Decision tab, then act in Defender on the host.' }
+    if ($dd) { $decision.Text = [string]$dd.title + ': ' + [string]$dd.summary + ' Follow the Decision tab, record your decision below, then act in Defender on the host.' }
     $decision.ForeColor = $style.Back
     Show-Decision $r
 
@@ -1814,6 +1823,7 @@ Set-Access $decChoice 'Final decision'; Set-Access $decReviewer 'Reviewer name';
 Set-Access $bSave 'Save report' 'Shortcut Ctrl+S'; Set-Access $bClear 'New review'
 $ti = 0; foreach ($tabCtl in @($fileList, $bBrowse, $bRefresh, $pwdBox, $showPwd, $bContinue, $attPwd, $bAnalyze, $bCancel)) { $tabCtl.TabIndex = $ti++ }
 $split.Panel1.TabIndex = 0; $split.Panel2.TabIndex = 1
+$leftCard.TabIndex = 0; $decRecordPanel.TabIndex = 1
 for ($i = 0; $i -lt 4; $i++) { $script:StepUi[$i].Card.TabIndex = $i; $script:StepUi[$i].Link.TabIndex = 0 }
 $status.TabIndex = 4
 $tabs.TabIndex = 0; $actions.TabIndex = 1; $bSave.TabIndex = 0; $bClear.TabIndex = 1
@@ -1828,6 +1838,7 @@ $form.ResumeLayout($false)
 # (an ambient-font change during AutoScale), e.g. labels would be 2.25x too big at 150 %.
 $form.Font = New-Font 9.5
 Limit-FormToScreen $form
+$split.Panel1.Controls.Add($decRecordPanel)   # added after leftCard, so it docks first and the step cards take the space above it
 # Created after scaling (they size themselves from their font): environment pills, results stage content, verdict count pills.
 Add-Chip $(if ($EnvStatus.Export) { 'Report export on' } else { 'No host export' }) $true $(if ($EnvStatus.Export) { 'Reports can be saved to the host Reports folder (C:\Reports).' } else { 'Reports stay inside this Sandbox (C:\Work) and are deleted when it closes.' })
 Add-Chip $(if ($EnvStatus.ReadOnly) { 'Host files read-only' } else { 'Host files WRITABLE' }) $EnvStatus.ReadOnly 'C:\Review (your tool folder) must be mapped read-only.'
@@ -1918,8 +1929,6 @@ if ($Screenshot) {
         $script:RecordedDecision = [string]$decChoice.SelectedItem
         $decReviewer.Text = 'J. Analyst'
         Update-ReviewStepper
-        [System.Windows.Forms.Application]::DoEvents()
-        $decPanel.ScrollControlIntoView($decRecordPanel)   # show the 'Record your decision' section
         Save-ShotImage 'decision-recorded'
         $tabs.SelectedTab = $tFindings
         Save-ShotImage 'result-findings'
