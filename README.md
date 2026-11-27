@@ -205,7 +205,7 @@ The review tool covers one step. The plan is a small kit for the whole life of a
 
 | Version | Component | Status |
 |---|---|---|
-| v2.3 | **Release-request intake.** List pending release requests using read-only Exchange Online PowerShell and export password-protected messages to `Incoming`. | In progress |
+| v2.3 | **Release-request intake.** List pending release requests using read-only Exchange Online PowerShell and export password-protected messages to `Incoming`. | Released |
 | v2.4 | **Response pack.** Save the Defender steps checklist with the decision, export the block list as a `New-TenantAllowBlockListItems` script or CSV, find other copies with message trace or Content search, and provide a user-notification template. | Planned |
 | v2.5 | **Batch mode.** Analyze a folder of user-reported messages in one summary, remember the reviewer's name and improve `.msg` handling. | Planned |
 | v2.6 | **Decisions dashboard.** Summarize monthly review volume, malicious messages, false positives and common message types from `decisions-log.csv`. | Planned |

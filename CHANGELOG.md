@@ -5,7 +5,7 @@ the same in `Launcher.ps1`, `QuarantineReview.ps1`, `inspect_eml.py` and both RE
 
 ## [Unreleased]
 
-## [2.3.0] - Unreleased
+## [2.3.0] - 2026-11-27
 
 ### Added
 - **Animated start-up splash.** The launcher opens with an image splash (product picture, name, version and a calm progress bar). It runs
