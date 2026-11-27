@@ -7,7 +7,10 @@ param([switch]$NoGui, [string]$Screenshot, [int]$ScreenshotDpi = 0, [switch]$Scr
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-$AppVersion   = '2.3.0'   # read by the start-up splash, so it is set before anything else
+# Labels, check boxes and buttons draw their text with GDI (TextRenderer, crisp ClearType) instead of the .NET Framework default GDI+,
+# which looked thin and grey next to the kit's own painted text. Only allowed before the first control exists, so it runs first.
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { $null = $_ } # too late if a control already exists: keep the default
+$AppVersion   = '2.3.1'   # read by the start-up splash, so it is set before anything else
 
 # ---------------------------------------------------------------- start-up: single instance, then a splash while the window is built
 # Only for a real GUI run (not -Screenshot, -NoGui or inside the Sandbox). Plain WinForms and .NET only: nothing here needs Add-Type or the UI kit,
@@ -18,8 +21,28 @@ $script:SplashState = $null     # shared with the animated splash thread: Close,
 $script:SplashPs = $null; $script:SplashRs = $null; $script:SplashAsync = $null
 $startGui = (-not $Screenshot) -and (-not $NoGui) -and ($env:USERNAME -ne 'WDAGUtilityAccount')
 
+# The few native calls the splash needs (compiled with Add-Type inside the splash runspace, namespace QraSplash so it never clashes with the kit's QraUi.Native).
+# If the compile is refused (Constrained Language Mode, AppLocker, a compiler error) the splash simply stays DPI-unaware, as in v2.3.0.
+$script:LauncherSplashNativeSource = @'
+[DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+[DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(long point, uint flags);
+[DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+public static bool SetThreadPerMonitorV2() { try { return SetThreadDpiAwarenessContext(new IntPtr(-4)) != IntPtr.Zero; } catch (Exception) { return false; } }
+public static int MonitorDpi(int x, int y)
+{
+    try
+    {
+        IntPtr mon = MonitorFromPoint(((long)y << 32) | (uint)x, 2);
+        uint dx, dy;
+        if (mon != IntPtr.Zero && GetDpiForMonitor(mon, 0, out dx, out dy) == 0) return (int)dx;
+    }
+    catch (Exception) { }
+    return 0;
+}
+'@
+
 # The animated splash. It runs on its OWN STA thread (a runspace with its own message loop), because the launcher thread is busy for a couple of seconds
-# (compile, build the form) and pumps no messages: an animation on that thread would freeze. Plain WinForms and GDI+ only, no Add-Type.
+# (compile, build the form) and pumps no messages: an animation on that thread would freeze. Plain WinForms and GDI+; the only native code is one small guarded Add-Type (QraSplash.Native) for the screen's DPI.
 # With $state.Shot set it renders one frame (progress frozen) to that PNG on the calling thread and returns: that is the review screenshot.
 $script:LauncherSplashBlock = {
     param($state)
@@ -28,10 +51,33 @@ $script:LauncherSplashBlock = {
     $ui = @{ Frame = 0; Fading = 0; Closing = $false; CloseAt = 0; LastStatus = '' }
     $win = $null; $timer = $null
     try {
+        # This thread is per-monitor aware BEFORE anything draws (GDI+ takes its DPI from its first use: a stale 96 would leak into the launcher's text),
+        # and the window is sized for the screen with the mouse: 640 x 357 at 96 dpi, more pixels on a denser screen, never stretched by Windows.
+        $dpi = [int]$state.Dpi   # only the review picture sets it (QRA_SPLASH_DPI): it then draws at that scale without asking Windows
+        $nt = $false
+        if ($dpi -le 0 -and -not $shot -and $state.NativeSource) {
+            try {
+                if (-not ('QraSplash.Native' -as [type])) { Add-Type -Namespace QraSplash -Name Native -MemberDefinition ([string]$state.NativeSource) -ErrorAction Stop }
+                $nt = [bool][QraSplash.Native]::SetThreadPerMonitorV2()
+            } catch { $nt = $false } # no per-monitor awareness here: today's splash
+        }
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
         $dr = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-        $ui.W = 640; $ui.H = 357
+        if ($dpi -le 0) {
+            $dpi = 96
+            if ($nt) {
+                try {
+                    $mp = [System.Windows.Forms.Cursor]::Position
+                    $md = [QraSplash.Native]::MonitorDpi([int]$mp.X, [int]$mp.Y)
+                    if ($md -ge 96 -and $md -le 960) { $dpi = $md }
+                    else { $gs = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $dpi = [int]$gs.DpiX; $gs.Dispose() }
+                } catch { $dpi = 96 }
+            }
+        }
+        $sc = $dpi / 96.0
+        $px = { param([double]$n) [int][Math]::Round($n * $sc) }
+        $ui.W = & $px 640; $ui.H = & $px 357
         $navy = [System.Drawing.Color]::FromArgb(17, 38, 66)
         $win = New-Object System.Windows.Forms.Form
         $win.AutoScaleMode = 'None'; $win.FormBorderStyle = 'None'; $win.ShowInTaskbar = $false; $win.TopMost = $true; $win.StartPosition = 'Manual'
@@ -51,8 +97,8 @@ $script:LauncherSplashBlock = {
         if (& $hasFont 'Segoe UI Variable Display Semib') { $titleName = 'Segoe UI Variable Display Semib'; $titleStyle = [System.Drawing.FontStyle]::Regular }
         elseif (& $hasFont 'Segoe UI Semibold') { $titleName = 'Segoe UI Semibold'; $titleStyle = [System.Drawing.FontStyle]::Regular }
         $bodyName = if (& $hasFont 'Segoe UI Variable Text') { 'Segoe UI Variable Text' } else { 'Segoe UI' }
-        $fTitle = New-Object System.Drawing.Font($titleName, [single]20, $titleStyle, [System.Drawing.GraphicsUnit]::Point)
-        $fBody = New-Object System.Drawing.Font($bodyName, [single]10, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+        $fTitle = New-Object System.Drawing.Font($titleName, [single](20 * 96 / 72 * $sc), $titleStyle, [System.Drawing.GraphicsUnit]::Pixel)   # 20 pt and 10 pt, in pixels at this scale
+        $fBody = New-Object System.Drawing.Font($bodyName, [single](10 * 96 / 72 * $sc), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
         $ui.FBody = $fBody
 
         # The picture is shipped at twice the window size and scaled down once, with the best filter, into a cache that every repaint copies from.
@@ -82,8 +128,8 @@ $script:LauncherSplashBlock = {
         } catch { $hasImage = $false; $gc.Clear($navy) }   # missing or unreadable picture: plain navy, same text, same animation
 
         # Layout: the picture keeps its shield on the left, so the text sits in the empty right part (or the whole width without a picture).
-        $ui.TextX = if ($hasImage) { 372 } else { 40 }
-        $ui.TextW = $ui.W - $ui.TextX - 40
+        $ui.TextX = if ($hasImage) { & $px 372 } else { & $px 40 }
+        $ui.TextW = $ui.W - $ui.TextX - (& $px 40)
         $white = [System.Drawing.Brushes]::White
         $muted = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(170, 196, 224))
         $sf = New-Object System.Drawing.StringFormat([System.Drawing.StringFormat]::GenericDefault)
@@ -92,18 +138,19 @@ $script:LauncherSplashBlock = {
         $title = 'Quarantine Review Assistant'
         $titleH = [Math]::Ceiling($gc.MeasureString($title, $fTitle, $ui.TextW, $sf).Height)
         $verH = [Math]::Ceiling($fBody.GetHeight($gc))
-        $blockH = $titleH + 10 + $verH
-        $top = [Math]::Round(158 - $blockH / 2)
+        $gap = & $px 10
+        $blockH = $titleH + $gap + $verH
+        $top = [Math]::Round((& $px 158) - $blockH / 2)
         $gc.DrawString($title, $fTitle, $white, (New-Object System.Drawing.RectangleF($ui.TextX, $top, $ui.TextW, ($titleH + 4))), $sf)
-        $gc.DrawString(('Version ' + [string]$state.Version), $fBody, $muted, (New-Object System.Drawing.RectangleF($ui.TextX, ($top + $titleH + 10), $ui.TextW, ($verH + 4))), $sf)
-        # 1 px border
-        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(42, 74, 117), 1)
+        $gc.DrawString(('Version ' + [string]$state.Version), $fBody, $muted, (New-Object System.Drawing.RectangleF($ui.TextX, ($top + $titleH + $gap), $ui.TextW, ($verH + 4))), $sf)
+        # 1 px border (one physical pixel per 100 % of scale)
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(42, 74, 117), [single][Math]::Max(1, [Math]::Floor($sc)))
         $gc.DrawRectangle($pen, 0, 0, ($ui.W - 1), ($ui.H - 1))
         $pen.Dispose(); $muted.Dispose(); $sf.Dispose(); $gc.Dispose(); $fTitle.Dispose()
         $ui.Cache = $cache
-        $ui.StatusRect = New-Object System.Drawing.Rectangle(($ui.TextX - 2), 284, ($ui.TextW + 4), 26)
-        $ui.BarRect = New-Object System.Drawing.Rectangle($ui.TextX, 320, $ui.TextW, 3)
-        $ui.BarInvalid = New-Object System.Drawing.Rectangle(($ui.TextX - 2), 318, ($ui.TextW + 4), 7)
+        $ui.StatusRect = New-Object System.Drawing.Rectangle(($ui.TextX - 2), (& $px 284), ($ui.TextW + 4), (& $px 26))
+        $ui.BarRect = New-Object System.Drawing.Rectangle($ui.TextX, (& $px 320), $ui.TextW, [Math]::Max(3, (& $px 3)))
+        $ui.BarInvalid = New-Object System.Drawing.Rectangle(($ui.TextX - 2), ((& $px 320) - 2), ($ui.TextW + 4), ($ui.BarRect.Height + 4))
         $ui.Segment = [int]($ui.TextW * 0.34)
         $ui.Clock = [System.Diagnostics.Stopwatch]::StartNew()
         $ui.Frozen = -1.0
@@ -116,7 +163,7 @@ $script:LauncherSplashBlock = {
                 $g.DrawImage($ui.Cache, $r, $r.X, $r.Y, $r.Width, $r.Height, [System.Drawing.GraphicsUnit]::Pixel)
                 if ($r.IntersectsWith($ui.StatusRect)) {
                     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
-                    $g.DrawString([string]$state.Status, $ui.FBody, [System.Drawing.Brushes]::White, [single]$ui.TextX, [single]($ui.StatusRect.Y + 2))
+                    $g.DrawString([string]$state.Status, $ui.FBody, [System.Drawing.Brushes]::White, [single]$ui.TextX, [single]($ui.StatusRect.Y + (& $px 2)))
                 }
                 if ($r.IntersectsWith($ui.BarInvalid)) {
                     $bar = $ui.BarRect
@@ -201,7 +248,7 @@ function Start-LauncherSplash {
     # The wait keeps the order the DPI rule needs: this window must exist before the process declares DPI awareness.
     $state = [hashtable]::Synchronized(@{
             Close = $false; Ready = $false; Failed = $false; Done = $false; Frame = 0; Progress = 0.0; Error = ''; Shot = ''
-            Status = 'Starting...'; Version = $AppVersion; Image = (Join-Path $PSScriptRoot 'assets\splash.jpg')
+            Status = 'Starting...'; Version = $AppVersion; Image = (Join-Path $PSScriptRoot 'assets\splash.jpg'); Dpi = 0; NativeSource = $script:LauncherSplashNativeSource
         })
     $rs = $null; $ps = $null
     try {
@@ -261,8 +308,9 @@ function Exit-LauncherMutex {
     }
 }
 if ($env:QRA_SPLASH_SHOT) {
-    # Review screenshot of the splash (renders the same form, progress frozen, to the PNG named in the variable). QRA_SPLASH_IMAGE may point at another picture file.
-    $shotState = @{ Shot = $env:QRA_SPLASH_SHOT; Version = $AppVersion; Status = 'Starting...'; Image = $(if ($env:QRA_SPLASH_IMAGE) { $env:QRA_SPLASH_IMAGE } else { Join-Path $PSScriptRoot 'assets\splash.jpg' }) }
+    # Review screenshot of the splash (renders the same form, progress frozen, to the PNG named in the variable). QRA_SPLASH_IMAGE may point at another picture file,
+    # QRA_SPLASH_DPI (for example 120 or 150) draws it at that display scale (default: 96, the picture is then 640 x 357).
+    $shotState = @{ Shot = $env:QRA_SPLASH_SHOT; Dpi = $(if ($env:QRA_SPLASH_DPI) { [int]$env:QRA_SPLASH_DPI } else { 0 }); Version = $AppVersion; Status = 'Starting...'; Image = $(if ($env:QRA_SPLASH_IMAGE) { $env:QRA_SPLASH_IMAGE } else { Join-Path $PSScriptRoot 'assets\splash.jpg' }) }
     & $script:LauncherSplashBlock $shotState
     exit 0
 }
@@ -290,6 +338,11 @@ if ($startGui) {
     }
     if (-not (Start-LauncherSplash)) {
         try {
+            # This thread draws first now: make it per-monitor aware before any GDI+ use, so GDI+ does not keep a stale 96 dpi for the whole process.
+            if (-not ('QraSplash.Native' -as [type])) { Add-Type -Namespace QraSplash -Name Native -MemberDefinition $script:LauncherSplashNativeSource -ErrorAction Stop }
+            [void][QraSplash.Native]::SetThreadPerMonitorV2()
+        } catch { $null = $_ } # keeps today's behaviour
+        try {
             $sp = New-Object System.Windows.Forms.Form
             $sp.AutoScaleMode = 'None'; $sp.FormBorderStyle = 'None'; $sp.ShowInTaskbar = $false; $sp.TopMost = $true; $sp.StartPosition = 'Manual'
             $sp.BackColor = [System.Drawing.Color]::FromArgb(17, 38, 66); $sp.Size = New-Object System.Drawing.Size(380, 120)
@@ -316,13 +369,16 @@ function Set-LauncherSplashStatus([string]$text) {
 
 # Shared UI kit: DPI helpers, design tokens, fonts, painted controls (with plain fallbacks) and background work.
 Set-LauncherSplashStatus 'Loading the interface...'
+if ($Screenshot) { $env:QRA_DPI_MODE = 'system' }   # the review pictures emulate a scale on one fixed system DPI: no per-monitor behaviour there
 . (Join-Path $PSScriptRoot 'QraUi.ps1')
 # Optional release-request intake (Exchange Online). Dot-sourced WITHOUT arguments: its parameters are aliased so this script's $Incoming and $Screenshot stay untouched.
 . (Join-Path $PSScriptRoot 'ReleaseRequests.ps1')
 Set-LauncherSplashStatus 'Building the window...'
 if ($script:Splash) { [System.Windows.Forms.Application]::DoEvents() }
 # -ScreenshotDpi: emulate another display scale. Must run before any window exists.
+# Otherwise (per-monitor aware): the window is built for the screen it opens on, the one with the mouse (CenterScreen). Set-QraEmulatedDpi does the rest.
 if ($ScreenshotDpi -gt 0) { Set-QraEmulatedDpi $ScreenshotDpi }
+elseif ($script:QraPerMonitor) { Set-QraEmulatedDpi (Get-QraMonitorDpi) }
 [System.Windows.Forms.Application]::EnableVisualStyles()
 trap {
     Close-LauncherSplash -Wait; Exit-LauncherMutex
@@ -352,6 +408,7 @@ $ReadinessFunctions = @('Get-ReadinessChecks', 'New-Check', 'Get-SandboxFeatureS
 # ---------------------------------------------------------------- layout (runs after scaling, so everything here uses S())
 $script:LayoutReady = $false
 function Fit-CheckRow($row) {
+    Use-QraFormDpi $form
     $detail = $row.Tag.Detail; $btn = $row.Tag.Btn; $bar = $row.Tag.Bar
     $detail.Width = if ($btn) { $row.Width - (S 170) } else { $row.Width - (S 56) }
     if ($btn) { $btn.Left = $row.Width - (S 116) }
@@ -541,8 +598,9 @@ function Test-ConfigChanged([string]$path, [ref]$lastStamp) {
 
 # ---------------------------------------------------------------- guided stepper: pure state
 # Turns what the launcher can observe into the five rail rows. Pure: no UI, no disk, no clock.
-# $Facts keys: ChecksRunning, BlockingCount, WarnCount, DefenderChecked, IncomingCount, DecisionCurrent,
-# DecisionText, SandboxRunning, LaunchState ('None' | 'Starting' | 'Vanished'), ExportOn, DecisionAcknowledged, CleanedUp,
+# $Facts keys: ChecksRunning, BlockingCount, WarnCount, DefenderChecked, IncomingCount, ReviewedCount (packages with a
+# decision for exactly these bytes; absent = 1 when DecisionCurrent, else 0), DecisionCurrent (at least one package reviewed),
+# PartialContinued (the user chose to go on with some of the packages reviewed), DecisionText, SandboxRunning, LaunchState ('None' | 'Starting' | 'Vanished'), ExportOn, DecisionAcknowledged, CleanedUp,
 # and optionally CheckSeconds / LaunchSeconds (whole seconds the readiness checks / the Sandbox start have been running).
 # ' (12 s)' for a wait that has a count, '' otherwise. Whole seconds only, so the text changes once a second and never jitters.
 function Format-WaitSeconds($seconds) {
@@ -586,14 +644,19 @@ function Get-LauncherStepState([hashtable]$Facts) {
     $byDecision = $false
     if ($current -eq 0) {
         $s = $steps[3]
-        $byDecision = ($incoming -eq 1 -and [bool]$Facts.DecisionCurrent)
-        if ($byDecision) { $s.State = 'Done'; $s.Summary = 'Decision recorded' }
+        $reviewed = if ($null -ne $Facts.ReviewedCount) { [int]$Facts.ReviewedCount } else { [int][bool]$Facts.DecisionCurrent }
+        $all = ($incoming -gt 0 -and $reviewed -ge $incoming)
+        $partial = ($reviewed -gt 0 -and $reviewed -lt $incoming)
+        $byDecision = $all
+        if ($all) { $s.State = 'Done'; $s.Summary = $(if ($reviewed -gt 1) { "Decisions recorded for $reviewed messages" } else { 'Decision recorded' }) }
         elseif ($Facts.DecisionAcknowledged -and -not $Facts.ExportOn) { $s.State = 'Done'; $s.Summary = 'Decision recorded in the Sandbox' }
         elseif ($Facts.SandboxRunning) { $s.State = 'Working'; $s.Summary = 'Review in progress'; $current = 4 }
         elseif ($Facts.LaunchState -eq 'Starting') { $s.State = 'Working'; $s.Summary = 'Starting Windows Sandbox...' + (Format-WaitSeconds $Facts.LaunchSeconds); $current = 4 }
+        elseif ($partial -and $Facts.PartialContinued) { $s.State = 'Done'; $s.Summary = "$reviewed of $incoming messages reviewed"; $byDecision = $true }
         else {
             $s.State = 'Current'; $current = 4
-            if ($Facts.LaunchState -eq 'Vanished') { $s.Summary = 'The Sandbox closed before a decision reached this PC.' }
+            if ($partial) { $s.Summary = "$reviewed of $incoming messages reviewed" }
+            elseif ($Facts.LaunchState -eq 'Vanished') { $s.Summary = 'The Sandbox closed before a decision reached this PC.' }
         }
     }
 
@@ -602,6 +665,7 @@ function Get-LauncherStepState([hashtable]$Facts) {
         $s = $steps[4]
         $s.State = 'Current'; $current = 5
         if (-not $byDecision -and $Facts.DecisionAcknowledged -and -not $Facts.ExportOn) { $s.Summary = 'No decision received on this PC (report export was off)' }
+        elseif ($byDecision -and $reviewed -gt 1) { $s.Summary = "$reviewed decisions recorded" }
         elseif ($byDecision -and $Facts.DecisionText) { $s.Summary = "Decision: $($Facts.DecisionText)" }
     }
     [pscustomobject]@{ Steps = $steps; Current = $current; AllDone = $false }
@@ -727,7 +791,7 @@ if (-not $Screenshot) { Enable-QraForeground; Hide-QraConsole }   # the console 
 $Fonts = @{
     Title = (New-Font 18 'Bold' 'Display'); Sub = (New-Font 10); Pane = (New-Font 14 'Bold' 'Display')
     Row = (New-Font 11 'Bold'); RowSub = (New-Font 9.5); Body = (New-Font 10); BodyBold = (New-Font 10 'Bold')
-    Eyebrow = (New-Font 9 'Bold'); Overall = (New-Font 10 'Bold'); Pill = (New-Font 9.5 'Bold')
+    Eyebrow = (New-Font 9 'Bold'); Small = (New-Font 9); Overall = (New-Font 10 'Bold'); Pill = (New-Font 9.5 'Bold')
 }
 # Shown in a rail row until the step has a summary of its own (pending steps, or a current step with nothing to report).
 $StepHints = @('Check Windows Sandbox and Python', 'Look before you release', 'Save the ZIP into Incoming', 'Open the offline Sandbox', 'Block or release, then clean up')
@@ -826,6 +890,7 @@ function New-RailRow([int]$n, [string]$title) {
     $row.Add_GotFocus({ $this.Invalidate() })
     $row.Add_LostFocus({ $this.Invalidate() })
     $row.Add_Paint({ param($s, $e)
+        Use-QraFormDpi $form
         $g = $e.Graphics; $idx = [int]$s.Tag.Index; $b = $s.Tag.Badge
         $sel = ($idx -eq $script:SelectedStep)
         $cx = $b.Left + [int]($b.Width / 2)
@@ -891,7 +956,7 @@ function New-StepPanel([int]$n, [string]$title, [string]$lead, [object[]]$subs =
             $segs = @()
             foreach ($part in $parts) {
                 if (-not $part[0]) { continue }
-                $segs += @{ Text = $part[0]; Font = $(if ($part[1]) { $Fonts.BodyBold } else { $Fonts.Body }) }
+                $segs += @{ Text = $part[0]; Bold = [bool]$part[1]; Font = $(if ($part[1]) { $Fonts.BodyBold } else { $Fonts.Body }) }
             }
             $rich = New-TextLabel '' $Fonts.Body $C.Text
             $rich.Tag = $segs; $rich.AccessibleName = $sub.Text; $rich.Visible = $false
@@ -969,13 +1034,10 @@ $st4 = New-StepPanel 4 'Analyze in the Sandbox' 'Networking is off. Report expor
     (New-SubStep 'Click Launch Sandbox review. The review window starts by itself after 20-60 seconds.' 'Launch Sandbox review'),
     (New-SubStep 'In the review window, select the ZIP, enter the download password, click Analyze.' 'Analyze')
 )
-$optReports = New-Object System.Windows.Forms.CheckBox
-$optReports.Text = 'Let the Sandbox save reports and the decision log to the Reports folder on this PC'
+$optReports = New-QraCheckBox 'Let the Sandbox save reports and the decision log to the Reports folder on this PC'
 $optReports.Checked = $true
-$optProtected = New-Object System.Windows.Forms.CheckBox
-$optProtected.Text = 'Protected Client mode (extra hardening; turn off if the Sandbox fails to start)'
-$optCompat = New-Object System.Windows.Forms.CheckBox
-$optCompat.Text = 'Compatibility mode (only if the Sandbox will not start; weaker isolation)'
+$optProtected = New-QraCheckBox 'Protected Client mode (extra hardening; turn off if the Sandbox fails to start)'
+$optCompat = New-QraCheckBox 'Compatibility mode (only if the Sandbox will not start; weaker isolation)'
 foreach ($opt in @($optReports, $optProtected, $optCompat)) { $opt.Font = $Fonts.Body; $opt.ForeColor = $C.Text; $opt.BackColor = $C.Card; $opt.UseMnemonic = $false }
 $optCompat.ForeColor = $C.Warning
 $bLaunch = New-QraButton 'Launch Sandbox review' 'Primary' $QraGlyph.Play
@@ -995,14 +1057,22 @@ $doneNote = New-TextLabel 'All five steps are done. Review the next message when
 Set-Shown $doneNote $false
 $bNext = New-QraButton 'Review the next message' 'Primary' $QraGlyph.Mail
 Set-Shown $bNext $false
+# The recorded decisions: a heading with a count, then one card per package (built by Build-DecisionCards while the step is laid out). With no
+# decision yet, $lastDec holds the guidance as a muted note.
 $lastDec = New-Object System.Windows.Forms.Label
 $lastDec.BackColor = $C.Surface; $lastDec.Padding = New-Object System.Windows.Forms.Padding(8, 6, 8, 6); $lastDec.Font = $Fonts.Body
-$lastDec.UseMnemonic = $false
+$lastDec.ForeColor = $C.TextMuted; $lastDec.UseMnemonic = $false
+$decHead = New-TextLabel '' $Fonts.BodyBold $C.Text
+$decArea = New-Object System.Windows.Forms.Panel
+$decArea.AutoScroll = $true; $decArea.BackColor = $C.Card; $decArea.TabStop = $false
+Set-ControlStyle $decArea 'Selectable' $true     # takes the focus on mouse-over, so the wheel scrolls a long list
+$decArea.Add_MouseEnter({ if (-not $this.Focused) { [void]$this.Focus() } })
+Set-Shown $lastDec $true; Set-Shown $decHead $false; Set-Shown $decArea $false
 $bCopyBlock = New-QraButton 'Copy block list' 'Secondary' $QraGlyph.Copy
 $bLog = New-QraButton 'Decisions log' 'Secondary'
 $bReports = New-QraButton 'Reports folder' 'Secondary' $QraGlyph.Folder
 $bClean = New-QraButton 'Delete Incoming...' 'Danger' $QraGlyph.Delete
-$st5.Panel.Controls.AddRange(@($doneNote, $bNext, $lastDec, $bCopyBlock, $bLog, $bReports, $bClean))
+$st5.Panel.Controls.AddRange(@($doneNote, $bNext, $decHead, $decArea, $lastDec, $bCopyBlock, $bLog, $bReports, $bClean))
 
 $body.Controls.Add($pane)
 $body.Controls.Add($railGap)
@@ -1028,6 +1098,7 @@ Set-Access $bLaunch 'Launch Sandbox review'
 Set-Access $bAck "I've recorded my decision in the Sandbox, go to the next step"
 Set-Access $bCopyBlock 'Copy block list'; Set-Access $bLog 'Open the decisions log'; Set-Access $bReports 'Open the Reports folder'; Set-Access $bClean 'Delete files in Incoming'
 Set-Access $bNext 'Review the next message'
+Set-Access $decArea 'Recorded decisions' 'One card per message, with its decision, subject, sender and the tool verdicts'
 $rail.TabIndex = 0; $pane.TabIndex = 1
 $ti = 0; foreach ($row in $script:RailRows) { $row.TabIndex = $ti++ }
 $checksPanel.TabIndex = 0; $recheck.TabIndex = 1; $bShortcut.TabIndex = 2
@@ -1075,6 +1146,7 @@ function Get-Blend([System.Drawing.Color]$from, [System.Drawing.Color]$to, [doub
 }
 
 function Update-HeaderLayout {
+    Use-QraFormDpi $form
     $gap = S 8; $x = 0; $h = 0
     foreach ($pl in $script:Pills) { $h = [Math]::Max($h, $pl.Height) }
     foreach ($pl in $script:Pills) { $pl.Location = New-Object System.Drawing.Point($x, [int](($h - $pl.Height) / 2)); $x += $pl.Width + $gap }
@@ -1086,6 +1158,7 @@ function Update-HeaderLayout {
 }
 
 function Update-RailLayout {
+    Use-QraFormDpi $form
     $railW = $rail.ClientSize.Width
     $rowH = [Math]::Max((S 64), [Math]::Min((S 88), [int]($rail.ClientSize.Height / 5)))   # shrinks on a small screen so row 5 stays visible
     $badgeD = S 28
@@ -1135,6 +1208,7 @@ function Set-StepHead($st, [int]$pad, [int]$tw) {
 }
 
 function Update-StepContent([int]$n) {
+    Use-QraFormDpi $form
     $st = $script:Step[$n]; $p = $st.Panel
     $w = $p.ClientSize.Width; $h = $p.ClientSize.Height
     $pad = S 28
@@ -1201,7 +1275,7 @@ function Update-StepContent([int]$n) {
         4 {
             foreach ($opt in @($optReports, $optProtected, $optCompat)) {
                 $opt.Width = $tw
-                $opt.Height = [Math]::Max((S 24), (Measure-Wrapped $opt.Text $opt.Font ($tw - (S 24))) + (S 4))
+                $opt.Height = [Math]::Max((S 24), (Measure-Wrapped $opt.Text $opt.Font ($tw - (Get-QraCheckBoxIndent $opt))) + (S 4))
                 $opt.Location = New-Object System.Drawing.Point($pad, $y); $y = $opt.Bottom + (S 4)
             }
             $y += S 16
@@ -1215,8 +1289,21 @@ function Update-StepContent([int]$n) {
         5 {
             if (Test-Shown $doneNote) { $y = (Set-Wrapped $doneNote $pad $y $tw) + (S 12) }
             if (Test-Shown $bNext) { $bNext.SetBounds($pad, $y, (Get-ButtonWidth $bNext (S 232)), (S 44)); $y = $bNext.Bottom + (S 16) }
-            $lastDec.SetBounds($pad, $y, $tw, [Math]::Max((S 92), (Measure-Wrapped $lastDec.Text $lastDec.Font ($tw - (S 16))) + (S 20)))
-            $y = $lastDec.Bottom + (S 16)
+            if (Test-Shown $decHead) { $decHead.SetBounds($pad, $y, $rw, ($Fonts.BodyBold.Height + (S 4))); $y = $decHead.Bottom + (S 8) }
+            if (Test-Shown $decArea) {
+                # the cards scroll inside their area when they do not fit; the buttons below always stay visible
+                $below = (S 16) + (S 36) + (S 16) + (S 36) + (S 24)
+                $total = Get-DecisionCardsHeight $script:DecCards
+                $avail = [Math]::Max((S 140), $h - $y - $below)
+                $scrolls = ($total -gt $avail)
+                $decArea.SetBounds($pad, $y, $rw, $(if ($scrolls) { $avail } else { $total }))
+                Build-DecisionCards ($rw - $(if ($scrolls) { [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth } else { 0 }))
+                $y = $decArea.Bottom + (S 16)
+            }
+            if (Test-Shown $lastDec) {
+                $lastDec.SetBounds($pad, $y, $rw, [Math]::Max((S 56), (Measure-Wrapped $lastDec.Text $lastDec.Font ($rw - (S 16))) + (S 20)))
+                $y = $lastDec.Bottom + (S 16)
+            }
             $bh = S 36; $bx = $pad
             foreach ($btn in @($bCopyBlock, $bLog, $bReports)) { $bw = Get-ButtonWidth $btn; $btn.SetBounds($bx, $y, $bw, $bh); $bx += $bw + (S 8) }
             $y += $bh + (S 16)
@@ -1228,7 +1315,8 @@ function Update-StepContent([int]$n) {
 }
 
 function Update-StepLayout {
-    if (-not $script:LayoutReady -or $script:InLayout) { return }
+    if (-not $script:LayoutReady -or $script:InLayout -or $script:QraDpiBusy) { return }
+    Use-QraFormDpi $form
     $script:InLayout = $true
     try {
         Update-HeaderLayout
@@ -1256,6 +1344,19 @@ $pane.Add_Resize({ Update-StepLayout })
 foreach ($k in 1..5) { $script:Step[$k].Panel.Add_Resize({ Update-StepLayout }) }
 Select-LauncherStep 1
 
+# ---- Per-monitor DPI: the window is rescaled when it is dragged to a screen with another scale (no-op in system mode, the fallback and Constrained Language Mode).
+# The rich sub-step lines hold their fonts in Tag, the check rows are rebuilt (they were sized with S()), then the whole layout runs again.
+[void](Register-QraDpiWindow $form -FontTables @($Fonts) -Relayout {
+        param($f)
+        foreach ($stepInfo in @($script:Step.Values)) {
+            foreach ($item in $stepInfo.Subs) {
+                if ($item.Rich) { foreach ($seg in $item.Rich.Tag) { $seg.Font = $(if ($seg.Bold) { $Fonts.BodyBold } else { $Fonts.Body }) } }
+            }
+        }
+        if (@($script:Checks).Count) { Render-Checks }
+        Update-StepLayout
+    })
+
 # ================================================================= behaviour
 $script:Checks = @()
 $script:Busy = $null   # @{ Kind='python'|'sandbox'|'notepad'; Work/Process; RowId; ... } while a user-started task runs
@@ -1276,11 +1377,20 @@ $script:IncomingFiles = @()
 $script:IncomingSig = $null
 $script:LastDecision = $null
 $script:DecisionCurrent = $false
+$script:DecisionMap = @{}              # input_sha256 -> newest complete decision record in Reports
+$script:DecisionCache = @{}            # record file signature -> parsed record (old files are read once)
+$script:DecCards = @(); $script:DecSig = ''; $script:DecBuiltKey = ''   # the step 5 cards (data, signature, what was last built)
+$script:Reviewed = @()                 # {FileName, Decision} for every package in Incoming with a decision for its bytes
 $script:IncomingWatcher = $null
 $script:HashWork = $null
 $script:HashWorkKey = $null
-$script:IncomingHash = $null
+$script:IncomingHashes = @{}           # full path -> SHA256 of each package in Incoming
 $script:IncomingHashKey = $null
+$script:RunEnded = $false              # a Sandbox run was seen and has closed (Vanished is judged against LaunchSnapshot)
+$script:LaunchSnapshot = @{}           # decision hash -> record source when the Sandbox was launched
+$script:ContinuedSig = $null           # 'reviewed/incoming' the user chose to go on with (some packages unreviewed)
+$script:LastReviewedSig = $null
+$script:AckPartial = $false
 
 function Set-OverallBusy([string]$text) {
     $overall.Text = $text
@@ -1313,10 +1423,11 @@ function Set-Overall {
 }
 
 function Render-Checks {
+    Use-QraFormDpi $form
     $checksPanel.SuspendLayout()
     foreach ($old in @($checksPanel.Controls)) { $old.Dispose() }   # Clear() would leave animated spinners registered
     $script:BusyRow = $null
-    if (-not $script:RowFonts) { $script:RowFonts = @{ Icon = (Get-IconFont 14); Name = (New-Font 10 'Bold') } }
+    if (-not $script:RowFonts) { $script:RowFonts = @{ Icon = (Get-IconFont 14); Name = (New-Font 10 'Bold') }; Add-QraFontTable $form $script:RowFonts }   # rescaled with the window
     $primaryTaken = $false; $firstBad = $null
     $glyphName = @{ OK = 'Check'; WARN = 'Warning'; FAIL = 'Cancel'; INFO = 'Info' }
     $w = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24))
@@ -1492,9 +1603,6 @@ function Show-IncomingFiles($files) {
         if ($other.Count) {
             $incomingHint.Text = "$(Get-QraGlyphText 'WARN') $($other.Count) file(s) are not .zip/.eml. Keep only downloaded quarantine packages here."
             $incomingHint.ForeColor = $C.Warning
-        } elseif ($files.Count -gt 1) {
-            $incomingHint.Text = 'Keep one package in Incoming so the launcher can verify which decision applies.'
-            $incomingHint.ForeColor = $C.Warning
         } else {
             $incomingHint.Text = "$($files.Count) file(s) ready. They are visible read-only inside the Sandbox as C:\Review\Incoming."
             $incomingHint.ForeColor = $C.Success
@@ -1519,20 +1627,90 @@ function Get-DecisionInputHash($d) {
         $d.final_decision -is [string] -and $d.final_decision.Trim()) { return $d.input_sha256 }
 }
 
+# Every complete decision record in $directory as a map input_sha256 -> newest record for that hash. Records that are
+# unreadable, malformed or incomplete (Get-DecisionInputHash) are ignored. Each record carries qra_source (file name, size
+# and write time) so a re-recorded decision can be told from an older one. $cache (sig -> record) spares re-reading old files.
+function Read-DecisionMap([string]$directory, [hashtable]$cache = $null) {
+    $map = @{}
+    try {
+        $files = @(Get-ChildItem -LiteralPath $directory -File -Filter 'Decision-*.json' -ErrorAction Stop |
+            Where-Object { $_.Name -notlike '*-report.json' -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
+            Sort-Object LastWriteTimeUtc, Name)
+        $seen = @{}
+        foreach ($f in $files) {
+            $sig = '{0}|{1}|{2}' -f $f.Name, $f.Length, $f.LastWriteTimeUtc.Ticks
+            $seen[$sig] = $true
+            if ($cache -and $cache.ContainsKey($sig)) { $record = $cache[$sig] }
+            else {
+                $record = $null
+                try {
+                    $r = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json -ErrorAction Stop
+                    if ($r -is [pscustomobject] -and (Get-DecisionInputHash $r)) {
+                        Add-Member -InputObject $r -NotePropertyName qra_source -NotePropertyValue $sig -Force
+                        $record = $r
+                    }
+                } catch { $null = $_ } # unreadable or malformed decision JSON is ignored
+                if ($cache) { $cache[$sig] = $record }
+            }
+            if ($record) { $map[[string]$record.input_sha256] = $record }
+        }
+        if ($cache) { foreach ($k in @($cache.Keys)) { if (-not $seen.ContainsKey($k)) { $cache.Remove($k) } } }
+    } catch { $null = $_ } # an unreadable Reports folder means no decisions
+    return $map
+}
+
+# hash -> source of the record, to tell later which decisions are new
+function Get-DecisionSnapshot($map) {
+    $snap = @{}
+    if ($map) { foreach ($k in @($map.Keys)) { $snap[[string]$k] = [string]$map[$k].qra_source } }
+    return $snap
+}
+
+# True when the Sandbox run left a decision that was not there at launch. $currentHashes: the hashes of the packages now in
+# Incoming, or $null while they are still being computed (then any new record counts, so a decision just recorded is not
+# reported as missing for the few seconds the hashing takes).
+function Test-RunProducedDecision($map, $snapshot, $currentHashes) {
+    if (-not $map) { return $false }
+    foreach ($h in @($map.Keys)) {
+        if ($null -ne $currentHashes -and @($currentHashes) -notcontains [string]$h) { continue }
+        if (-not $snapshot -or -not $snapshot.ContainsKey([string]$h) -or $snapshot[[string]$h] -ne [string]$map[$h].qra_source) { return $true }
+    }
+    return $false
+}
+
 # Timestamps identify when to discard work. Only a hash of the bytes can match a record.
-function Get-IncomingPackageKey($files) {
-    if ($files.Count -ne 1) { return }
-    $f = $files[0]
+function Get-IncomingFileKey($f) {
     if ($f.Extension -in '.zip', '.eml' -and -not ($f.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         return '{0}|{1}|{2}|{3}' -f $f.FullName, $f.Length, $f.CreationTimeUtc.Ticks, $f.LastWriteTimeUtc.Ticks
+    }
+}
+# One key for every package in Incoming (.zip/.eml, not a reparse point), in a fixed order. Nothing when there is none.
+function Get-IncomingPackageKey($files) {
+    $keys = @(@($files) | Where-Object { $_ } | Sort-Object FullName | ForEach-Object { Get-IncomingFileKey $_ })
+    if ($keys.Count) { return ($keys -join ';') }
+}
+function Get-IncomingPackagePaths($files) {
+    @(@($files) | Where-Object { $_ -and (Get-IncomingFileKey $_) } | Sort-Object FullName | ForEach-Object { [string]$_.FullName })
+}
+
+# The packages in $files that have a decision for exactly these bytes. $hashes: full path -> SHA256 of the file now in
+# Incoming; $map: input_sha256 -> newest record (Read-DecisionMap). A stale or previous decision never matches.
+function Get-ReviewedPackages($files, $hashes, $map) {
+    if (-not $hashes -or -not $map) { return }
+    foreach ($f in @($files | Where-Object { $_ })) {
+        $h = [string]$hashes[[string]$f.FullName]
+        if ($h -and $map.ContainsKey($h) -and (Get-DecisionInputHash $map[$h]) -eq $h) {
+            [pscustomobject]@{ FileName = [string]$f.Name; Decision = $map[$h] }
+        }
     }
 }
 
 function Clear-IncomingHash {
     $script:HashWorkKey = $null  # discard an in-flight result even if the path and timestamps were preserved
     $script:IncomingHashKey = $null
-    $script:IncomingHash = $null
+    $script:IncomingHashes = @{}
     $script:DecisionCurrent = $false
+    $script:Reviewed = @()
 }
 
 function Start-IncomingWatcher {
@@ -1557,7 +1735,7 @@ function Update-IncomingHash {
     Start-IncomingWatcher
     $key = Get-IncomingPackageKey $script:IncomingFiles
     if ($key -ne $script:IncomingHashKey -or -not $script:IncomingWatcher) {
-        $script:IncomingHash = $null; $script:IncomingHashKey = $null
+        $script:IncomingHashes = @{}; $script:IncomingHashKey = $null
     }
     if ($script:HashWork) {
         if ($key -ne $script:HashWorkKey) { $script:HashWorkKey = $null }
@@ -1565,29 +1743,35 @@ function Update-IncomingHash {
         $result = Complete-QraWork $script:HashWork
         $script:HashWork = $null
         if ($key -and $key -eq $script:HashWorkKey -and $script:IncomingWatcher -and -not $result.Error) {
-            $script:IncomingHash = [string]($result.Output | Select-Object -First 1)
-            $script:IncomingHashKey = $key
+            $found = @{}
+            foreach ($o in @($result.Output)) { if ($o.Path -and $o.Hash) { $found[[string]$o.Path] = [string]$o.Hash } }
+            if ($found.Count) { $script:IncomingHashes = $found; $script:IncomingHashKey = $key }
         }
     }
-    if (-not $key -or -not $script:IncomingWatcher -or $script:IncomingHash -or -not (Get-DecisionInputHash $script:LastDecision)) { return }
+    if (-not $key -or -not $script:IncomingWatcher -or $script:IncomingHashKey -or -not $script:DecisionMap.Count) { return }
     try {
         $script:HashWorkKey = $key
+        # every package in Incoming, in one background job (nothing is hashed on the UI thread)
         $script:HashWork = Start-QraWork {
-            (Get-FileHash -LiteralPath $packagePath -Algorithm SHA256 -ErrorAction Stop).Hash
-        } -Variables @{ packagePath = $script:IncomingFiles[0].FullName }
+            foreach ($p in $packagePaths) {
+                [pscustomobject]@{ Path = $p; Hash = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash }
+            }
+        } -Variables @{ packagePaths = @(Get-IncomingPackagePaths $script:IncomingFiles) }
     } catch { $script:HashWorkKey = $null }
 }
 
 function Refresh-LastDecision {
+    $script:DecisionMap = Read-DecisionMap $Reports $script:DecisionCache
     Show-LastDecision (Read-LastDecision $Reports)
     Update-IncomingHash
 }
 
+$script:NoDecisionText = 'No decision recorded yet. In the Sandbox: Record decision, bottom left (needs "save reports to this PC" selected in step 4).'
 function Show-LastDecision($d) {
     $script:LastDecision = $d
     if (-not $d) {
-        $lastDec.Text = 'No decision recorded yet. In the Sandbox: Decision tab > Record decision (needs "save reports to this PC" selected in step 4).'
-        $lastDec.ForeColor = $C.TextMuted; $bCopyBlock.Enabled = $false
+        $lastDec.Text = $script:NoDecisionText
+        $bCopyBlock.Enabled = $false
         return
     }
 }
@@ -1600,33 +1784,240 @@ function Get-LastDecisionText($d, [bool]$stale) {
             "Sender: $($d.sender)`r`nSubject: $($d.subject)`r`n" +
             "Tool said: $($d.tool_recommendation) (confidence $($d.confidence)); Microsoft: $($d.microsoft_verdict)")
 }
-function Set-LastDecisionView {
-    $d = $script:LastDecision
-    if (-not $d) { return }
-    $io = $d.iocs
-    $hasIocs = [bool]($io.sender -or $io.sender_domain -or $io.domains -or $io.urls -or $io.sha256 -or $d.spoof_pair)
-    $st = Get-CopyBlockState $hasIocs ([bool]$script:DecisionCurrent) ([bool]$optReports.Checked)
-    $lastDec.ForeColor = $C.Text
-    $text = Get-LastDecisionText $d $st.Stale
-    if ($lastDec.Text -ne $text) { $lastDec.Text = $text }
-    $bCopyBlock.Enabled = $st.Enabled
+# Several decisions for the last-decision box: one line per package, then the compact details of each decision.
+function Get-ReviewedDecisionsText($reviewed, $incomingNames) {
+    $items = @($reviewed | Where-Object { $_ } | Sort-Object { [string]$_.FileName })
+    $names = @($items | ForEach-Object { [string]$_.FileName })
+    $rest = @(@($incomingNames) | Where-Object { $_ -and ($names -notcontains [string]$_) } | Sort-Object)
+    $head = if ($rest.Count) { "$($items.Count) of $($items.Count + $rest.Count) messages reviewed" } else { "$($items.Count) decisions recorded" }
+    $L = @($head)
+    foreach ($i in $items) {
+        $d = $i.Decision
+        $L += "$($i.FileName) - $($d.final_decision) - $($d.confidence) - $($d.recorded_local)"
+        $L += "    Sender: $($d.sender) | Subject: $($d.subject)"
+        $L += "    Tool said: $($d.tool_recommendation); Microsoft: $($d.microsoft_verdict)"
+    }
+    foreach ($n in $rest) { $L += "$n - not reviewed yet" }
+    return ($L -join "`r`n")
 }
+function Test-DecisionHasIocs($d) {
+    $io = $d.iocs
+    return [bool]($io.sender -or $io.sender_domain -or $io.domains -or $io.urls -or $io.sha256 -or $d.spoof_pair)
+}
+# Pure: the tone of a recorded decision ('Danger' | 'Success' | 'Warning' | 'Info'). Keep/verify wins over release, release over delete/block.
+function Get-DecisionTone($finalDecision) {
+    $t = ([string]$finalDecision).ToLowerInvariant()
+    if ($t -match 'keep|verif|pending|hold') { return 'Warning' }
+    if ($t -match 'release|allow|false positive|deliver') { return 'Success' }
+    if ($t -match 'delete|block|remove|purge') { return 'Danger' }
+    return 'Info'
+}
+# Pure: the cards for step 5. Kind is 'Decision', 'Pending' (a package in Incoming without a decision) or 'Previous' (a decision that is not for the current download).
+function Get-DecisionCards($reviewed, $incomingNames, $lastDecision, [bool]$stale) {
+    $dot = '  ' + [string][char]0x00B7 + '  '
+    $oneLine = { param($s) (([string]$s) -replace '[\r\n]+', ' ').Trim() }
+    $make = { param($d, $file, $kind)
+        $subject = & $oneLine $d.subject; if (-not $subject) { $subject = '(no subject)' }
+        $fromAddr = & $oneLine $d.sender; if (-not $fromAddr) { $fromAddr = '(no sender)' }
+        $decision = & $oneLine $d.final_decision; if (-not $decision) { $decision = 'Decision recorded' }
+        $conf = & $oneLine $d.confidence; if ($conf) { $conf = "$conf confidence" }
+        $from = "From $fromAddr"; if ($file) { $from += $dot + $file }
+        $toolParts = @()
+        $rec = & $oneLine $d.tool_recommendation; $ms = & $oneLine $d.microsoft_verdict
+        if ($rec) { $toolParts += "Tool: $rec" }
+        if ($ms) { $toolParts += "Microsoft: $ms" }
+        $prefix = if ($kind -eq 'Previous') { 'Previous decision, not for the current download: ' } else { 'Recorded decision: ' }
+        $confText = if ($conf) { ', ' + $conf } else { '' }
+        [pscustomobject]@{
+            Kind = $kind; Tone = (Get-DecisionTone $decision); Decision = $decision; Confidence = $conf; Time = (& $oneLine $d.recorded_local)
+            Subject = $subject; From = $from; File = [string]$file; Tool = ($toolParts -join $dot)
+            Accessible = "$prefix$decision$confText. Subject: $subject. From: $fromAddr."
+        }
+    }
+    $cards = @()
+    $items = @($reviewed | Where-Object { $_ } | Sort-Object { [string]$_.FileName })
+    if ($items.Count) {
+        foreach ($i in $items) { $cards += & $make $i.Decision ([string]$i.FileName) 'Decision' }
+        $names = @($items | ForEach-Object { [string]$_.FileName })
+        foreach ($n in @(@($incomingNames) | Where-Object { $_ -and ($names -notcontains [string]$_) } | Sort-Object)) {
+            $cards += [pscustomobject]@{ Kind = 'Pending'; Tone = 'Info'; Decision = 'Not reviewed yet'; Confidence = ''; Time = ''; Subject = ''; From = ''; File = [string]$n; Tool = 'Launch the Sandbox again to review it.'
+                Accessible = "Not reviewed yet: $n. Launch the Sandbox again to review it." }
+        }
+    } elseif ($lastDecision) {
+        $cards += & $make $lastDecision '' $(if ($stale) { 'Previous' } else { 'Decision' })
+    }
+    return @($cards)
+}
+# Pure: the line above the cards ('' for none).
+function Get-DecisionHeading($cards) {
+    $dec = @($cards | Where-Object { $_.Kind -eq 'Decision' }).Count
+    $pend = @($cards | Where-Object { $_.Kind -eq 'Pending' }).Count
+    if (-not $dec) { return '' }
+    if ($pend) { return "$dec of $($dec + $pend) messages reviewed" }
+    if ($dec -eq 1) { return 'Decision recorded' }
+    return "$dec decisions recorded"
+}
+# Pure: the step 5 intro and the clean-up sub-step, singular or plural.
+function Get-Step5Wording([bool]$several) {
+    if ($several) { return @{ Lead = 'Your recorded decisions appear below with a ready-to-paste block list.'; Delete = 'Delete the downloaded ZIPs from Incoming.' } }
+    return @{ Lead = 'Your recorded decision appears below with a ready-to-paste block list.'; Delete = 'Delete the downloaded ZIP from Incoming.' }
+}
+function Get-DecisionCardHeight($card) {
+    $sh = if ($script:UiNative) { S 2 } else { 0 }
+    $fp = $Fonts.Pill.Height
+    $pillH = $fp + 2 * [int][Math]::Round($fp * 0.3)
+    if ($card.Kind -eq 'Pending') { return (2 * $sh + 2 * (S 10) + $Fonts.BodyBold.Height + (S 2) + (S 2) + $Fonts.Small.Height + (S 2)) }
+    $h = 2 * $sh + 2 * (S 10) + $pillH + (S 6) + ($Fonts.BodyBold.Height + (S 2)) + (S 2) + ($Fonts.Body.Height + (S 2))
+    if ($card.Tool) { $h += (S 2) + $Fonts.Small.Height + (S 2) }
+    if ($card.Kind -eq 'Previous') { $h += $Fonts.Small.Height + (S 2) + (S 4) }
+    return $h
+}
+function Get-DecisionCardsHeight($cards) {
+    $list = @($cards | Where-Object { $_ })
+    if (-not $list.Count) { return 0 }
+    $sum = 0; foreach ($one in $list) { $sum += Get-DecisionCardHeight $one }
+    return ($sum + ($list.Count - 1) * (S 10))
+}
+# Rebuilds the cards at this width. Nothing is cached in pixels: the key holds the data, the width, the scale and the contrast mode.
+function Build-DecisionCards([int]$width) {
+    Use-QraFormDpi $form
+    $key = '{0}|{1}|{2}|{3}' -f $script:DecSig, $width, $script:DpiScale, $script:QraHighContrast
+    if ($key -eq $script:DecBuiltKey) { return }
+    $script:DecBuiltKey = $key
+    $native = [bool]$script:UiNative
+    $sh = if ($native) { S 2 } else { 0 }
+    $statusOf = @{ Danger = 'FAIL'; Success = 'OK'; Warning = 'WARN'; Info = 'INFO' }
+    if (-not $script:DecTip) { try { $script:DecTip = New-Object System.Windows.Forms.ToolTip } catch { $script:DecTip = $null } }
+    $mkLabel = { param($text, $font, $color, $fill, $x, $y, $w, $tip)
+        $l = New-Object System.Windows.Forms.Label
+        $l.AutoSize = $false; $l.UseMnemonic = $false; $l.AutoEllipsis = $true; $l.TextAlign = 'MiddleLeft'
+        $l.Text = $text; $l.Font = $font; $l.ForeColor = $color; $l.BackColor = $fill
+        $l.SetBounds($x, $y, [Math]::Max((S 20), $w), ($font.Height + (S 2)))
+        if ($tip -and $script:DecTip) { $script:DecTip.SetToolTip($l, $text) }
+        $l
+    }
+    $decArea.SuspendLayout()
+    foreach ($old in @($decArea.Controls)) { $old.Dispose() }
+    $y = 0
+    foreach ($card in @($script:DecCards)) {
+        $ch = Get-DecisionCardHeight $card
+        $stale = ($card.Kind -ne 'Decision')
+        $fill = if ($card.Kind -eq 'Decision') { $C.Card } else { $C.Surface }
+        $p = New-QraCard
+        if ($native) { $p.ShadowSize = $sh; $p.Radius = S 8; $p.FillColor = $fill } else { $p.BackColor = $fill; $p.BorderStyle = 'FixedSingle' }
+        $p.AccessibleName = $card.Accessible; $p.AccessibleRole = 'Grouping'
+        $x0 = $sh + (S 20); $xr = $width - $sh - (S 16); $cw = $xr - $x0
+        $mute = $C.TextMuted
+        if ($card.Kind -eq 'Pending') {
+            $yy = $sh + (S 10)
+            $p.Controls.Add((& $mkLabel $card.Decision $Fonts.BodyBold $mute $fill $x0 $yy $cw $false))
+            $yy += $Fonts.BodyBold.Height + (S 4)
+            $p.Controls.Add((& $mkLabel ($card.File + '  ' + [string][char]0x00B7 + '  ' + $card.Tool) $Fonts.Small $mute $fill $x0 $yy $cw $true))
+        } else {
+            if ($card.Kind -eq 'Decision') {
+                $bar = New-Object System.Windows.Forms.Panel
+                $bar.BackColor = $C[[string]$card.Tone]
+                if ($native) { $bar.SetBounds(($sh + (S 1)), ($sh + (S 8)), (S 4), ($ch - 2 * ($sh + (S 8)))) } else { $bar.SetBounds(1, 1, (S 4), ($ch - 2)) }
+                $p.Controls.Add($bar)
+            }
+            $yy = $sh + (S 10)
+            if ($card.Kind -eq 'Previous') {
+                $p.Controls.Add((& $mkLabel 'Previous decision (not for the current download)' $Fonts.Small $mute $fill $x0 $yy $cw $false))
+                $yy += $Fonts.Small.Height + (S 2) + (S 4)
+            }
+            $pill = New-QraPill $statusOf[[string]$card.Tone] $card.Decision
+            $pill.Font = $Fonts.Pill
+            if (-not $native) { $pill.BackColor = $fill; $pill.Padding = (SPad 8 2 8 2) }
+            $timeW = 0
+            if ($card.Time) { $timeW = (Get-TextAdvance $card.Time $Fonts.Small) + (S 16) }
+            $room = $cw - $timeW - (S 12)
+            if ($pill.Width -gt $room) { $pill.AutoSize = $false; $pill.Width = [Math]::Max((S 80), $room) }
+            $pill.Location = New-Object System.Drawing.Point($x0, $yy)
+            $pill.AccessibleName = $card.Decision
+            $p.Controls.Add($pill)
+            $pillH = $pill.Height
+            $rx = $pill.Right + (S 10)
+            $smallTop = $yy + [int](($pillH - $Fonts.Small.Height - (S 2)) / 2)
+            if ($card.Time) {
+                $tl = & $mkLabel $card.Time $Fonts.Small $mute $fill ($xr - $timeW) $smallTop $timeW $false
+                $tl.TextAlign = 'MiddleRight'; $tl.AutoEllipsis = $false; $p.Controls.Add($tl)
+            }
+            if ($card.Confidence) { $p.Controls.Add((& $mkLabel $card.Confidence $Fonts.Small $mute $fill $rx $smallTop ($xr - $timeW - (S 8) - $rx) $false)) }
+            $yy += $pillH + (S 6)
+            $subjColor = if ($stale) { $mute } else { $C.Text }
+            $p.Controls.Add((& $mkLabel $card.Subject $Fonts.BodyBold $subjColor $fill $x0 $yy $cw $true))
+            $yy += $Fonts.BodyBold.Height + (S 2) + (S 2)
+            $p.Controls.Add((& $mkLabel $card.From $Fonts.Body $mute $fill $x0 $yy $cw $true))
+            $yy += $Fonts.Body.Height + (S 2) + (S 2)
+            if ($card.Tool) { $p.Controls.Add((& $mkLabel $card.Tool $Fonts.Small $mute $fill $x0 $yy $cw $true)) }
+        }
+        $p.SetBounds(0, $y, $width, $ch)
+        $decArea.Controls.Add($p)
+        $y += $ch + (S 10)
+    }
+    $decArea.ResumeLayout($true)
+}
+function Set-LastDecisionView {
+    $reviewed = @($script:Reviewed | Where-Object { $_ })
+    $incNames = @($script:IncomingFiles | Where-Object { $_ } | ForEach-Object { [string]$_.Name })
+    $d = $script:LastDecision
+    $cards = @(); $enabled = $false
+    if ($reviewed.Count) {
+        $hasIocs = [bool](@($reviewed | Where-Object { Test-DecisionHasIocs $_.Decision }).Count)
+        $st = Get-CopyBlockState $hasIocs $true ([bool]$optReports.Checked)
+        $cards = @(Get-DecisionCards $reviewed $incNames $null $false); $enabled = $st.Enabled
+    } elseif ($d) {
+        $st = Get-CopyBlockState (Test-DecisionHasIocs $d) ([bool]$script:DecisionCurrent) ([bool]$optReports.Checked)
+        $cards = @(Get-DecisionCards @() @() $d $st.Stale); $enabled = $st.Enabled
+    }
+    $bCopyBlock.Enabled = $enabled
+    $several = (($reviewed.Count -gt 1) -or ($incNames.Count -gt 1))
+    $wording = Get-Step5Wording $several
+    $changed = $false
+    if ($st5.Lead.Text -ne $wording.Lead) { $st5.Lead.Text = $wording.Lead; $changed = $true }
+    $delSub = $st5.Subs[2]
+    if ($delSub.Plain.Text -ne $wording.Delete) { $delSub.Plain.Text = $wording.Delete; $delSub.Text = $wording.Delete; $changed = $true }
+    $sig = (@($cards | ForEach-Object { @($_.Kind, $_.Decision, $_.Confidence, $_.Time, $_.Subject, $_.From, $_.Tool) -join '~' }) -join '||')
+    if ($sig -ne $script:DecSig) { $script:DecSig = $sig; $script:DecCards = $cards; $changed = $true }
+    $heading = Get-DecisionHeading $cards
+    if ($decHead.Text -ne $heading) { $decHead.Text = $heading; $changed = $true }
+    if ($cards.Count -eq 0 -and $lastDec.Text -ne $script:NoDecisionText) { $lastDec.Text = $script:NoDecisionText }
+    $showCards = [bool]$cards.Count
+    if ((Test-Shown $decArea) -ne $showCards) { Set-Shown $decArea $showCards; Set-Shown $lastDec (-not $showCards); $changed = $true }
+    $showHead = [bool]$heading
+    if ((Test-Shown $decHead) -ne $showHead) { Set-Shown $decHead $showHead; $changed = $true }
+    if ($changed -and $script:LayoutReady) { Update-StepLayout }
+}
+# The block list for the displayed decisions (one record, or one per reviewed package). Nothing unless every one of them still
+# matches a package in Incoming (checked on its bytes, which stay locked against writes meanwhile) and its record on disk.
 function Get-VerifiedBlockList([string]$directory, [string]$reportsDir, $displayed) {
-    $expected = Get-DecisionInputHash $displayed
-    if (-not $expected) { return }
-    $stream = $null
+    $shown = @($displayed | Where-Object { $_ })
+    if (-not $shown.Count) { return }
+    foreach ($d in $shown) { if (-not (Get-DecisionInputHash $d)) { return } }
+    $streams = New-Object System.Collections.Generic.List[IO.Stream]
     try {
         $files = @(Get-IncomingPackages $directory)
         $key = Get-IncomingPackageKey $files
         if (-not $key) { return }
-        # Deny writes and replacement while checking the package and rereading the displayed decision.
-        $stream = [IO.File]::OpenRead($files[0].FullName)
-        if ((Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expected) { return }
-        $d = Read-LastDecision $reportsDir
-        if ((Get-DecisionInputHash $d) -ne $expected -or $key -ne (Get-IncomingPackageKey @(Get-IncomingPackages $directory))) { return }
-        $text = Get-BlockListText $d
-        if ($text -ceq (Get-BlockListText $displayed)) { return $text }
-    } catch { $null = $_ } finally { if ($stream) { $stream.Dispose() } } # hash/read failure falls back to no block list
+        # Deny writes and replacement while checking the packages and rereading the displayed decisions.
+        $hashes = @{}
+        foreach ($f in $files) {
+            if (-not (Get-IncomingFileKey $f)) { continue }
+            $stream = [IO.File]::OpenRead($f.FullName)
+            $streams.Add($stream)
+            $hashes[[string](Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash] = $true
+        }
+        $map = Read-DecisionMap $reportsDir
+        $current = [ordered]@{}
+        foreach ($d in $shown) {
+            $h = [string](Get-DecisionInputHash $d)
+            if (-not $hashes.ContainsKey($h) -or -not $map.ContainsKey($h)) { return }
+            if ((Get-BlockListText $map[$h]) -cne (Get-BlockListText $d)) { return }
+            $current[$h.ToLowerInvariant()] = $map[$h]
+        }
+        if ($key -ne (Get-IncomingPackageKey @(Get-IncomingPackages $directory))) { return }
+        return (Get-CombinedBlockListText @($current.Values))
+    } catch { $null = $_ } finally { foreach ($s in $streams) { $s.Dispose() } } # hash/read failure falls back to no block list
 }
 function Get-BlockListText($d) {
     $io = $d.iocs
@@ -1642,6 +2033,37 @@ function Get-BlockListText($d) {
     $doms = @($io.domains | Where-Object { $_ }); if ($doms.Count) { $L += '# Link domains (URLs tab)'; $L += $doms; $L += '' }
     $urls = @($io.urls | Where-Object { $_ }); if ($urls.Count) { $L += '# Full URLs (live - do not click)'; $L += ($urls | ForEach-Object { & $refang $_ }); $L += '' }
     $sh = @($io.sha256 | Where-Object { $_ }); if ($sh.Count) { $L += '# File SHA256 (Files tab)'; $L += ($sh | ForEach-Object { ([string]$_).Split(' ')[0] }) }
+    return ($L -join "`r`n")
+}
+
+# One block list for several decisions: the union of their IOCs (senders, domains and hashes lower-cased), each value once, every section sorted. One record gives
+# exactly Get-BlockListText.
+function Get-CombinedBlockListText($records) {
+    $recs = @($records | Where-Object { $_ })
+    if ($recs.Count -eq 1) { return (Get-BlockListText $recs[0]) }
+    $refang = { param($u) ([string]$u -replace '^hxxp', 'http' -replace '^fxp', 'ftp' -replace '\[\.\]', '.') }
+    $newSet = { param($cmp) New-Object 'System.Collections.Generic.SortedSet[string]' $cmp }
+    $spoof = & $newSet ([StringComparer]::OrdinalIgnoreCase); $senders = & $newSet ([StringComparer]::OrdinalIgnoreCase)
+    $sdoms = & $newSet ([StringComparer]::OrdinalIgnoreCase); $doms = & $newSet ([StringComparer]::OrdinalIgnoreCase)
+    $urls = & $newSet ([StringComparer]::Ordinal); $shas = & $newSet ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($d in $recs) {
+        if ($d.spoof_pair -and [string]$d.final_decision -like 'Release*') { [void]$spoof.Add([string]$d.spoof_pair); continue }
+        $io = $d.iocs
+        if ($io.sender) { [void]$senders.Add(([string]$io.sender).ToLowerInvariant()) }
+        if ($io.sender_domain) { [void]$sdoms.Add(([string]$io.sender_domain).ToLowerInvariant()) }
+        foreach ($x in @($io.domains | Where-Object { $_ })) { [void]$doms.Add(([string]$x).ToLowerInvariant()) }
+        foreach ($x in @($io.urls | Where-Object { $_ })) { [void]$urls.Add([string](& $refang $x)) }
+        foreach ($x in @($io.sha256 | Where-Object { $_ })) { [void]$shas.Add(([string]$x).Split(' ')[0].ToLowerInvariant()) }
+    }
+    $newest = ($recs | ForEach-Object { [string]$_.recorded_local } | Sort-Object | Select-Object -Last 1)
+    $L = @("# Block list from Quarantine Review Assistant - $($recs.Count) decisions, newest recorded $newest",
+           '# Paste into Defender > Policies & rules > Threat policies > Tenant Allow/Block Lists (block).', '')
+    if ($spoof.Count) { $L += '# SPOOF ALLOW PAIR (Tenant Allow/Block List > Spoofed senders > Add > Allow, External)'; $L += @($spoof); $L += '' }
+    if ($senders.Count) { $L += '# Sender'; $L += @($senders); $L += '' }
+    if ($sdoms.Count) { $L += '# Sender domain'; $L += @($sdoms); $L += '' }
+    if ($doms.Count) { $L += '# Link domains (URLs tab)'; $L += @($doms); $L += '' }
+    if ($urls.Count) { $L += '# Full URLs (live - do not click)'; $L += @($urls); $L += '' }
+    if ($shas.Count) { $L += '# File SHA256 (Files tab)'; $L += @($shas) }
     return ($L -join "`r`n")
 }
 
@@ -1820,6 +2242,7 @@ $timer.Add_Tick({
 function Reset-LauncherSession {
     $script:DefenderChecked = $false; $script:DecisionAcknowledged = $false; $script:CleanedUp = $false
     $script:LaunchState = 'None'; $script:LaunchStarted = $null; $script:SandboxSeen = $false; $script:Step4Seen = $false
+    $script:RunEnded = $false; $script:LaunchSnapshot = @{}; $script:ContinuedSig = $null
 }
 
 # What the launcher can observe right now. Incoming and Reports are read by their own refreshers (cached); only the
@@ -1828,28 +2251,36 @@ function Get-LauncherFacts {
     $checks = @($script:Checks)
     $files = @($script:IncomingFiles | Where-Object { $_ })
     $incCount = $files.Count
-    $expected = Get-DecisionInputHash $script:LastDecision
-    $decisionCurrent = [bool]($expected -and $script:IncomingHash -eq $expected -and
-        $script:IncomingHashKey -eq (Get-IncomingPackageKey $files))
+    # a decision counts only for a package whose bytes (hashed in the background) equal its input_sha256
+    $hashesCurrent = [bool]($script:IncomingHashKey -and $script:IncomingHashKey -eq (Get-IncomingPackageKey $files))
+    $reviewed = @(if ($hashesCurrent) { Get-ReviewedPackages $files $script:IncomingHashes $script:DecisionMap })
+    $decisionCurrent = ($reviewed.Count -gt 0)
+    $partialContinued = [bool]($decisionCurrent -and $script:ContinuedSig -and $script:ContinuedSig -eq ('{0}/{1}' -f $reviewed.Count, $incCount))
     $acknowledged = $script:DecisionAcknowledged -and -not $optReports.Checked
     $running = (@(Get-SandboxProcess | Where-Object { $_ }).Count -gt 0)
     $checking = [bool]($script:ReadinessWork -or $script:Busy)
 
-    # Sandbox lifecycle: Starting until a process appears; Vanished when it was seen, is gone, and no decision came with it
+    # Sandbox lifecycle: Starting until a process appears; Vanished when it was seen, is gone, and the run left no decision that
+    # was not already there at launch (an older decision for one of the files must not hide a failed run). Judged on every
+    # tick after the close, so a decision that is still being verified is not reported as missing.
     if ($running) {
-        $script:SandboxSeen = $true
+        $script:SandboxSeen = $true; $script:RunEnded = $false
         if ($script:LaunchState -ne 'None') { $script:LaunchState = 'None' }
     } elseif ($script:SandboxSeen) {
-        $script:SandboxSeen = $false
-        $script:LaunchState = if ($decisionCurrent -or $acknowledged) { 'None' } else { 'Vanished' }
+        $script:SandboxSeen = $false; $script:RunEnded = $true
     } elseif ($script:LaunchState -eq 'Starting' -and $script:LaunchStarted -and ((Get-Date) - $script:LaunchStarted).TotalSeconds -gt 120) {
         $script:LaunchState = 'Vanished'    # no Sandbox process ever appeared
+    }
+    if ($script:RunEnded -and -not $running) {
+        $current = if ($hashesCurrent) { @($script:IncomingHashes.Values) } else { $null }
+        $produced = Test-RunProducedDecision $script:DecisionMap $script:LaunchSnapshot $current
+        $script:LaunchState = if ($produced -or $acknowledged) { 'None' } else { 'Vanished' }
     }
 
     # Clean-up: step 4 was done while Incoming had files, and now it is empty
     if ($script:CleanedUp -and $incCount -gt 0) { Reset-LauncherSession; $script:LastCurrent = 0 }     # a new download starts the next message (and may move the view forward again)
     elseif (-not $script:CleanedUp -and $script:Step4Seen -and $incCount -eq 0 -and -not $checking -and -not $script:IncomingReadFailed) { $script:CleanedUp = $true }
-    $script:Step4Seen = ($incCount -gt 0) -and ($decisionCurrent -or $acknowledged)
+    $script:Step4Seen = ($incCount -gt 0) -and (($decisionCurrent -and ($reviewed.Count -ge $incCount -or $partialContinued)) -or $acknowledged)
 
     @{
         ChecksRunning = $checking
@@ -1858,9 +2289,12 @@ function Get-LauncherFacts {
         DefenderChecked = [bool]$script:DefenderChecked
         IncomingCount = $incCount
         DecisionCurrent = $decisionCurrent
+        ReviewedCount = $reviewed.Count
+        Reviewed = $reviewed
+        PartialContinued = $partialContinued
         CheckSeconds = $(if ($script:ReadinessWork) { [int]([DateTime]::UtcNow - $script:ReadinessWork.Started).TotalSeconds } else { $null })
         LaunchSeconds = $(if ($script:LaunchState -eq 'Starting' -and $script:LaunchStarted) { [int]((Get-Date) - $script:LaunchStarted).TotalSeconds } else { $null })
-        DecisionText = $(if ($decisionCurrent) { [string]$script:LastDecision.final_decision } else { '' })
+        DecisionText = $(if ($reviewed.Count -eq 1) { [string]$reviewed[0].Decision.final_decision } else { '' })
         SandboxRunning = $running
         LaunchState = [string]$script:LaunchState
         ExportOn = [bool]$optReports.Checked
@@ -1874,6 +2308,7 @@ function Update-Stepper([hashtable]$Facts = $null) {
     $live = ($null -eq $Facts)
     if ($live) { $Facts = Get-LauncherFacts }
     $script:DecisionCurrent = [bool]$Facts.DecisionCurrent
+    $script:Reviewed = @($Facts.Reviewed | Where-Object { $_ })
     Set-LastDecisionView
     $state = Get-LauncherStepState $Facts
     $words = @{ Pending = 'not started'; Current = 'current step'; Working = 'in progress'; Done = 'done'; Warning = 'needs attention'; Blocked = 'blocked' }
@@ -1903,12 +2338,28 @@ function Update-Stepper([hashtable]$Facts = $null) {
     $pl = @(Get-LauncherPills $script:Checks $pillsBusy)
     for ($i = 0; $i -lt 3; $i++) { Set-QraPill $script:Pills[$i] $pl[$i].Status $pl[$i].Text; $script:Pills[$i].AccessibleName = $pl[$i].Text }
 
-    # step 4: the optional "recorded my decision" button and the launch status line
-    Set-Shown $bAck (-not [bool]$Facts.ExportOn)
+    # step 4: the secondary button and the launch status line. With some (not all) packages reviewed it continues to step 5 with
+    # those decisions; with report export off it is the "I've recorded my decision" button.
+    $nRev = [int]$Facts.ReviewedCount; $nInc = [int]$Facts.IncomingCount
+    $script:LastReviewedSig = '{0}/{1}' -f $nRev, $nInc
+    $idle = (-not $Facts.SandboxRunning -and $Facts.LaunchState -ne 'Starting')
+    $partial = ([bool]$Facts.ExportOn -and $nRev -gt 0 -and $nRev -lt $nInc -and $idle -and -not $Facts.PartialContinued)
+    $script:AckPartial = $partial
+    $ackText = if ($partial) { "Continue with $nRev decision(s)" } else { "I've recorded my decision - next" }
+    if ($bAck.Text -ne $ackText) {
+        $bAck.Text = $ackText
+        Set-Access $bAck $(if ($partial) { "Continue to the next step with the $nRev decision(s) recorded so far" } else { "I've recorded my decision in the Sandbox, go to the next step" })
+    }
+    Set-Shown $bAck ($partial -or -not [bool]$Facts.ExportOn)
     $text = ''; $color = $C.TextMuted; $spin = $false
     if ([int]$Facts.BlockingCount -gt 0 -and -not $Facts.ChecksRunning) { $text = 'Complete step 1 (PC readiness) first.' }
     elseif ($Facts.SandboxRunning) { $text = 'Review in progress. Record your decision in the Sandbox, then come back here.'; $color = $C.Text; $spin = $true }
     elseif ($Facts.LaunchState -eq 'Starting') { $text = 'Starting... the review window opens inside the Sandbox in 20-60 s.'; $color = $C.Text; $spin = $true }
+    elseif ($partial) {
+        $text = 'Review the rest in the Sandbox (launch it again), or continue to step 5 with the decisions you have.'
+        $color = $C.Text
+        if ($Facts.LaunchState -eq 'Vanished') { $text = 'The Sandbox closed without a new decision. ' + $text; $color = $C.Warning }
+    }
     elseif ($Facts.LaunchState -eq 'Vanished') { $text = if ($Facts.ExportOn) { 'The Sandbox closed before a decision reached this PC. Launch again to continue.' } else { "The Sandbox closed. Report export is off, so no decision reaches this PC. If you recorded your decision, click `"I've recorded my decision - next`"." }; $color = $C.Warning }
     $launchHint.Text = $text; $launchHint.ForeColor = $color
     Set-Shown $launchSpin $spin
@@ -1953,7 +2404,10 @@ foreach ($lbl in @($launchHint, $lastDec, $incomingHint)) { $lbl.Add_TextChanged
 $recheck.Add_Click({ Start-ReadinessRefresh; Refresh-Incoming })
 $bShortcut.Add_Click({ Invoke-CreateDesktopShortcut })
 $bChecked.Add_Click({ $script:DefenderChecked = $true; Update-Stepper; Select-LauncherStep 3 })
-$bAck.Add_Click({ $script:DecisionAcknowledged = $true; Update-Stepper; Select-LauncherStep 5 })
+$bAck.Add_Click({
+    if ($script:AckPartial) { $script:ContinuedSig = $script:LastReviewedSig } else { $script:DecisionAcknowledged = $true }
+    Update-Stepper; Select-LauncherStep 5
+})
 $bNext.Add_Click({ Reset-LauncherSession; Update-Stepper; Select-LauncherStep 2 })
 $optReports.Add_CheckedChanged({ if (-not $Screenshot) { Update-Stepper } })
 $bPortal.Add_Click({ Start-Process $QuarantineUrl })
@@ -1968,7 +2422,7 @@ $bFetch.Add_Click({
 })
 $bCopyBlock.Add_Click({
     if (-not $optReports.Checked -or -not $script:DecisionCurrent) { return }
-    $text = Get-VerifiedBlockList $Incoming $Reports $script:LastDecision
+    $text = Get-VerifiedBlockList $Incoming $Reports @($script:Reviewed | ForEach-Object { $_.Decision })
     if (-not $text) {
         Clear-IncomingHash
         Refresh-Incoming; Refresh-LastDecision; Update-Stepper
@@ -2024,13 +2478,15 @@ $bLaunch.Add_Click({
         if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe -ArgumentList ('"' + $wsb + '"') }
         else { Start-Process -FilePath $wsb }
         $script:LaunchState = 'Starting'; $script:LaunchStarted = Get-Date; $script:SandboxSeen = $false
+        $script:RunEnded = $false; $script:ContinuedSig = $null
+        $script:LaunchSnapshot = Get-DecisionSnapshot $script:DecisionMap     # what was decided before this run
         Update-Stepper
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Could not start Windows Sandbox:`r`n$($_.Exception.Message)`r`n`r`nTry again with 'Compatibility mode' selected.", 'Launch failed', 'OK', 'Error') | Out-Null
     }
 })
 
-$checksPanel.Add_Resize({ if ($script:LayoutReady) { foreach ($ctl in $checksPanel.Controls) { $ctl.Width = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24)); Fit-CheckRow $ctl } } })
+$checksPanel.Add_Resize({ if ($script:LayoutReady -and -not $script:QraDpiBusy) { Use-QraFormDpi $form; foreach ($ctl in $checksPanel.Controls) { $ctl.Width = [Math]::Max((S 380), $checksPanel.ClientSize.Width - (S 24)); Fit-CheckRow $ctl } } })
 if (-not $Screenshot) { $form.Add_Shown({
     Close-LauncherSplash
     # The console is hidden, so this process may have lost the right to come to the front: ask for it explicitly.
@@ -2085,10 +2541,26 @@ if ($Screenshot) {
     )
     $shotBase = @{
         ChecksRunning = $false; BlockingCount = 0; WarnCount = 0; DefenderChecked = $false; IncomingCount = 0
-        DecisionCurrent = $false; DecisionText = ''; SandboxRunning = $false; LaunchState = 'None'; ExportOn = $true
+        DecisionCurrent = $false; ReviewedCount = 0; Reviewed = @(); DecisionText = ''; SandboxRunning = $false; LaunchState = 'None'; ExportOn = $true
         DecisionAcknowledged = $false; CleanedUp = $false
     }
     $withFile = @{ DefenderChecked = $true; IncomingCount = 1 }
+    $shotFile2 = [pscustomobject]@{ Name = 'Quarantined Messages (2).zip'; Length = 36864; LastWriteTime = $shotTime.AddMinutes(-3); Extension = '.zip' }
+    $shotDecision2 = [pscustomobject]@{
+        record_complete = $true; input_sha256 = ('b' * 64)
+        recorded_local = '2026-11-25 11:06'; final_decision = 'Release'; sender = 'newsletter@news-digest.example'
+        subject = 'Weekly digest'; tool_recommendation = 'Likely safe'; confidence = 'Medium'; microsoft_verdict = 'Bulk'
+        iocs = [pscustomobject]@{ sender = ''; sender_domain = ''; domains = @(); urls = @(); sha256 = @() }
+    }
+    $twoFiles = @{ DefenderChecked = $true; IncomingCount = 2 }
+    $shotMany = @('Quarantined Messages (3).zip', 'Quarantined Messages (4).zip', 'Quarantined Messages (5) with a very long file name for the ellipsis check - long.zip', 'Quarantined Messages (6).zip', 'Quarantined Messages (7).zip') |
+        ForEach-Object { [pscustomobject]@{ Name = $_; Length = 20480; LastWriteTime = $shotTime; Extension = '.zip' } }
+    $shotLong = [pscustomobject]@{
+        record_complete = $true; input_sha256 = ('c' * 64)
+        recorded_local = '2026-11-25 11:20'; final_decision = 'Release (false positive, submitted to Microsoft)'; sender = 'accounts-payable-notifications@a-rather-long-sender-domain.example'
+        subject = 'Re: Fwd: Updated remittance advice for purchase order 77120-B, please confirm the new bank details before Friday'; tool_recommendation = 'Likely safe'; confidence = 'Medium'; microsoft_verdict = 'No threat found'
+        iocs = [pscustomobject]@{ sender = ''; sender_domain = ''; domains = @(); urls = @(); sha256 = @() }
+    }
     $ScreenshotStates = [ordered]@{
         'checks-running'     = @{ Checks = @(); Facts = @{ ChecksRunning = $true }; Select = 1 }
         'not-ready'          = @{ Checks = $shotNotReady; Facts = @{ BlockingCount = 2 }; Select = 1 }
@@ -2099,6 +2571,17 @@ if ($Screenshot) {
         'export-off'         = @{ Checks = $shotOk; Files = @($shotFile); Facts = $withFile + @{ ExportOn = $false }; Select = 4 }
         'decision-recorded'  = @{ Checks = $shotOk; Files = @($shotFile); Decision = $shotDecision
             Facts = $withFile + @{ DecisionCurrent = $true; DecisionText = 'Delete and block' }; Select = 5 }
+        'two-files-one-reviewed' = @{ Checks = $shotOk; Files = @($shotFile, $shotFile2); Decision = $shotDecision
+            Reviewed = @([pscustomobject]@{ FileName = $shotFile.Name; Decision = $shotDecision })
+            Facts = $twoFiles + @{ DecisionCurrent = $true; ReviewedCount = 1; DecisionText = 'Delete and block' }; Select = 4 }
+        'two-files-reviewed' = @{ Checks = $shotOk; Files = @($shotFile, $shotFile2); Decision = $shotDecision
+            Reviewed = @([pscustomobject]@{ FileName = $shotFile.Name; Decision = $shotDecision }, [pscustomobject]@{ FileName = $shotFile2.Name; Decision = $shotDecision2 })
+            Facts = $twoFiles + @{ DecisionCurrent = $true; ReviewedCount = 2 }; Select = 5 }
+        'stale-decision'     = @{ Checks = $shotOk; Files = @($shotFile2); Decision = $shotDecision
+            Facts = $withFile + @{ DecisionCurrent = $false }; Select = 5 }
+        'many-decisions'     = @{ Checks = $shotOk; Files = $shotMany; Decision = $shotDecision
+            Reviewed = @($shotMany[0..3] | ForEach-Object { [pscustomobject]@{ FileName = $_.Name; Decision = $(if ($_.Name -like '*long*') { $shotLong } else { $shotDecision2 }) } })
+            Facts = @{ DefenderChecked = $true; IncomingCount = 5; DecisionCurrent = $true; ReviewedCount = 4 }; Select = 5 }
         'all-done'           = @{ Checks = $shotOk; Files = @(); Decision = $shotDecision
             Facts = @{ DefenderChecked = $true; CleanedUp = $true }; Select = 5 }
     }
@@ -2121,6 +2604,8 @@ if ($Screenshot) {
         if ($facts.ChecksRunning) { Set-OverallBusy 'Checking this PC...' } else { Set-Overall }
         Show-IncomingFiles $sd.Files
         Show-LastDecision $sd.Decision
+        $facts.Reviewed = @($sd.Reviewed)
+        if ($facts.DecisionCurrent -and -not $sd.Reviewed) { $facts.Reviewed = @([pscustomobject]@{ FileName = $shotFile.Name; Decision = $sd.Decision }); $facts.ReviewedCount = 1 }
         Update-Stepper $facts
         Select-LauncherStep ([int]$sd.Select)
         Update-StepLayout
